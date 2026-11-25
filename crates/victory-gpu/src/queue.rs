@@ -1213,8 +1213,12 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Done at once, once the
+/// flights sent ahead whose shaders may write the pages have landed
+/// ([`crate::host::land_before_remap`]).
+/// shortcut: a submission a queue still holds behind a wait (`Held`) runs
+/// after the remap, where the console runs it before when it was sent to
+/// the same queue first (fxceless/victory-fork #1131).
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1233,6 +1237,19 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // The console maps the pages behind the work sent before: what that
+    // work's shaders write must land in the pages mapped now, not in those
+    // mapped next (flights sent ahead land after their submission returned).
+    #[cfg(windows)]
+    for b in batches.into_iter().flatten() {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
+        crate::host::land_before_remap(b.destination, len);
+    }
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
