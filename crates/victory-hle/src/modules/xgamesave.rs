@@ -375,26 +375,31 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Moves a container of the old layout (blob files named by encoded name,
-/// a `.display` file) into a committed version, then removes it.
+/// a `.display` file) into a committed version, then removes it. If any of
+/// it cannot be read, or the version written cannot be read back, it stays
+/// as it is for the next time: it is the only copy until then.
 fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
-        let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let display = match std::fs::read_to_string(old.join(".display")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            read => read.ok()?,
+        };
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in std::fs::read_dir(old).ok()? {
+            let entry = entry.ok()?;
+            if let Some(blob) = entry.file_name().to_str().and_then(decode) {
+                blobs.push((blob, std::fs::read(entry.path()).ok()?));
+            }
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
             .map(|(n, d)| (n.as_str(), Source::Data(d)))
             .collect();
         commit(&dir, 1, name, &display, &sources).ok()?;
+        current_named(&dir, name).ok()??;
     }
     std::fs::remove_dir_all(old).ok()?;
     tracing::info!(container = name, "game save moved to the versioned layout");
@@ -558,8 +563,17 @@ impl Update {
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
-        // The old version is garbage now; a crash here leaves it for later.
+        // The old version goes only once the new one reads back whole.
         if let Some(old) = &current {
+            match load(&self.dir.join(format!("v{number}"))) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let e = std::io::Error::new(std::io::ErrorKind::InvalidData, "the new version does not read back");
+                    return io_error(&self.dir, &e);
+                }
+                Err(e) => return io_error(&self.dir, &e),
+            }
+            // A crash here leaves it for later.
             let _ = std::fs::remove_dir_all(&old.dir);
             step();
         }
@@ -1373,6 +1387,30 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    /// A blob of the old layout that cannot be read (here: a folder in its
+    /// place) leaves the whole container where it is, and nothing is written
+    /// or deleted beside it; once it can be read, all of it moves.
+    #[test]
+    fn an_unreadable_old_container_is_not_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old = root.join("Slot");
+        std::fs::create_dir_all(old.join("b")).unwrap();
+        std::fs::write(old.join("a"), b"old a").unwrap();
+        std::fs::write(old.join(".display"), b"one").unwrap();
+
+        assert!(containers(root).is_empty());
+        assert_eq!(std::fs::read(old.join("a")).unwrap(), b"old a");
+        assert!(old.join("b").is_dir());
+        assert!(!container_dir(root, "Slot").exists());
+
+        std::fs::remove_dir(old.join("b")).unwrap();
+        std::fs::write(old.join("b"), b"old b").unwrap();
+        assert_eq!(containers(root).len(), 1);
+        assert!(!old.exists());
+        assert_eq!(state(root), old_state());
     }
 
     /// An empty configuration id names none. As a folder name it would be
