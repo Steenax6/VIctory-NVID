@@ -118,6 +118,7 @@ static ADD: u8 = 0;
 /// Any options add the one user, silently.
 extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> HRESULT {
     tracing::info!(options, "XUserAddAsync: the offline local user");
+    super::gameinput::auto_start::user_added();
     xasync::XAsyncBegin(
         block,
         std::ptr::null_mut(),

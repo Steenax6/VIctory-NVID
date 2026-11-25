@@ -40,7 +40,12 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
 (`-Cache`, `-Data`) and presses no buttons for you. Controller: XInput pads
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
-keyboard acts as one while the game window has focus.
+keyboard acts as one while the game window has focus (Enter is A).
+
+`VICTORY_AUTO_START=1` answers the start screen's "press A" for you: A is
+pressed briefly every 2 s from the moment the game adds its user until it
+moves on (at most 30 s). The first-start menus come later and are left to
+you.
 
 ## Faster settings (optional, off by default)
 

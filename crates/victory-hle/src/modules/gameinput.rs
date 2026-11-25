@@ -1067,6 +1067,91 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// `VICTORY_AUTO_START=1`: the start screen's "press A" is answered for the
+/// player. The title adds its user ([`user_added`], `XUserAddAsync`) just
+/// before it shows that screen; from then on A (Enter on the keyboard) is
+/// pressed for 0.2 s every 2 s, until the title opens its next file
+/// ([`title_moved_on`]: it left the screen) or 30 s have passed.
+///
+/// The title (2026) ignores a press before the screen is up (presses 2 and
+/// 4 s after the user was added were read and dropped, the one at 6 s was
+/// taken), and presses during the film that follows change nothing (it ran
+/// its 30 s either way). Its first-start menus (settings, privacy) come only
+/// after the screen and that film, so no press reaches them.
+pub(crate) mod auto_start {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const FIRST: Duration = Duration::from_secs(1);
+    const EVERY: Duration = Duration::from_secs(2);
+    const HELD: Duration = Duration::from_millis(200);
+    const LIMIT: Duration = Duration::from_secs(30);
+
+    static ADDED: OnceLock<Instant> = OnceLock::new();
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_AUTO_START").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    /// The title added its user: the presses start (once per run).
+    pub(crate) fn user_added() {
+        if enabled() && ADDED.set(Instant::now()).is_ok() {
+            tracing::info!("auto start: pressing A until the title moves on");
+        }
+    }
+
+    /// The title opened a file: once the presses have started, they end.
+    pub(crate) fn title_moved_on() {
+        if ADDED.get().is_some() && !DONE.swap(true, Ordering::Relaxed) {
+            tracing::info!("auto start: the title moved on, no more presses");
+        }
+    }
+
+    /// Whether A is down now.
+    pub(super) fn pressing() -> bool {
+        let Some(added) = ADDED.get() else {
+            return false;
+        };
+        if DONE.load(Ordering::Relaxed) {
+            return false;
+        }
+        let elapsed = added.elapsed();
+        if elapsed >= LIMIT {
+            if !DONE.swap(true, Ordering::Relaxed) {
+                tracing::info!("auto start: no more presses after 30 s");
+            }
+            return false;
+        }
+        down(elapsed)
+    }
+
+    /// The press schedule: held from 1 s on, 0.2 s of every 2 s.
+    fn down(elapsed: Duration) -> bool {
+        elapsed
+            .checked_sub(FIRST)
+            .is_some_and(|t| t.as_millis() % EVERY.as_millis() < HELD.as_millis())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn presses_are_short_and_two_seconds_apart() {
+            let at = |ms| down(Duration::from_millis(ms));
+            assert!(!at(0) && !at(999));
+            assert!(at(1000) && at(1199));
+            assert!(!at(1200) && !at(2999));
+            assert!(at(3000) && at(3100));
+            assert!(!at(3200));
+            assert!(at(29_000));
+        }
+    }
+}
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1158,6 +1243,10 @@ mod host {
                     }
                 }
             }
+            // The same for `VICTORY_AUTO_START`.
+            if slot == 0 && auto_start::pressing() {
+                pad.buttons |= A;
+            }
             Some(pad)
         }
 
@@ -1166,6 +1255,10 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            // Enter is A on the stand-in pad; with or without focus.
+            if auto_start::pressing() && !down.contains(&0x0D) {
+                down.push(0x0D);
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
