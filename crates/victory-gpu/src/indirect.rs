@@ -45,7 +45,10 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: the records are gathered:
+    // record i is read at args_offset plus the first word of entry i of the
+    // table in count_buf (8 bytes an entry, from count_offset on) and goes
+    // to the offset its second word names.
     uint has_count;
     uint count_offset;
 };
@@ -84,6 +87,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
+    if ((has_count & 4u) != 0 && active) {
+        uint2 entry = count_buf.Load2(count_offset + id.x * 8);
+        src_at = args_offset + entry.x;
+        dst_at = entry.y;
+    }
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -489,6 +497,145 @@ fn record_clamp_as(
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
+    }
+    true
+}
+
+/// The records of one argument buffer (of one kind and stride) that a
+/// list's prelude clamps in one pass ahead of the list ([`hoists`]).
+#[derive(Clone)]
+pub(crate) struct HoistRun {
+    /// The host copy the records are read from.
+    pub(crate) src: ID3D12Resource,
+    pub(crate) kind: u32,
+    /// The stride the title's signature names: the bytes of a record.
+    pub(crate) stride: u32,
+    /// Per record: its offset in `src`, and where it goes in the list's
+    /// hoist buffer.
+    pub(crate) entries: Vec<[u32; 2]>,
+}
+
+/// Whether single indirect records are clamped in the list's prelude, all
+/// of a list's in a handful of passes ahead of it, where nothing recorded
+/// in the list before the draw can have written buffers on the card
+/// (`VICTORY_INDIRECT_HOIST=0` turns it off; on by default).
+///
+/// The title issues its mesh draws one record per call: some 5,000 a frame
+/// in the intro, and before each our clamp ran as a compute dispatch of its
+/// own between two waits, so the card went from drawing to compute and
+/// back for every record (the timing run of the intro: 73 ms a frame in
+/// 5,091 indirect commands, 14 microseconds each, most of them draws of
+/// next to nothing). The lists that draw are recorded beside each other
+/// and hold no compute work: what wrote their records (the title's culling
+/// passes) ran in lists submitted before them. So until a list records
+/// something that can write a buffer on the card (a dispatch, a draw whose
+/// shaders store), its records are the same at its start as at the draw,
+/// and the clamp can run there: in the prelude, which the host runs right
+/// before the list. The draws then read the hoist buffer with no pass and
+/// no barrier of ours between them.
+pub(crate) fn hoists() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_HOIST").is_none_or(|v| v != "0"))
+}
+
+/// Whether a record of `kind` with `stride` at `src_offset` of `src` can
+/// be clamped by a prelude ([`record_hoisted`] then fails for it only for
+/// want of memory).
+pub(crate) fn hoistable(src: &ID3D12Resource, src_offset: u64, kind: u32, stride: u32) -> bool {
+    // SAFETY: a live D3D12 buffer resource.
+    let base = unsafe { src.GetGPUVirtualAddress() };
+    clamp().is_some()
+        && validate_layout((kind, stride, 1), src_offset, None).is_some()
+        && base.is_multiple_of(4)
+        && src_offset.checked_add(u64::from(stride)).is_some_and(|end| end <= u64::from(u32::MAX))
+}
+
+/// Records, in a prelude `l`, the clamp of `runs` into the list's hoist
+/// buffer `dst` (readable as indirect arguments since its last prelude if
+/// `readable`, else common), charging `budget`, a buffer of the hoist's
+/// own that is zeroed first: one pass a run, its records gathered by a
+/// table in upload memory that `table` gives (bytes; the host address and
+/// the mapping). Leaves `dst` readable as indirect arguments for the list,
+/// and `budget` common. False, with nothing recorded, if there is no clamp
+/// or no memory for a table.
+pub(crate) fn record_hoisted(
+    l: &ID3D12GraphicsCommandList,
+    (dst, readable): (&ID3D12Resource, bool),
+    budget: &ID3D12Resource,
+    runs: &[HoistRun],
+    table: &mut dyn FnMut(u64) -> Option<(u64, *mut u8)>,
+) -> bool {
+    clamp().is_some_and(|c| record_hoisted_as(c, l, (dst, readable), budget, runs, table))
+}
+
+/// [`record_hoisted`] with the clamp `c`.
+fn record_hoisted_as(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, readable): (&ID3D12Resource, bool),
+    budget: &ID3D12Resource,
+    runs: &[HoistRun],
+    table: &mut dyn FnMut(u64) -> Option<(u64, *mut u8)>,
+) -> bool {
+    let Ok(l2) = windows::core::Interface::cast::<ID3D12GraphicsCommandList2>(l) else {
+        return false;
+    };
+    let mut tables = Vec::with_capacity(runs.len());
+    for run in runs {
+        let Some((gpu, to)) = table(8 * run.entries.len() as u64) else {
+            return false;
+        };
+        if !gpu.is_multiple_of(4) {
+            return false;
+        }
+        // SAFETY: upload memory of that many bytes, given for this.
+        unsafe { std::ptr::copy_nonoverlapping(run.entries.as_ptr().cast::<u8>(), to, 8 * run.entries.len()) };
+        tables.push(gpu);
+    }
+    // SAFETY: live D3D12 buffer resources.
+    let (dst_gpu, budget_gpu) = unsafe { (dst.GetGPUVirtualAddress(), budget.GetGPUVirtualAddress()) };
+    let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: budget_gpu + offset, Value: 0 });
+    let before = if readable { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON };
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // destination and budget buffers, the last two the list's own; the
+    // tables in upload memory the list keeps. The sources stay common (read
+    // through implicit promotion, as in `record_clamp_as`).
+    unsafe {
+        // Earlier shader writes (the title's argument passes, in lists
+        // before this one) first.
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(budget, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+        ]);
+        l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        for (i, (run, table_gpu)) in runs.iter().zip(tables).enumerate() {
+            if i > 0 {
+                // The budget's charges in the order of the runs.
+                l.ResourceBarrier(&[uav_barrier()]);
+            }
+            let records = run.entries.len() as u32;
+            let constants = [run.kind, run.stride, records, 0u32, 4u32, 0u32];
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, run.src.GetGPUVirtualAddress());
+            l.SetComputeRootShaderResourceView(2, table_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget_gpu);
+            l.Dispatch(records.div_ceil(64), 1, 1);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::IndirectHoistRuns, 1);
+                crate::copystat::add(crate::copystat::C::IndirectHoisted, u64::from(records));
+            }
+        }
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+            transition(budget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+        ]);
     }
     true
 }
@@ -1445,6 +1592,68 @@ void main() {
                 assert_eq!(spent, charged_filled + 13 * 65535 * 128, "clamped one by one, each slot is charged the most");
                 assert_eq!(largest, u32::MAX);
             }
+        }
+    }
+
+    /// A prelude's pass (`record_hoisted`): records anywhere in their
+    /// buffer, each clamped into the slot its entry names, the slots
+    /// between them left alone.
+    #[test]
+    fn warp_hoisted_records_are_gathered_to_their_slots() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        // (offset in the source, slot offset in the hoist buffer, groups asked)
+        let picks = [(96u32, 0u32, 7u32), (0, 64, 3), (2048, 12, 70_000), (512, 200, 0)];
+        let total = 4096usize;
+        let mut src = vec![0xffu8; total];
+        for &(at, _, groups) in &picks {
+            for (w, word) in [groups, 1, 1].into_iter().enumerate() {
+                let at = at as usize + w * 4;
+                src[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(256);
+        let dst_buf = warp.default_uav(256);
+        let budget_buf = warp.default_uav(256);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            std::ptr::write_bytes(readback_ptr, 0xee, 256);
+        }
+        let run = HoistRun {
+            src: src_buf.clone(),
+            kind: KIND_MESH,
+            stride: STRIDE,
+            entries: picks.iter().map(|&(at, slot, _)| [at, slot]).collect(),
+        };
+        let mut gave = 0;
+        assert!(record_hoisted_as(&warp.clamp, &warp.list, (&dst_buf, false), &budget_buf, &[run], &mut |bytes| {
+            gave += 1;
+            assert_eq!(bytes, 8 * picks.len() as u64);
+            Some((table_gpu, table_ptr))
+        }));
+        assert_eq!(gave, 1);
+        // SAFETY: an open list; the hoist buffer, left readable as
+        // arguments, is copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 256);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; a mapped buffer.
+        let out = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 64).to_vec() };
+        for &(_, slot, groups) in &picks {
+            let at = slot as usize / 4;
+            assert_eq!(out[at..at + 3], [groups.min(65535), 1, 1], "the record at slot offset {slot}");
         }
     }
 

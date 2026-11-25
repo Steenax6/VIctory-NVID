@@ -127,6 +127,10 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Indirect records clamped by lists' preludes, and the passes that
+    /// clamped them (`crate::indirect::hoists`).
+    IndirectHoisted,
+    IndirectHoistRuns,
     /// `watch::writes` kernel askings that failed (the range is not
     /// write-watched: view memory or not watchable).
     WatchFailed,
@@ -1262,7 +1266,8 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    let lines = std::env::var("VICTORY_TIMING_LINES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(40usize);
+    for (what, (n, us, longest)) in by.into_iter().take(lines) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
@@ -1279,12 +1284,27 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each), {:.0} more in {:.0} passes of their lists' preludes (VICTORY_INDIRECT_HOIST); \
+         barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::IndirectHoisted as usize],
+        c[C::IndirectHoistRuns as usize],
         barrier_test()
     );
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let w: Vec<f64> = crate::draw::WINDOW_WHY.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
+        let h: Vec<f64> = crate::host::HOIST_WHY.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "  indirect records per frame, why they were clamped where drawn: {:.0} draws that can have no window, {:.0} \
+             found no window, {:.0} another buffer's or kind's, {:.0} not a step after the last; {:.0} windows clamped \
+             ahead, {:.0} ended by a direct draw; not left to the prelude: {:.0} shaders of the list may have written, \
+             {:.0} not clampable there, {:.0} hoist buffer full",
+            w[1], w[2], w[3], w[4], w[5], w[0], h[0], h[1], h[2]
+        );
+    }
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();

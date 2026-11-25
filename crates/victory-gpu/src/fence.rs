@@ -29,8 +29,14 @@ struct Fence {
     value: AtomicU64,
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
 }
+
+/// Since the last frame-rate line: events the title asked to have set
+/// when a fence reaches a value it had not reached yet, those set since,
+/// and the microseconds they waited from the asking to the setting (what a
+/// title thread that waits on such an event stands for).
+pub(crate) static EVENT_WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
@@ -106,7 +112,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    EVENT_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -114,10 +121,12 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, asked)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            EVENT_WAITS[1].fetch_add(1, Ordering::Relaxed);
+            EVENT_WAITS[2].fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         !reached
     });

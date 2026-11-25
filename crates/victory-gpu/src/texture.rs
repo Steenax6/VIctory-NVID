@@ -1352,6 +1352,63 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Whether the 64 KiB block of title memory at `block` is there, asked at
+/// `at` inside it: the answer is kept until the runtime says the block was
+/// mapped anew ([`blocks_remapped`]). The pass over the heap's textures
+/// asked for every block of every texture still due, every frame (6,000
+/// textures waiting for their memory in the intro: 12 ms a frame of a
+/// recording thread in probes, most of them of blocks that had not changed
+/// since the frame before). `VICTORY_MAPPED_CACHE=0`: asked every time.
+fn block_there(block: usize, at: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_CACHE").is_none_or(|v| v != "0")) {
+        return readable(at, 1, true).0 == 1;
+    }
+    let key = block >> 16;
+    if let Some(&there) = BLOCKS_THERE.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return there;
+    }
+    // Asked without the lock: a remapping meanwhile takes the entry out
+    // again only if it comes after the insert below, so its number is
+    // looked at before and after.
+    let before = BLOCKS_REMAPPED.load(std::sync::atomic::Ordering::Acquire);
+    let there = readable(at, 1, true).0 == 1;
+    let mut blocks = BLOCKS_THERE.lock().unwrap_or_else(|e| e.into_inner());
+    if BLOCKS_REMAPPED.load(std::sync::atomic::Ordering::Acquire) == before {
+        blocks.insert(key, there);
+    }
+    there
+}
+
+/// The answers [`block_there`] keeps, by block number.
+static BLOCKS_THERE: std::sync::Mutex<
+    std::collections::HashMap<usize, bool, std::hash::BuildHasherDefault<crate::descriptor::slots::SlotHasher>>,
+> = std::sync::Mutex::new(std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()));
+
+/// Counts the remappings told to [`blocks_remapped`].
+static BLOCKS_REMAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The runtime mapped, unmapped or freed title memory in `[at, at + len)`:
+/// what [`block_there`] kept for its blocks is asked anew.
+pub(crate) fn blocks_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut blocks = BLOCKS_THERE.lock().unwrap_or_else(|e| e.into_inner());
+    BLOCKS_REMAPPED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if blocks.is_empty() {
+        return;
+    }
+    let (first, last) = (at >> 16, (at + len - 1) >> 16);
+    if last - first > blocks.len() {
+        blocks.retain(|&key, _| key < first || key > last);
+    } else {
+        for key in first..=last {
+            blocks.remove(&key);
+        }
+    }
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
@@ -1388,7 +1445,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         let mut block = start & !(BLOCK - 1);
         while block < end {
             let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
+            if block_there(block, lo) {
                 there += (hi - lo) as u64;
             }
             block = block.saturating_add(BLOCK);

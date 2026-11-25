@@ -162,6 +162,12 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    if !at.is_null() {
+        // What the GPU side noted of these addresses (unmapped, guarded,
+        // a view) was of memory before this: freed address space coming
+        // back, or a reservation committed.
+        victory_gpu::title_memory_remapped(at as usize, size);
+    }
     at
 }
 
