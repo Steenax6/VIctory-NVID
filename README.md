@@ -15,7 +15,7 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 | Boot, first-boot screens, intro, opening credits | works |
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase (wanted level, minimap), boat, binoculars |
 | Stability | 1 h 30 min+ in one session without a crash |
-| Frame rate | 1-3 fps in the world (the first run is slower while shaders translate; they are cached after that) |
+| Frame rate | 1-3 fps in the world on that card (the first run is slower while shaders translate; they are cached after that). On an RTX 4070 Ti with a Ryzen 7 9800X3D, with `scripts\play.ps1`: 5-9 fps in the opening cutscene and 10-11 fps in the first room (they were 1-5 and about 4 before the changes of 2026-11-25, see "Faster settings") |
 | Known problems | anything in shadow is black and bright scenes overexpose (the game's ray-traced lighting does not run yet); some blocky artifacts; boats sit low in the water |
 
 ## Requirements
@@ -47,18 +47,49 @@ pressed briefly every 2 s from the moment the game adds its user until it
 moves on (at most 30 s). The first-start menus come later and are left to
 you.
 
-## Faster settings (optional, off by default)
+## Faster settings
 
-What this section listed before (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
-card copies of title buffers from 1 MB to 1024 MB) is the default since
-upstream `c96b4f2` (about 230 ms a frame where it was about 400 there).
+`scripts\play.ps1` turns four of upstream's opt-in switches on unless you set
+them yourself: `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`,
+`VICTORY_INDIRECT_WINDOW=1`, `VICTORY_TEXTURE_NO_WAIT=1` (`-Plain` leaves
+them as the environment has them; `victory.exe` run by hand has them off).
+Do not combine `VICTORY_INDIRECT_WINDOW=1` with `VICTORY_CARD_FETCH_INFLIGHT=1`
+(a device loss upstream).
 
-Newer switches from upstream (`f85101b`), off by default. Together they took
-the first room from about 3.5-4 to 6-7 frames a second on an RTX 4070:
-`VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`, `VICTORY_INDIRECT_WINDOW=1`,
-`VICTORY_TEXTURE_NO_WAIT=1`. Do not combine `VICTORY_INDIRECT_WINDOW=1` with
-`VICTORY_CARD_FETCH_INFLIGHT=1` (a device loss upstream). Set them in
-PowerShell before running the script.
+What 2026-11-25 added is on by default; each has a switch that puts the old
+way back (`=0`). Measured on an RTX 4070 Ti in the first room, with the four
+switches above: from 5.5 to 10-11 frames a second (182 to about 95 ms a
+frame); the thread that prepares and sends submissions went from about 195
+to about 47 ms of work a frame.
+
+| Switch (`=0`: as before) | What it does |
+|---|---|
+| `VICTORY_INDIRECT_HOIST`, `VICTORY_INDIRECT_HOIST_ALL` | single indirect records are clamped in their list's prelude, one pass for all records of a buffer, where no shader of the list has declared a write over them (some 1,900 of 4,700 a frame; each used to be a compute pass of ours between two draws) |
+| `VICTORY_INDIRECT_WINDOW_SIZES=16,64`, `VICTORY_INDIRECT_WINDOW_KEEP` | windows of records clamped ahead grow 64, 256, 1024 and outlive direct draws whose shaders store nothing |
+| `VICTORY_FILL_HOT`, `VICTORY_FILL_DIRECT`, `VICTORY_LATE_COPY` | only reads of the 64 KiB of title memory where shaders were seen to change bytes under a fill wait for flights (one such fill used to make every fill wait); constants there are bound from the buffer's host copy; a title buffer copy out of such memory is done when its submission lands |
+| `VICTORY_HEAP_SYNC_FAST`, `VICTORY_DESCRIPTOR_STRIPES` | descriptor records the title copies into its heap are found by the write watch's 4 KiB pages and mirrored in runs; slots have striped locks, so recording threads no longer stand behind that pass |
+| `VICTORY_SHADOW_CACHE` | recording threads remember which host copy an address range has |
+| `VICTORY_USER_COPY`, `VICTORY_REFRESH_PARTS`, `VICTORY_REFRESH_4K`, `VICTORY_GUARD_4K`, `VICTORY_MARK_ONLY`, `VICTORY_VIEW_KNOWN`, `VICTORY_ABSENT_ONCE`, `VICTORY_ASK_SKIP_VIEWS`, `VICTORY_ALIAS_RUNS`, `VICTORY_SEND_CHANGED` | title memory is copied by the processor (a fault falls back to the kernel's copy), by 4 KiB pages and only where written; guards are not re-armed over other views; unmapped runs are remembered (`VICTORY_ABSENT_FRAMES`, 30); bytes the copy-back itself wrote are not sent up to the card again |
+| `VICTORY_CARD_FINE`, `VICTORY_CARD_WIDE_HASH`, `VICTORY_CARD_SYNC_BATCH`, `VICTORY_MERGE_PAGES`, `VICTORY_FAST_MERGE`, `VICTORY_WIDE_COMPARE`, `VICTORY_BURY_ASIDE` | shader writes to copies in the card's memory are found per 4 KiB block (was 64 KiB), fetched as runs and merged where they differ; title bytes under flights go up a page at a time where shaders never wrote |
+
+Experiments, off: `VICTORY_ASYNC_PRESENT=1` (the title records the next
+frame while the last is sent; as it stands the title faults with it within
+two minutes, because waits between its queues are passed at the present; a
+variant that met them in order ran four minutes without a fault, at the same
+frame rate, since the card sets the pace by then, and was not kept),
+`VICTORY_HOT_BLOCKS=1`, `VICTORY_MERGE_FORGET=1`, `VICTORY_NAMED_WRITES=1`
+(not yet tried in a run), `--console series-s` (a quarter faster, but the
+picture is black: the title upscales with FidelityFX there, whose programs
+do not run yet).
+
+Where the time goes now (first room, 90-100 ms a frame): the card is busy
+about 73 % of the time. A timing run (`VICTORY_GPU_TIMING=1`) puts the
+title's own commands at 62 ms a frame on the card (3,850 dispatches, 5,100
+indirect draws; they were 113 ms while each indirect record had a clamp pass
+of ours beside it) and the passes of ours at 14 ms (23 before the wide
+hash). The title's recording threads and our submitting thread take turns
+for the rest. 30 frames a second is out of reach of this design on this
+card: the title's commands alone take twice a frame's time there.
 
 `VICTORY_PIPELINE_WORKERS=<n>` sets how many threads build pipelines that
 are not cached yet (default: half the logical processors, at most 8). On a
@@ -94,6 +125,7 @@ these are an NVIDIA card's.
 | `VICTORY_BACK_RUN_GAP=0` | every run of a copy-back is a write of its own; by default runs under 64 bytes apart are one write (upstream pull request #857) |
 | `VICTORY_WAVE_PAIRS=0` | no paired form for 64-lane programs on 32-lane cards (upstream pull request #854) |
 | `VICTORY_MESH_LINK=0` | mesh programs over 32 KiB are not linked with their pixel program (upstream pull request #854) |
+| `VICTORY_GPU_TIMING=1` + `VICTORY_D3D12_DRED=1` | the card's time per command and per pass of ours (diagnostics build; submissions are waited for, so not for frame rate); `VICTORY_TIMING_LINES=<n>` lists that many commands |
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
 
