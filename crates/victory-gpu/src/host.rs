@@ -2044,6 +2044,10 @@ struct Deferred {
     /// What this recording's shaders that store by address declared and named
     /// (`crate::memory::ready`): [`AddressWrites`].
     address_writes: AddressWrites,
+    /// `VICTORY_BVH_QUARANTINE`: the recording has a stage of the
+    /// structure builder, so nothing its shaders write is copied back into
+    /// title memory ([`HostList::quarantine`]).
+    quarantined: bool,
 }
 
 /// Per recording, of shaders that read and write title memory by address
@@ -6020,6 +6024,14 @@ impl Host {
         crate::copystat::submission_begins();
         #[cfg(feature = "diagnostics")]
         crate::profile::seen(crate::profile::Seen::Submit);
+        // A quarantined builder stage in one list keeps the whole
+        // submission's shader writes from the title: the copy-back compares
+        // every list's declared ranges after all of them ran, so a range of
+        // another list over memory the builder wrote would carry its stores
+        // back all the same.
+        if runs.iter().any(|r| r.deferred().quarantined) {
+            runs.iter().for_each(|r| r.quarantine());
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -7126,9 +7138,28 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        if deferred.quarantined {
+            return;
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// The recording has a quarantined stage of the structure builder
+    /// (`VICTORY_BVH_QUARANTINE=1`): no shader write of the whole recording
+    /// is copied back into title memory, those declared before it included.
+    /// Copy-backs are declared per list, not per dispatch: a range another
+    /// shader of the same list declared written carried the builder's
+    /// stores in it back to the title all the same, and the quarantine
+    /// leaked (fxceless/victory-fork#1013). The builder's lists then give
+    /// the title none of their other shaders' writes either; it is a test,
+    /// not a way to run.
+    pub(crate) fn quarantine(&self) {
+        let mut deferred = self.deferred();
+        if !deferred.quarantined {
+            deferred.quarantined = true;
+            deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go

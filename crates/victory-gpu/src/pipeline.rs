@@ -264,9 +264,17 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// check for a first run of the whole builder: a stage that stores where
 /// it should not can then not reach the title's own objects (run 98), and
 /// the programs that walk the structures read the host's copies anyway.
+/// It holds for every shader of a submission with a builder stage in it
+/// (`HostList::quarantine`): copy-backs are declared per list and compared
+/// per submission, so another shader's range over the builder's memory
+/// would carry its stores back too (it did before, fxceless/victory-fork
+/// #1013: the earlier quarantine runs did not show what they were meant
+/// to). Copies in place (`VICTORY_INPLACE=1`) are the title's memory
+/// itself and cannot be held back: test without them.
 /// shortcut: not a way to run: the title also reads results back (sizes,
-/// counters) and gets none, and a copy's pages are overwritten from title
-/// memory when the title writes them.
+/// counters) and gets none, nor what the other shaders of those lists
+/// write, and a copy's pages are overwritten from title memory when the
+/// title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
