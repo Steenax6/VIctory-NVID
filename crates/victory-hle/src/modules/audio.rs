@@ -323,6 +323,9 @@ const ADVANCE_XMA_READ: u32 = 18;
 
 const BLOCK_BYTES: usize = 256;
 const SAMPLES_PER_BLOCK: usize = BLOCK_BYTES / 2;
+/// Decode steps in a row without samples after which a pass leaves a voice
+/// for the next one.
+const EMPTY_STEPS: u32 = 16;
 /// Error status: the input ran out.
 const INPUT_INVALID: u32 = 4;
 
@@ -599,8 +602,26 @@ fn fill_block(context: Context, voice: &mut Voice, ring: &Mutex<Takes>) -> bool 
     if size == 0 || context.field(1, 31, 1) == 0 {
         return false;
     }
-    if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
-        return false;
+    // A decode step can give no samples: a switch to the other input, or a
+    // skip that takes a whole frame. Decoding goes on until the block is
+    // full, so no block of silence goes out in between. A run of such steps
+    // (a looping stream whose skip takes all it keeps) ends the pass.
+    let mut empty = 0;
+    while voice.pcm.len() < SAMPLES_PER_BLOCK {
+        let before = voice.pcm.len();
+        if !decode(context, voice) {
+            // Out of input: the rest goes out padded, then nothing.
+            if voice.pcm.is_empty() {
+                return false;
+            }
+            break;
+        }
+        if voice.pcm.len() == before {
+            empty += 1;
+            if empty == EMPTY_STEPS {
+                return false;
+            }
+        }
     }
     // The write block is the title's too: taken modulo the ring before the
     // first write, which would otherwise land past the ring's end.
@@ -1470,6 +1491,70 @@ mod tests {
         assert_eq!((write, full), (2, true));
         assert!(ring[..0x200].iter().all(|&b| b == 0));
         assert!(ring[0x200..].iter().all(|&b| b == 0x55));
+    }
+
+    /// Decode steps that give no samples (an empty input 0 before input 1,
+    /// or a start skip of a whole frame) do not make a block of silence:
+    /// the ring gets exactly the stream's samples. It used to get one
+    /// silent block more for each such step.
+    #[test]
+    fn blocks_are_filled_across_decode_steps_without_samples() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+        // Fills the ring of four blocks until the voice ends, the title
+        // taking all blocks after each pass; the samples written.
+        let drain = |words: &mut [u32; 16], skip: usize| -> usize {
+            let context = Context(words.as_mut_ptr());
+            let ring = Mutex::new(Takes::default());
+            let mut voice = Voice::new(skip);
+            for _ in 0..32 {
+                while fill_block(context, &mut voice, &ring) {}
+                if voice.ended && voice.pcm.is_empty() {
+                    break;
+                }
+                let write = context.field(0, 27, 5);
+                context.set_field(9, 0, 5, write);
+                context.set_field(1, 31, 1, 1);
+            }
+            assert!(voice.ended);
+            voice.trace.produced
+        };
+
+        // Input 0 valid with no packets, input 1 the six-frame stream: 24
+        // blocks of frames and two of the overlap tail.
+        let mut words = [0u32; 16];
+        words[0] = 0b11 << 20 | 4 << 22;
+        words[1] = 2 | 3 << 27 | 1 << 31;
+        words[2] = 32;
+        words[5] = input_apu;
+        words[6] = input_apu;
+        words[7] = output_apu;
+        assert_eq!(drain(&mut words, 0), 26 * SAMPLES_PER_BLOCK, "empty input 0");
+
+        // A start skip of four subframes drops the first frame whole: five
+        // frames and the tail, 22 blocks.
+        let mut words = [0u32; 16];
+        words[0] = 2 | 1 << 20 | 4 << 22;
+        words[1] = 4 << 24 | 3 << 27 | 1 << 31;
+        words[2] = 32;
+        words[5] = input_apu;
+        words[7] = output_apu;
+        assert_eq!(
+            drain(&mut words, 4 * xma::SUBFRAME_SAMPLES),
+            22 * SAMPLES_PER_BLOCK,
+            "a whole frame skipped"
+        );
+        ApuFree(input);
+        ApuFree(output);
     }
 
     /// A start skip longer than the one frame of a stream reaches into the
