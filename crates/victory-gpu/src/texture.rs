@@ -190,6 +190,11 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Its hash found it changed while its guard saw no write: the title
+    /// writes it through another view, so it is hashed at every check.
+    behind_guard: bool,
+    /// Checks of it through the guards so far (counted up to a few).
+    checks: u8,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1154,7 +1159,16 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        // A texture whose hash found it changed while the guard saw nothing
+        // is hashed at every check from then on (`Last::behind_guard`): the
+        // title's video player decodes into a ring of three frames written
+        // through another view, and on its eighth-frame turn each frame of
+        // the ring was refreshed about every 24 frames, so two presented
+        // frames in three showed video from up to two seconds before (the
+        // opening video stuttered: fxceless/victory-fork pull requests #701,
+        // with 0 of 318 frames out of order after it, and #602, #489).
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut unseen = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -1162,10 +1176,36 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            // A texture's first checks hash it whatever the turn, so one
+            // written behind its guard is found at its second use, not up
+            // to a second later (its memory moves from run to run, so it
+            // cannot be known by address).
+            const FIRST_CHECKS: u8 = 3;
+            let young = last.checks < FIRST_CHECKS;
+            last.checks = last.checks.saturating_add(1);
+            if unwritten && !turn && !young && !last.behind_guard {
                 return 0;
             }
+            unseen = unwritten;
         }
+        let hash_before = last.hash;
+        let read = self.refresh_hashed(last, size);
+        if unseen && hash_before.is_some() && last.hash != hash_before && !last.behind_guard {
+            last.behind_guard = true;
+            BEHIND_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(
+                memory = ?self.memory,
+                bytes = size,
+                "a texture changed with no write its guard saw (written through another view): hashed at every check from now on"
+            );
+        }
+        read
+    }
+
+    /// [`Staging::refresh_timed`] past the write watch and the guards: the
+    /// texture's memory read, hashed and detiled if it changed. Returns the
+    /// bytes of title memory read.
+    fn refresh_hashed(&self, last: &mut Last, size: usize) -> usize {
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -1431,14 +1471,21 @@ fn fill_zero_levels(data: &mut [u8], levels: &[(usize, usize, usize, usize)], n:
 /// (`Staging::fill_missing_levels`).
 pub(crate) static FILLED_LEVELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The line on levels filled from a smaller one ([`FILLED_LEVELS`]), every
-/// few seconds; nothing while there are none.
+/// Textures found changed with no write their guard saw, hashed at every
+/// check since (`Last::behind_guard`), since the start.
+static BEHIND_GUARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The line on levels filled from a smaller one ([`FILLED_LEVELS`]) and on
+/// textures written behind their guards ([`BEHIND_GUARD`]), every few
+/// seconds; nothing while there are none.
 pub(crate) fn filled_line() {
-    let filled = FILLED_LEVELS.load(std::sync::atomic::Ordering::Relaxed);
-    if filled > 0 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (filled, behind) = (FILLED_LEVELS.load(Relaxed), BEHIND_GUARD.load(Relaxed));
+    if filled + behind > 0 {
         tracing::info!(
-            "levels of streaming textures that were all zeros, shown from the nearest smaller level until their pages \
-             come, since the start: {filled} (VICTORY_TEXTURE_FILL_LEVELS=0 leaves the zeros)"
+            "since the start: {filled} levels of streaming textures that were all zeros shown from the nearest smaller \
+             level until their pages come (VICTORY_TEXTURE_FILL_LEVELS=0 leaves the zeros); {behind} textures found \
+             written through another view, behind their guards, hashed at every check since"
         );
     }
 }
