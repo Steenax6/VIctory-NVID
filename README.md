@@ -6,6 +6,13 @@ NVIDIA graphics cards, from game files you supply yourself.
 **This repository contains no game files or assets.** You need your own copy
 of the game. Not affiliated with or endorsed by its developer or publisher.
 
+This tree lives on the branch `steenax` of
+[Steenax6/VIctory-NVID](https://github.com/Steenax6/VIctory-NVID), a fork of
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory). It left upstream at
+`ffe310e` (2026-11-24) and is not merged with it since: changes from
+upstream and from other forks are taken one at a time, where a run on the
+cards below shows a gain or a fix. The fork's `main` is upstream's, untouched.
+
 ## Status (2026-11-25)
 
 Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
@@ -14,9 +21,9 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 |---|---|
 | Boot, first-boot screens, intro, opening credits | works |
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase (wanted level, minimap), boat, binoculars |
-| Stability | 1 h 30 min+ in one session without a crash |
+| Stability | 1 h 30 min+ in one session without a crash. The card's driver gave up in the opening cutscene in about one run of ten on the RTX 4070 Ti (a fault in the card's memory, after 100 s and more); two causes were closed on 2026-11-25 (view slots rewritten and textures let go under lists still in flight), and nine runs past that point have been clean since |
 | Frame rate | 1-3 fps in the world on that card (the first run is slower while shaders translate; they are cached after that). On an RTX 4070 Ti with a Ryzen 7 9800X3D, with `scripts\play.ps1`: 6-9 fps in the opening cutscene and about 11 fps in the first room (they were 1-5 and about 4 before the changes of 2026-11-25, see "Faster settings"); the first room is lit and complete there in every run, and the band of stale blocks along the bottom of the picture is gone |
-| Known problems | anything in shadow is black and bright scenes overexpose (the game's ray-traced lighting does not run yet); some blocky artifacts; boats sit low in the water |
+| Known problems | anything in shadow is black and bright scenes overexpose (the game's ray-traced lighting does not run yet); faces are soft and eyes glow white in cutscenes (a blur pass of the title's own, a Gaussian pyramid meant for the picture's edges, works at full strength over the whole picture; the cause is not found yet); some blocky artifacts; boats sit low in the water |
 
 ## Requirements
 
@@ -101,11 +108,19 @@ it was not kept),
 `VICTORY_HOT_BLOCKS=1`, `VICTORY_MERGE_FORGET=1`, `VICTORY_NAMED_WRITES=1`
 (not yet tried in a run), the argument clamp between enhanced barriers
 (Zettrox/ztrx pull request #139; on this card the same time on the card and
-in the title, left on the branch `narrow-waits`), page marks set by shaders
+in the title; not in this tree), page marks set by shaders
 for copy-backs (Marvisak/VIctory `cd94d35`: its gain is the CPU compare this
 tree no longer does; not ported), copy-backs written without the kernel's
 call (fxceless/victory-fork pull request #1032: no time goes into that call
-here, the merges already write directly), `--console series-s` (a quarter faster, but the
+here, the merges already write directly), upstream's `VICTORY_JOIN_PARTS`
+and `VICTORY_BACK_OWN_VIEW` (ported and measured: no gain on this card, not
+in this tree), DirectStorage workers by physical cores (8 against 16: no
+gain, not in this tree), `VICTORY_INPLACE=1` (slower here: the first room
+99.6 ms a frame against 87), `VICTORY_CARD_WINDOWS_MB=1024` (the cutscene
+within the spread of runs, the card nearly full), `VICTORY_BVH_BUILDER=1`
+with `VICTORY_BVH_QUARANTINE=1` (the builder starts and the title faults
+within seconds of the first 3D frame; see `docs/fork-ray-tracing.md`),
+`--console series-s` (a quarter faster, but the
 picture is black: the title upscales with FidelityFX there, whose programs
 do not run yet).
 
@@ -115,8 +130,14 @@ title's own commands at 62 ms a frame on the card (3,850 dispatches, 5,100
 indirect draws; they were 113 ms while each indirect record had a clamp pass
 of ours beside it) and the passes of ours at 14 ms (23 before the wide
 hash). The title's recording threads and our submitting thread take turns
-for the rest. 30 frames a second is out of reach of this design on this
-card: the title's commands alone take twice a frame's time there.
+for the rest. The room is bound by the card, shown by experiment: with the
+four heaviest compute passes skipped (15 ms on the card) a frame takes 70 ms
+instead of 88, while taking a wait of the processor's side away changes
+nothing. The card's time is not spread evenly: about 60 single passes of the
+title take some 34 ms of it and the other 8,700 commands share 27 ms. Why
+those passes are slow as translated is open, and it is where the next gain
+would be; 30 frames a second would need the title's commands, twice a
+frame's time there now, to halve.
 
 `VICTORY_PIPELINE_WORKERS=<n>` sets how many threads build pipelines that
 are not cached yet (default: half the logical processors, at most 8). On a
