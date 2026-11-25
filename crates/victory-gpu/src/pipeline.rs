@@ -394,6 +394,74 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The render target formats a draw of title pipeline `this` writes when
+/// the views bound are in `bound` (format per slot, `UNKNOWN` where none
+/// is): `None` if every target the pipeline names is bound in the format it
+/// names (or not bound), else the pipeline's formats with the bound ones in
+/// the slots that differ. The console writes each target in its view's
+/// format; the host leaves a draw whose pipeline names another undefined.
+/// Each such draw is counted by its pixel shader ([`note_other_targets`]).
+#[cfg(windows)]
+pub(crate) fn other_targets(
+    this: This,
+    bound: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8],
+) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let mut targets = p.host.graphics.as_ref()?.targets;
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let mut differs = false;
+    for (named, &bound) in targets.RTFormats[..count].iter_mut().zip(bound) {
+        if *named != DXGI_FORMAT_UNKNOWN && bound != DXGI_FORMAT_UNKNOWN && *named != bound {
+            *named = bound;
+            differs = true;
+        }
+    }
+    if !differs {
+        return None;
+    }
+    note_other_targets(p, &targets);
+    Some(targets)
+}
+
+/// Draws whose pipeline names other render target formats than the views
+/// bound ([`other_targets`]), by pixel shader and formats: each distinct
+/// case is logged at its first draw and when its count reaches a power of
+/// two (at most 256 cases).
+#[cfg(windows)]
+fn note_other_targets(p: &Pipeline, bound: &windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY) {
+    static SEEN: Mutex<Option<HashMap<(String, [i32; 8], [i32; 8]), u64>>> = Mutex::new(None);
+    let Some(named) = p.host.graphics.as_ref().map(|g| g.targets) else {
+        return;
+    };
+    let pixel = p.shaders.iter().find(|s| s.stage == "pixel").map_or("", |s| s.hash.as_str());
+    let count = (named.NumRenderTargets as usize).min(8);
+    let (named, bound) = (named.RTFormats.map(|f| f.0), bound.RTFormats.map(|f| f.0));
+    let times = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(HashMap::new);
+        let key = (pixel.to_owned(), named, bound);
+        if seen.len() >= 256 && !seen.contains_key(&key) {
+            return;
+        }
+        let times = seen.entry(key).or_insert(0);
+        *times += 1;
+        *times
+    };
+    if times.is_power_of_two() {
+        tracing::info!(
+            pixel,
+            times,
+            named = ?&named[..count],
+            bound = ?&bound[..count],
+            "draws whose pipeline names other render target formats than the views bound"
+        );
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -838,6 +906,19 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+            // A draw into a view of the format named, or into none, writes
+            // as the pipeline says; into an sRGB view, in sRGB.
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+            let bound = |first: i32| {
+                let mut formats = [DXGI_FORMAT(0); 8];
+                formats[0] = DXGI_FORMAT(first);
+                formats[1] = DXGI_FORMAT(10);
+                formats
+            };
+            assert!(other_targets(p, &bound(28)).is_none());
+            assert!(other_targets(p, &bound(0)).is_none());
+            let other = other_targets(p, &bound(29)).unwrap();
+            assert_eq!((other.NumRenderTargets, other.RTFormats[0].0, other.RTFormats[1].0), (1, 29, 0));
         }
     }
 }
