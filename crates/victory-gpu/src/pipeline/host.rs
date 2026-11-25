@@ -222,6 +222,159 @@ impl GraphicsState {
         }
     }
 
+    /// A copy of the state with what the host refuses and the console
+    /// allows put right, and what was put right (empty: nothing, and no
+    /// copy). For a pipeline the host refused as the title described it
+    /// (`E_INVALIDARG`, with no debug layer to say why): it is tried once
+    /// more with this. `VICTORY_PIPELINE_FIX=0`: not tried.
+    /// - formats named past the targets' count (the host wants none there);
+    /// - target formats the host cannot render to, and a depth format it
+    ///   has no depth targets in (as asked of the host device);
+    /// - blending on a target whose format the host cannot blend (integer
+    ///   formats), and logic ops on one it has no logic ops for (one blend
+    ///   description for all targets is made one per target first, so that
+    ///   the others keep theirs);
+    /// - dual-source blending with more than one target;
+    /// - conservative rasterization and a forced sample count;
+    /// - depth and stencil tests without a depth format;
+    /// - no samples, or a quality level with one sample.
+    fn host_fixed(&self, device: &ID3D12Device) -> Option<(GraphicsState, Vec<&'static str>)> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_FIX").is_none_or(|v| v != "0")) {
+            return None;
+        }
+        // What the host does with a format: (support 1, support 2) bits.
+        let support = |format: DXGI_FORMAT| {
+            let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: format,
+                ..Default::default()
+            };
+            // SAFETY: a plain query into a structure of the size passed.
+            let asked = unsafe {
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    std::ptr::from_mut(&mut data).cast(),
+                    size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+                )
+            };
+            asked.map_or((0, 0), |()| (data.Support1.0, data.Support2.0))
+        };
+        let mut fixes = Vec::new();
+        let mut f = self.copy();
+        let count = (f.targets.NumRenderTargets as usize).min(8);
+        for format in &mut f.targets.RTFormats[count..] {
+            if *format != DXGI_FORMAT_UNKNOWN {
+                *format = DXGI_FORMAT_UNKNOWN;
+                fixes.push("formats past the targets' count");
+            }
+        }
+        // A target format the host cannot render to: none (its writes go
+        // nowhere, as the title's draws into such a target did not reach
+        // the host at all without a pipeline).
+        for format in &mut f.targets.RTFormats[..count] {
+            if *format != DXGI_FORMAT_UNKNOWN && support(*format).0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0 {
+                *format = DXGI_FORMAT_UNKNOWN;
+                fixes.push("a target format the host cannot render to");
+            }
+        }
+        if f.depth_format != DXGI_FORMAT_UNKNOWN && support(f.depth_format).0 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL.0 == 0 {
+            f.depth_format = DXGI_FORMAT_UNKNOWN;
+            fixes.push("a depth format the host has no depth targets in");
+        }
+        let formats = f.targets.RTFormats;
+        let blendable: [bool; 8] = std::array::from_fn(|i| {
+            formats[i] != DXGI_FORMAT_UNKNOWN && support(formats[i]).0 & D3D12_FORMAT_SUPPORT1_BLENDABLE.0 != 0
+        });
+        let logic: [bool; 8] = std::array::from_fn(|i| {
+            formats[i] != DXGI_FORMAT_UNKNOWN && support(formats[i]).1 & D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP.0 != 0
+        });
+        // (Of the targets with a format: the host looks at no other.)
+        let off_target = |i: usize, b: &D3D12_RENDER_TARGET_BLEND_DESC| {
+            formats[i] != DXGI_FORMAT_UNKNOWN
+                && ((b.BlendEnable.as_bool() && !blendable[i]) || (b.LogicOpEnable.as_bool() && !logic[i]))
+        };
+        let shared = !f.blend.IndependentBlendEnable.as_bool();
+        let first = f.blend.RenderTarget[0];
+        let bad = (0..count).any(|i| off_target(i, if shared { &first } else { &f.blend.RenderTarget[i] }));
+        if bad {
+            if shared {
+                f.blend.IndependentBlendEnable = true.into();
+                f.blend.RenderTarget = [first; 8];
+            }
+            for i in 0..8 {
+                if off_target(i, &f.blend.RenderTarget[i]) {
+                    let b = &mut f.blend.RenderTarget[i];
+                    b.BlendEnable = false.into();
+                    b.LogicOpEnable = false.into();
+                }
+            }
+            fixes.push("blending or logic ops on a target that cannot have them");
+        }
+        let dual = |b: D3D12_BLEND| {
+            matches!(
+                b,
+                D3D12_BLEND_SRC1_COLOR | D3D12_BLEND_INV_SRC1_COLOR | D3D12_BLEND_SRC1_ALPHA | D3D12_BLEND_INV_SRC1_ALPHA
+            )
+        };
+        let b0 = &f.blend.RenderTarget[0];
+        if count > 1
+            && b0.BlendEnable.as_bool()
+            && [b0.SrcBlend, b0.DestBlend, b0.SrcBlendAlpha, b0.DestBlendAlpha].into_iter().any(dual)
+        {
+            for b in &mut f.blend.RenderTarget {
+                b.BlendEnable = false.into();
+            }
+            fixes.push("dual-source blending with more than one target");
+        }
+        if f.rasterizer.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF {
+            f.rasterizer.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+            fixes.push("conservative rasterization");
+        }
+        if f.rasterizer.ForcedSampleCount != 0 {
+            f.rasterizer.ForcedSampleCount = 0;
+            fixes.push("a forced sample count");
+        }
+        if f.depth_format == DXGI_FORMAT_UNKNOWN && (f.depth.DepthEnable.as_bool() || f.depth.StencilEnable.as_bool()) {
+            f.depth.DepthEnable = false.into();
+            f.depth.StencilEnable = false.into();
+            f.depth_bounds = false;
+            fixes.push("depth or stencil tests without a depth format");
+        }
+        if f.samples.Count == 0 || (f.samples.Count == 1 && f.samples.Quality != 0) {
+            f.samples = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            fixes.push("no samples, or a quality level with one sample");
+        }
+        (!fixes.is_empty()).then_some((f, fixes))
+    }
+
+    /// The state copied (the input elements' names point into the copy's).
+    fn copy(&self) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets: self.targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -598,13 +751,30 @@ impl HostPipeline {
                 &[&code_bytes(&ms_code), &code_bytes(&ps_code)],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, ms_code, ps_code, g, depth_bounds, &name) {
-                Ok(pso) => pso,
-                Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
-                    host.log_messages();
-                    return None;
+            let mut made = mesh_pipeline(&host.device, &root, ms_code, ps_code, g, depth_bounds, &name);
+            if let Err(e) = &made {
+                tracing::warn!(error = %e, ?shaders, state = %state, "host mesh pipeline refused");
+                host.log_messages();
+                // Once more with what the host refuses put right (`host_fixed`).
+                if let Some((fixed, fixes)) = g.host_fixed(&host.device) {
+                    let name = super::library::name(
+                        "mesh triangles",
+                        &root_blob,
+                        &[&code_bytes(&ms_code), &code_bytes(&ps_code)],
+                        &fixed.describe(),
+                    );
+                    made = mesh_pipeline(&host.device, &root, ms_code, ps_code, &fixed, depth_bounds && fixed.depth_bounds, &name);
+                    match &made {
+                        Ok(_) => tracing::warn!(?shaders, ?fixes, "host mesh pipeline made with its state put right"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, ?shaders, ?fixes, "host mesh pipeline refused with its state put right too");
+                            host.log_messages();
+                        }
+                    }
                 }
+            }
+            let Ok(pso) = made else {
+                return None;
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
@@ -704,13 +874,47 @@ impl HostPipeline {
             rect_gs = None;
             made = make(&desc, &name(None));
         }
-        let pso = match made {
-            Ok(pso) => pso,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
-                host.log_messages();
-                return None;
+        if let Err(e) = &made {
+            tracing::warn!(error = %e, ?shaders, state = %state, "host pipeline refused");
+            host.log_messages();
+            // Once more with what the host refuses put right (`host_fixed`).
+            if let Some((fixed, fixes)) = g.host_fixed(&host.device) {
+                let mut again = desc;
+                again.BlendState = fixed.blend;
+                again.RasterizerState = fixed.rasterizer;
+                again.DepthStencilState = fixed.depth;
+                again.NumRenderTargets = fixed.targets.NumRenderTargets;
+                again.RTVFormats = fixed.targets.RTFormats;
+                again.DSVFormat = fixed.depth_format;
+                again.SampleDesc = fixed.samples;
+                let name = super::library::name(
+                    "graphics",
+                    &root_blob,
+                    &[&code_bytes(&again.VS), &code_bytes(&again.PS)],
+                    &fixed.describe(),
+                );
+                made = if depth_bounds && fixed.depth_bounds {
+                    graphics_depth_bounds_pipeline(&host.device, &root, &again, fixed.depth1(), &name)
+                } else {
+                    super::library::pipeline(
+                        &name,
+                        // SAFETY: the description points at live data.
+                        |library, name| unsafe { library.LoadGraphicsPipeline(name, &again) },
+                        // SAFETY: as above.
+                        || unsafe { host.device.CreateGraphicsPipelineState(&again) },
+                    )
+                };
+                match &made {
+                    Ok(_) => tracing::warn!(?shaders, ?fixes, "host pipeline made with its state put right"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, ?fixes, "host pipeline refused with its state put right too");
+                        host.log_messages();
+                    }
+                }
             }
+        }
+        let Ok(pso) = made else {
+            return None;
         };
         tracing::info!(?shaders, "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
@@ -1089,6 +1293,36 @@ mod tests {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         }
+    }
+
+    /// A state the host refuses is put right where it refuses it and
+    /// nowhere else: blending on an integer target off (the other target
+    /// keeps the shared description's blending), a format past the count
+    /// gone; a state the host takes is left alone.
+    #[test]
+    fn a_refused_state_is_put_right_where_the_host_refuses_it() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        let (fixed, fixes) = g.host_fixed(&host.device).expect("put right");
+        assert!(fixes.contains(&"formats past the targets' count"));
+        assert!(fixes.contains(&"blending or logic ops on a target that cannot have them"));
+        assert_eq!(fixed.targets.RTFormats[2], DXGI_FORMAT_UNKNOWN);
+        assert!(fixed.blend.IndependentBlendEnable.as_bool());
+        assert!(fixed.blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!fixed.blend.RenderTarget[1].BlendEnable.as_bool());
+        let mut fine = GraphicsState::default();
+        fine.targets.NumRenderTargets = 1;
+        fine.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        fine.depth_format = DXGI_FORMAT_D32_FLOAT;
+        fine.blend.RenderTarget[0].BlendEnable = true.into();
+        assert!(fine.host_fixed(&host.device).is_none());
     }
 
     /// A mesh pipeline made once is loaded from the library the next time,

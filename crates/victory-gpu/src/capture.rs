@@ -27,7 +27,8 @@ pub(crate) fn listed(n: u64) -> bool {
                 .filter_map(|f| f.trim().parse().ok())
                 .collect()
         })
-        .contains(&n);
+        .contains(&n)
+        || triggered(n);
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
@@ -50,6 +51,67 @@ pub(crate) fn listed(n: u64) -> bool {
     named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
+/// `VICTORY_CAPTURE_WHEN=<text>`: a frame whose frame listing would have a
+/// line holding `<text>` and none of the texts of
+/// `VICTORY_CAPTURE_WHEN_NOT=<text>|<text>...` is captured from that line
+/// on (its listing and its picture), up to `VICTORY_CAPTURE_WHEN_MAX`
+/// frames (4). For passes the title runs only now and then, which a list
+/// of frame numbers misses: the interface layer, a 3840x2160 colour target
+/// the title composites over every frame, was written in none of 65
+/// captured frames (`VICTORY_CAPTURE_WHEN='3840x2160 f28"]'` with
+/// `VICTORY_CAPTURE_WHEN_NOT='pixel a78d088fa55aa495|pixel 4f4ec7b16673362f'`
+/// leaves out the composite and the upscale into the output).
+/// shortcut: every line of every frame is made to be looked at, which
+/// costs; and the frame's lines before the first match are not kept.
+#[cfg(feature = "diagnostics")]
+fn when() -> Option<&'static (String, Vec<String>, usize)> {
+    static WHEN: std::sync::OnceLock<Option<(String, Vec<String>, usize)>> = std::sync::OnceLock::new();
+    WHEN.get_or_init(|| {
+        let text = std::env::var("VICTORY_CAPTURE_WHEN").ok().filter(|t| !t.is_empty())?;
+        let not = std::env::var("VICTORY_CAPTURE_WHEN_NOT")
+            .unwrap_or_default()
+            .split('|')
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let most = std::env::var("VICTORY_CAPTURE_WHEN_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4);
+        Some((text, not, most))
+    })
+    .as_ref()
+}
+
+/// Frames listed by [`when`].
+static TRIGGERED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `frame` was listed by [`when`].
+fn triggered(frame: u64) -> bool {
+    TRIGGERED.lock().unwrap_or_else(|e| e.into_inner()).contains(&frame)
+}
+
+/// Lists `frame` if its line `text` matches [`when`] and frames are left.
+#[cfg(feature = "diagnostics")]
+fn trigger(frame: u64, text: &str) {
+    let Some((wanted, not, most)) = when() else {
+        return;
+    };
+    if !text.contains(wanted.as_str()) || not.iter().any(|n| text.contains(n.as_str())) {
+        return;
+    }
+    // `VICTORY_CAPTURE_WHEN_AFTER=<frame>`: not before that frame (a title's
+    // start screens write the same targets and would use the frames up).
+    static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let after = *AFTER
+        .get_or_init(|| std::env::var("VICTORY_CAPTURE_WHEN_AFTER").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if frame < after {
+        return;
+    }
+    let mut frames = TRIGGERED.lock().unwrap_or_else(|e| e.into_inner());
+    if frames.len() < *most && !frames.contains(&frame) {
+        frames.push(frame);
+        tracing::warn!(frame, "VICTORY_CAPTURE_WHEN: a line matched; the frame is captured from it on");
+    }
+}
+
 /// With a capture folder, for the frames [`listed`]: `what` is added to
 /// the frame's `frame-<n>-ops.txt`, one line per draw, dispatch, copy or
 /// drop in the order recorded (the title records on several threads, so
@@ -60,6 +122,23 @@ pub(crate) fn listed(n: u64) -> bool {
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
     let frame = crate::queue::presented() + 1;
+    // `VICTORY_CAPTURE_WHEN`: the line is made to be looked at; one that
+    // holds the text lists its frame from here on ([`triggered`]).
+    let mut what = Some(what);
+    let mut made = None;
+    if !listed(frame)
+        && when().is_some()
+        && let Some(make) = what.take()
+    {
+        let text = make();
+        trigger(frame, &text);
+        made = Some(text);
+    }
+    let what = move || match (made, what) {
+        (Some(text), _) => text,
+        (None, Some(make)) => make(),
+        (None, None) => String::new(),
+    };
     if !listed(frame) {
         // Before the world: the last lines are kept, and written out when
         // it starts (`before-world-ops.txt`): what the title drew just
