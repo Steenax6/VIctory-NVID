@@ -1134,10 +1134,16 @@ impl<'a> Lower<'a> {
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
+            // within one wave, where the console compiler leaves out barriers;
+            // and samples at an implicit level, which take it from the quad.
             console_lanes = insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
+                    || matches!(
+                        n,
+                        "image_sample" | "image_sample_o" | "image_sample_cl" | "image_sample_b"
+                            | "image_sample_b_cl"
+                    )
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
@@ -4469,6 +4475,39 @@ impl<'a> Lower<'a> {
             117,
             &[x, lane],
         )
+    }
+
+    /// Coarse derivatives of float coordinates `coords` across this lane's
+    /// quad of compute lanes (4n..4n+3), as DXIL gradients: x for up to three
+    /// coordinates (lane 1 less lane 0), then y (lane 2 less lane 0), each
+    /// times `scale` if given; undefined past `coords`.
+    fn quad_gradients(&mut self, coords: &[V], scale: Option<V>) -> Vec<V> {
+        let c = self.cur;
+        let lane = self.lane_index();
+        let not3 = self.s.m.i32(!3);
+        let base = self.s.m.bin(c, Bin::And, lane, not3);
+        let (one, two) = (self.s.m.i32(1), self.s.m.i32(2));
+        let others = [
+            self.s.m.bin(c, Bin::Or, base, one),
+            self.s.m.bin(c, Bin::Or, base, two),
+        ];
+        let fu = self.s.m.undef(self.s.t.f32);
+        let mut g = vec![fu; 6];
+        for (k, &x) in coords.iter().enumerate().take(3) {
+            let xi = self.as_int(x);
+            let origin = self.read_lane(xi, base);
+            let origin = self.as_float(origin);
+            for (d, &at) in others.iter().enumerate() {
+                let there = self.read_lane(xi, at);
+                let there = self.as_float(there);
+                let mut diff = self.s.m.bin(c, Bin::Sub, there, origin);
+                if let Some(s) = scale {
+                    diff = self.s.m.bin(c, Bin::Mul, diff, s);
+                }
+                g[3 * d + k] = diff;
+            }
+        }
+        g
     }
 
     /// The float value of a register value.
@@ -9560,16 +9599,57 @@ impl<'a> Lower<'a> {
             } else {
                 fu
             };
+            // With a16 the bias is an f16 in the low half of its word (the
+            // word is whole, the value is not).
+            let bias = |l: &mut Self| -> Result<V, Why> {
+                let bias = addr_u32(l, usize::from(offset_word))?;
+                Ok(if *a16 {
+                    let low = l.s.m.i32(0xFFFF);
+                    let bias = l.s.m.bin(l.cur, Bin::And, bias, low);
+                    to_float(l, bias)
+                } else {
+                    l.as_float(bias)
+                })
+            };
+            // Outside a pixel shader DXIL (validator 1.6) has no implicit
+            // derivatives: the validator refuses `sample` there ("features
+            // incompatible with the shader stage"). In compute the console
+            // still takes the level from each quad of lanes (lanes 4n..4n+3:
+            // lane 1 less lane 0 across, lane 2 less lane 0 down), so those
+            // differences become explicit gradients; a bias scales them by
+            // 2^bias, the same level for isotropic filtering. (These are the
+            // sky, fog and in-scattering, the ray-traced shadow denoisers,
+            // the irradiance cache and the ray-tracing resolves; they read
+            // level 0 before.) Lanes the console has inactive in a quad give
+            // whatever the host holds there, as on the console.
+            // shortcut: other stages without derivatives (vertex, mesh) read
+            // level 0 (a bias: that level).
+            let quad_grads = matches!(op, 60 | 61)
+                && !self.s.pixel
+                && self.s.threads.is_some()
+                && self.s.mesh.is_none();
             match op {
-                // Outside a pixel shader there are no screen derivatives:
-                // the validator refuses `sample` there ("features
-                // incompatible with the shader stage": 730 compute programs,
-                // among them the G-buffer resolves and the sky), and what a
-                // driver does with it is its own affair.
-                // shortcut: such a sample reads level 0 (a bias: that
-                // level). The console takes derivatives from neighbouring
-                // lanes there; compute them from the lanes if a resolve
-                // shows the wrong mip.
+                60 | 61 if quad_grads => {
+                    self.cross_lane(true)?;
+                    let scale = if op == 61 {
+                        let b = bias(self)?;
+                        Some(self.unary(21, b)) // 2^bias
+                    } else {
+                        None
+                    };
+                    let g = self.quad_gradients(&cs[..spatial], scale);
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(clamp);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
                 60 if !self.s.pixel => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
@@ -9589,16 +9669,7 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    // With a16 the bias is an f16 in the low half of its
-                    // word (the word is whole, the value is not).
-                    let bias = addr_u32(self, usize::from(offset_word))?;
-                    let bias = if *a16 {
-                        let low = self.s.m.i32(0xFFFF);
-                        let bias = self.s.m.bin(c, Bin::And, bias, low);
-                        to_float(self, bias)
-                    } else {
-                        self.as_float(bias)
-                    };
+                    let bias = bias(self)?;
                     args.extend(&os);
                     if self.s.pixel {
                         args.extend([bias, clamp]);

@@ -1710,6 +1710,12 @@ const fn mimg_sample(
 }
 
 fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
+    build_sampled_cs_in(body, vgprs, 1)
+}
+
+/// [`build_sampled_cs`] with `threads` lanes; with more than one the body
+/// stores its own results.
+fn build_sampled_cs_in(body: &[u32], vgprs: u16, threads: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = view table (SRV at 0, UAV at 8 dwords); s[6:7] = sampler table (offset 0).
     words.push(s_mov_b32(5, 0x80));
@@ -1721,7 +1727,9 @@ fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
     // s_load_dwordx4 s[20:23], s[4:5], 0x20
     words.extend_from_slice(&[0xF408_0502, 0xFA00_0020]);
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 20, 0));
+    if threads == 1 {
+        words.extend_from_slice(&buffer_store_dword(0, 20, 0));
+    }
     words.push(S_ENDPGM);
 
     let native = NativeProgram {
@@ -1788,7 +1796,7 @@ fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 7 << 1,
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -2034,6 +2042,85 @@ fn mimg_cube_sample_d_cl_keeps_the_minimum_level() {
                     (got - want).abs() < 0.05,
                     "{backend}: cube image_sample_d_cl g={g} min={min} returned LOD {got}, want {want}",
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn compute_implicit_sample_takes_its_level_from_the_quad() {
+    // Four compute lanes, one quad: lane bit 0 moves s, bit 1 moves t by s0
+    // face units. image_sample (implicit level) on a cube of four levels whose
+    // level m holds m: the level read is log2(s0 * 8), as the console's
+    // coarse derivatives give it (it read level 0 before).
+    let m0 = vec![[0.0f32, 0.0, 0.0, 1.0]; 6 * 8 * 8];
+    let m1 = vec![[1.0f32, 0.0, 0.0, 1.0]; 6 * 4 * 4];
+    let m2 = vec![[2.0f32, 0.0, 0.0, 1.0]; 6 * 2 * 2];
+    let m3 = vec![[3.0f32, 0.0, 0.0, 1.0]; 6];
+    let mips: [&[[f32; 4]]; 4] = [&m0, &m1, &m2, &m3];
+    let mut body = vec![
+        vop2(0x1A, 6, 0x82, 0), // v_lshlrev_b32 v6, 2, v0 (byte offset)
+        vop2(0x1B, 4, 0x81, 0), // v_and_b32 v4, 1, v0
+        vop2(0x16, 5, 0x81, 0), // v_lshrrev_b32 v5, 1, v0
+        vop2(0x1B, 5, 0x81, 5), // v_and_b32 v5, 1, v5
+        vop1(0x006, 4, vgpr(4)), // v_cvt_f32_u32 v4, v4
+        vop1(0x006, 5, vgpr(5)), // v_cvt_f32_u32 v5, v5
+        vop2(0x08, 4, sgpr(0), 4), // v_mul_f32 v4, s0, v4
+        vop2(0x08, 5, sgpr(0), 5), // v_mul_f32 v5, s0, v5
+    ];
+    body.extend([vop2(0x03, 1, 0xFF, 4), 1.5f32.to_bits()]); // v1 = 1.5 + v4
+    body.extend([vop2(0x03, 2, 0xFF, 5), 1.5f32.to_bits()]); // v2 = 1.5 + v5
+    body.push(vop1(0x001, 3, 0x80)); // face 0 (+X)
+    // image_sample (0x20), cube, dmask r, v0 <- v[1:3]
+    body.extend_from_slice(&mimg_sample(0x20, 3, 1, false, 0, 1, 8, 16));
+    body.extend([0xE070_1000, 0x8005_0006]); // buffer_store_dword v0, v6, s[20:23], 0 offen
+    let shader = build_sampled_cs_in(&body, 8, 4);
+    // (steps small enough that the quad stays well inside the face: the
+    // host takes each lane's level against its own direction)
+    let cases: &[(f32, f32)] = &[(0.0625, 0.0), (0.125, 0.0), (0.176_776_7, 0.5), (0.25, 1.0)];
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let sampler = [D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        }];
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            // (the program asks for waves of 32, which WARP does not have)
+            let (root, pso) = match host.compute_pipeline(&shader) {
+                Ok(p) => p,
+                Err(_) if warp => continue,
+                Err(e) => panic!("{backend}: {e}"),
+            };
+            for &(d, want) in cases {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![d.to_bits(), 0, 0, 0, 0, 0, 0]))],
+                            views: &[View::CubeMips(8, &mips), View::RawUav(16)],
+                            samplers: &sampler,
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                for lane in 0..4 {
+                    let got = f32::from_bits(out[0][lane]);
+                    assert!(
+                        (got - want).abs() < 0.1,
+                        "{backend}: lane {lane} step {d} read level {got}, want {want}",
+                    );
+                }
             }
         }
     }
