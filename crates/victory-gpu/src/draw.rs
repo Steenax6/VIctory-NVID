@@ -497,6 +497,42 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Whether the host runs a dispatch of more groups in x than it allows in
+/// one (65,535) as several, each told where its groups start
+/// (`victory_shader::emit::USER_GROUP_BASE`): on, `VICTORY_GROUP_SPLIT=0`
+/// as before (the first 65,535 groups only). The translator reads the same
+/// switch; a program translated with it on in an earlier run (the shader
+/// cache) and run with it off just reads a base of 0.
+fn group_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_SPLIT").is_none_or(|v| v != "0"))
+}
+
+/// The pieces an indirect dispatch whose program reads its group id is run
+/// in (`VICTORY_GROUP_PIECES`, 2: up to 131,070 groups in x; at most
+/// `crate::indirect::MOST_PIECES`). Its count is in the card's memory, so
+/// every such execution is recorded that many times, each piece told where
+/// its groups start, and the clamp gives each its share of the record's
+/// groups: a piece with none costs next to nothing. 1 with the split off.
+pub(crate) fn group_pieces() -> u32 {
+    static PIECES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PIECES.get_or_init(|| {
+        if !group_split() {
+            return 1;
+        }
+        std::env::var("VICTORY_GROUP_PIECES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(2)
+            .clamp(1, crate::indirect::MOST_PIECES)
+    })
+}
+
+/// Since the last frame line: indirect dispatch executions recorded in
+/// pieces, the `ExecuteIndirect` calls they took, and direct dispatches
+/// (compute and mesh) run in pieces.
+pub(crate) static GROUP_PIECES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -818,9 +854,15 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_GROUP_BASE {
+            // The first group of the dispatch being bound: 0 until a
+            // dispatch run in pieces sets it before each piece but the
+            // first ([`State::run_pieces`]).
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -2145,6 +2187,85 @@ impl State {
         });
     }
 
+    /// Where a compute or mesh stage's group base is bound, if the stage
+    /// reads its group id: its user-data root parameter and the dword in it
+    /// (`victory_shader::emit::USER_GROUP_BASE`). None with the split off.
+    fn group_base_slot(p: &HostPipeline) -> Option<(u32, u32)> {
+        if !group_split() {
+            return None;
+        }
+        p.stages.iter().find_map(|stage| {
+            let (param, _) = stage.user_data?;
+            let t = stage.translated();
+            t.host
+                .user_data
+                .iter()
+                .find(|u| u.root == RootType::Other(victory_shader::emit::USER_GROUP_BASE))
+                .map(|u| (param, u.index))
+        })
+    }
+
+    /// Sets the group base of the next piece of a dispatch run in pieces.
+    fn set_group_base(list: &HostList, compute: bool, (param, dword): (u32, u32), base: u32) {
+        // SAFETY: an open list whose root signature has that parameter
+        // (the pipeline's, bound just before).
+        unsafe {
+            if compute {
+                list.list.SetComputeRoot32BitConstant(param, base, dword);
+            } else {
+                list.list.SetGraphicsRoot32BitConstant(param, base, dword);
+            }
+        }
+    }
+
+    /// Runs a direct dispatch of `x` groups in x (`run` records one of the
+    /// count it is given). The host runs at most 65,535 in a dimension: a
+    /// console dispatch over that runs as several, each with the group id
+    /// where it starts, if its program reads its group id (`slot`,
+    /// [`State::group_base_slot`]); one whose program reads none runs its
+    /// first 65,535 groups (a count over the limit is not handed to the
+    /// driver either).
+    fn run_pieces(list: &HostList, compute: bool, slot: Option<(u32, u32)>, x: u32, mut run: impl FnMut(u32)) {
+        use crate::indirect::MOST_GROUPS;
+        match slot {
+            Some(slot) if x > MOST_GROUPS => {
+                let pieces = x.div_ceil(MOST_GROUPS);
+                static COMPUTE: std::sync::Once = std::sync::Once::new();
+                static MESH: std::sync::Once = std::sync::Once::new();
+                (if compute { &COMPUTE } else { &MESH }).call_once(|| {
+                    tracing::info!(
+                        x,
+                        pieces,
+                        what = if compute { "compute" } else { "mesh" },
+                        "a dispatch asks for more groups in x than the host runs: it runs in pieces, each told where \
+                         its groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
+                    );
+                });
+                GROUP_PIECES[2].fetch_add(1, Ordering::Relaxed);
+                let mut at = 0;
+                while at < x {
+                    let n = (x - at).min(MOST_GROUPS);
+                    if at != 0 {
+                        Self::set_group_base(list, compute, slot, at);
+                    }
+                    run(n);
+                    at += n;
+                }
+            }
+            _ => {
+                if x > MOST_GROUPS {
+                    once!(
+                        x,
+                        compute,
+                        "a dispatch asks for more groups in x than the host runs and its program reads no group id \
+                         (or VICTORY_GROUP_SPLIT=0): the groups after 65,535 do not run"
+                    );
+                }
+                run(x.min(MOST_GROUPS));
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2193,8 +2314,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // SAFETY (each piece): an open list with everything set.
+        Self::run_pieces(list, true, Self::group_base_slot(p), x, |n| unsafe { list.list.Dispatch(n, y, z) });
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2463,8 +2584,11 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    // As a dispatch: more groups in x than the host runs go
+                    // in pieces, each told where its groups start.
+                    let slot = crate::pipeline::host_pipeline(self.pipeline as This).and_then(Self::group_base_slot);
+                    // SAFETY (each piece): an open list with everything set.
+                    Self::run_pieces(list, false, slot, x, |n| unsafe { l6.DispatchMesh(n, 1, 1) });
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -3127,9 +3251,21 @@ impl State {
         // records still clamped where they run: 958 a frame in the intro,
         // which can have no window.)
         let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        // A dispatch whose program reads its group id runs in pieces
+        // (`group_pieces`): its count is in the card's memory, so the
+        // execution is recorded once a piece, each told where its groups
+        // start, and the clamp writes each record once a piece with that
+        // piece's share of its groups in x. Every path a dispatch record
+        // takes carries them: clamped here (the copies a record list
+        // apart) and in the prelude (a record apart); windows hold no
+        // dispatch records.
+        let base_slot = (kind == DISPATCH).then(|| Self::group_base_slot(p)).flatten();
+        let pieces = if base_slot.is_some() { group_pieces() } else { 1 };
         let hoisted = (crate::indirect::hoists() && max == 1 && count.is_none() && (hoist_all() || (kind != DISPATCH && !stores)))
-            .then(|| list.hoist((&args.buffer, offset, arguments), kind, stride))
+            .then(|| list.hoist((&args.buffer, offset, arguments), kind, stride, pieces))
             .flatten();
+        // How far apart the pieces' copies are in the clamped buffer.
+        let mut piece_step = u64::from(stride);
         // (Running records with no clamp at all was tried, for timing: in
         // the intro the card ran one frame for seven seconds and the title
         // ended. The records the clamp empties are real.)
@@ -3205,7 +3341,8 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    piece_step = u64::from(step) * u64::from(records);
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), pieces)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -3243,18 +3380,32 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
+        // Piece p from group p * 65,535 on (a dispatch run in pieces; one
+        // piece for everything else). The base is 0 as bound.
+        for piece in 0..pieces {
+            if piece > 0
+                && let Some(slot) = base_slot
+            {
+                Self::set_group_base(list, true, slot, piece * crate::indirect::MOST_GROUPS);
+            }
+            // SAFETY: an open list with everything set; the scratch buffer
+            // and host copies are kept alive by the list, and the signature
+            // is cached. The clamp wrote every piece's copy of the records.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at + u64::from(piece) * piece_step,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            };
+        }
+        if pieces > 1 {
+            GROUP_PIECES[0].fetch_add(1, Ordering::Relaxed);
+            GROUP_PIECES[1].fetch_add(u64::from(pieces), Ordering::Relaxed);
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
