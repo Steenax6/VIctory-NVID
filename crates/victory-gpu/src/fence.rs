@@ -81,6 +81,33 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
+
+/// A reference of ours to a title's fence, for a wait or a signal a queue
+/// holds back or leaves behind the submissions in the air: the title may
+/// release the fence meanwhile, and the signal is set (the wait looked at)
+/// when it is gone.
+pub(crate) struct FenceRef(This);
+
+// SAFETY: a fence's value is atomic and its waiters behind a lock; the
+// reference is only counted.
+unsafe impl Send for FenceRef {}
+
+impl FenceRef {
+    pub(crate) fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this)
+    }
+
+    pub(crate) fn this(&self) -> This {
+        self.0
+    }
+}
+
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.0);
+    }
+}
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
