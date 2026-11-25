@@ -224,7 +224,7 @@ impl Device {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Value {
     Pad(PadState),
     Keys(Vec<KeyState>),
@@ -321,6 +321,182 @@ struct Slot {
     connected: bool,
     sequence: u64,
     history: VecDeque<Ref>,
+    latch: Latch,
+}
+
+/// Whether presses are latched ([`Latch`]): yes, unless
+/// `VICTORY_INPUT_LATCH=0`.
+fn latch_enabled() -> bool {
+    latch_asked(std::env::var_os("VICTORY_INPUT_LATCH").as_deref())
+}
+
+fn latch_asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Presses are latched only on a device the title read the current state
+/// of within this many µs.
+const LATCH_IDLE: u64 = 2_000_000;
+/// The most presses a latch holds for reads to come.
+const LATCH_QUEUE: usize = 16;
+
+/// A title that reads only the current state once a frame misses a tap
+/// that begins and ends between two frames: at our frame rates (a frame
+/// every 90 to 160 ms) that is most taps, and a key had to be held or
+/// hammered. So a button or key pressed since the title last read this
+/// device's current state stays pressed in what we record until such a
+/// read has seen it (presses from different polls one per read, in order,
+/// so taps in sequence are no chord); that read then records the host's own
+/// state, so the release follows in the next read. Only presses are held:
+/// a release of a press the title already saw is recorded at once, and
+/// sticks and triggers are always the latest value. Readers of the history
+/// see every press and release as before, the release of a held press only
+/// later (at the read).
+///
+/// This departs from what the real `GetCurrentReading` returns, which is
+/// why it can be turned off (`VICTORY_INPUT_LATCH=0`); a device the title
+/// has not read that way for [`LATCH_IDLE`] holds nothing.
+#[derive(Default)]
+struct Latch {
+    /// When a current-state read last handed out this device's reading.
+    read: Option<u64>,
+    /// The host's last state, without held presses.
+    raw: Option<Value>,
+    /// Presses since that read, oldest first, each the buttons or keys that
+    /// went down in one poll: each read takes the oldest.
+    buttons: VecDeque<u32>,
+    keys: VecDeque<Vec<KeyState>>,
+}
+
+fn same_key(a: &KeyState, b: &KeyState) -> bool {
+    a.virtual_key == b.virtual_key && a.scan_code == b.scan_code
+}
+
+impl Latch {
+    /// `value` from the host, with the presses since the last read held.
+    fn hold(&mut self, value: Value, now: u64, enabled: bool) -> Value {
+        let reader = self.read.is_some_and(|t| now.saturating_sub(t) < LATCH_IDLE);
+        if !enabled || !reader {
+            self.buttons.clear();
+            self.keys.clear();
+        } else {
+            match (&value, &self.raw) {
+                (Value::Pad(pad), raw) => {
+                    let before = match raw {
+                        Some(Value::Pad(raw)) => raw.buttons,
+                        _ => 0,
+                    };
+                    let pressed = pad.buttons & !before;
+                    if pressed != 0 && self.buttons.len() < LATCH_QUEUE {
+                        self.buttons.push_back(pressed);
+                    }
+                }
+                (Value::Keys(keys), raw) => {
+                    let before: &[KeyState] = match raw {
+                        Some(Value::Keys(raw)) => raw,
+                        _ => &[],
+                    };
+                    let pressed: Vec<KeyState> = keys
+                        .iter()
+                        .filter(|k| !before.iter().any(|b| same_key(b, k)))
+                        .copied()
+                        .collect();
+                    if !pressed.is_empty() && self.keys.len() < LATCH_QUEUE {
+                        self.keys.push_back(pressed);
+                    }
+                }
+            }
+        }
+        self.raw = Some(value.clone());
+        self.apply(value)
+    }
+
+    /// `value` as the next read is to see it: the oldest held press added,
+    /// presses that came after it left for later reads.
+    fn apply(&self, value: Value) -> Value {
+        match value {
+            Value::Pad(mut pad) => {
+                let later = self.buttons.iter().skip(1).fold(0, |a, b| a | b);
+                let first = self.buttons.front().copied().unwrap_or(0);
+                pad.buttons = (pad.buttons & !(later & !first)) | first;
+                Value::Pad(pad)
+            }
+            Value::Keys(mut keys) => {
+                let first: &[KeyState] = self.keys.front().map_or(&[], |k| k);
+                let later = self.keys.iter().skip(1).flatten();
+                let later: Vec<&KeyState> =
+                    later.filter(|l| !first.iter().any(|f| same_key(f, l))).collect();
+                keys.retain(|k| !later.iter().any(|l| same_key(l, k)));
+                for key in first {
+                    if !keys.iter().any(|k| same_key(k, key)) {
+                        keys.push(*key);
+                    }
+                }
+                Value::Keys(keys)
+            }
+        }
+    }
+
+    /// A current-state read saw the device: the oldest held press is let
+    /// go, and the reading the next read is to see is returned when it
+    /// differs from what was recorded.
+    fn seen(&mut self, now: u64, recorded: &Value) -> Option<Value> {
+        self.read = Some(now);
+        // Diagnostics: presses held only by the latch (released again
+        // before this read), which the read would have missed without it.
+        #[cfg(feature = "diagnostics")]
+        match &self.raw {
+            Some(Value::Pad(raw)) => {
+                if let Some(&first) = self.buttons.front()
+                    && first & !raw.buttons != 0
+                {
+                    let buttons = format_args!("{:#x}", first & !raw.buttons);
+                    tracing::info!(buttons, "a tap kept for the title's read (released before it)");
+                }
+            }
+            Some(Value::Keys(raw)) => {
+                let tapped = self.keys.front().into_iter().flatten();
+                for key in tapped.filter(|k| !raw.iter().any(|r| same_key(r, k))) {
+                    let virtual_key = key.virtual_key;
+                    tracing::info!(virtual_key, "a key tap kept for the title's read (released before it)");
+                }
+            }
+            None => {}
+        }
+        self.buttons.pop_front();
+        self.keys.pop_front();
+        let next = self.raw.clone().map(|raw| self.apply(raw))?;
+        (&next != recorded).then_some(next)
+    }
+}
+
+impl Slot {
+    fn record(&mut self, devices: &[Device; DEVICES], index: usize, value: Value, now: u64) {
+        self.sequence += 1;
+        if self.history.len() == HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(Ref::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(1),
+            device: &devices[index],
+            sequence: self.sequence,
+            timestamp: now,
+            value,
+        }));
+    }
+
+    /// A current-state read handed out this device's newest reading: a
+    /// press held for it is let go now.
+    fn seen(&mut self, devices: &[Device; DEVICES], index: usize) {
+        let now = now();
+        let Some(newest) = self.history.back() else {
+            return;
+        };
+        if let Some(raw) = self.latch.seen(now, &newest.value) {
+            self.record(devices, index, raw, now);
+        }
+    }
 }
 
 struct State {
@@ -332,6 +508,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Presses are latched ([`Latch`]).
+    latch: bool,
 }
 
 pub struct Hub {
@@ -377,6 +555,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                latch: latch_enabled(),
             }),
             returned: Condvar::new(),
         }));
@@ -500,24 +679,17 @@ impl State {
         now: u64,
         events: &mut Vec<Event>,
     ) {
+        let latch = self.latch;
         let slot = &mut self.slots[index];
         let was = slot.connected;
         slot.connected = value.is_some();
-        if let Some(value) = value
+        if !was {
+            slot.latch = Latch::default();
+        }
+        if let Some(value) = value.map(|v| slot.latch.hold(v, now, latch))
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
-            slot.sequence += 1;
-            if slot.history.len() == HISTORY {
-                slot.history.pop_front();
-            }
-            slot.history.push_back(Ref::new(Reading {
-                vtable: &READING,
-                refs: AtomicU32::new(1),
-                device: &devices[index],
-                sequence: slot.sequence,
-                timestamp: now,
-                value,
-            }));
+            slot.record(devices, index, value, now);
         }
         if was != slot.connected {
             tracing::info!(device = index, connected = !was, "input device");
@@ -619,32 +791,41 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
-    let newest = |i: usize| {
+    let mut state = hub.state();
+    let newest = |state: &State, i: usize| {
         state.slots[i]
             .history
             .back()
-            .filter(|r| r.kind() & kind != 0)
+            .is_some_and(|r| r.kind() & kind != 0)
+            .then_some(i)
     };
     let found = if device.is_null() {
         (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
-            .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
+            .filter_map(|i| newest(&state, i))
+            .max_by_key(|&i| state.slots[i].history.back().map(|r| r.timestamp))
     } else {
         match hub.index(device) {
             None => return fail(out, E_INVALIDARG),
             Some(i) if !state.slots[i].connected => return fail(out, DEVICE_DISCONNECTED),
-            Some(i) => newest(i),
+            Some(i) => newest(&state, i),
         }
     };
     tracing::trace!(
         kind = format_args!("{kind:#x}"),
         device = ?hub.index(device),
-        sequence = found.map(|r| r.sequence),
+        sequence = found.and_then(|i| state.slots[i].history.back()).map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let Some(index) = found else {
+        return hand(out, None);
+    };
+    let result = hand(out, state.slots[index].history.back());
+    if result == S_OK {
+        // What the title has now seen is let go of.
+        state.slots[index].seen(&hub.devices, index);
+    }
+    result
 }
 
 /// The reading after (`forward`) or before `reference`: on `device`, or with
@@ -1595,6 +1776,8 @@ mod tests {
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
         let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
+        // Whatever the environment says: one test turns it off itself.
+        hub.state().latch = true;
         hub.poll();
         (hub, host)
     }
@@ -1943,6 +2126,218 @@ mod tests {
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
         poller.join().unwrap();
         leave.join().unwrap();
+    }
+
+    #[test]
+    fn the_latch_is_on_unless_turned_off() {
+        assert!(latch_asked(None));
+        assert!(latch_asked(Some("1".as_ref())));
+        assert!(latch_asked(Some("".as_ref())));
+        assert!(!latch_asked(Some("0".as_ref())));
+    }
+
+    /// A host pad at rest that counts as connected: a little stick drift.
+    fn resting() -> PadState {
+        PadState {
+            right_y: 0.001,
+            ..Default::default()
+        }
+    }
+
+    fn buttons(hub: &Hub, device: usize) -> u32 {
+        let r = current(hub, GAMEPAD_KIND, device).unwrap();
+        let b = pad(r).buttons;
+        release(r);
+        b
+    }
+
+    fn held_keys(hub: &Hub) -> Vec<u8> {
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let mut got = [KeyState::default(); 8];
+        let state =
+            slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
+        let n = state(r, 8, got.as_mut_ptr()) as usize;
+        release(r);
+        got[..n].iter().map(|k| k.virtual_key).collect()
+    }
+
+    #[test]
+    fn a_tap_between_current_reads_is_pressed_in_one_read_and_released_in_the_next() {
+        let (hub, host) = fake();
+        // The title reads the stand-in pad every frame.
+        assert_eq!(buttons(hub, FALLBACK), 0);
+        host.lock().unwrap().keys = vec![key(0x0D)];
+        hub.poll();
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        let tap = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(tap).buttons, A);
+        // The title's edge check sees the press.
+        let before = walk(hub, 0x30, tap).unwrap();
+        assert_eq!(pad(before).buttons, 0);
+        release(before);
+        // The next read, with or without a poll between, has it released.
+        let next = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(next).buttons, 0);
+        assert!(stamp(next).1 > stamp(tap).1);
+        hub.poll();
+        let after = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(after, next);
+        for r in [tap, next, after] {
+            release(r);
+        }
+    }
+
+    #[test]
+    fn a_held_button_stays_pressed_and_its_release_is_not_delayed() {
+        let (hub, host) = fake();
+        assert_eq!(buttons(hub, FALLBACK), 0);
+        host.lock().unwrap().keys = vec![key(0x0D)];
+        for _ in 0..3 {
+            hub.poll();
+            assert_eq!(buttons(hub, FALLBACK), A);
+        }
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(buttons(hub, FALLBACK), 0);
+    }
+
+    #[test]
+    fn sticks_and_triggers_stay_the_latest_value() {
+        let (hub, host) = fake();
+        assert_eq!(buttons(hub, FALLBACK), 0);
+        host.lock().unwrap().keys = vec![key(b'W'), key(b'C'), key(0x0D)];
+        hub.poll();
+        host.lock().unwrap().keys = vec![key(b'D')];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A,
+                left_x: 1.0,
+                ..Default::default()
+            }
+        );
+        release(r);
+    }
+
+    #[test]
+    fn a_host_pad_tap_is_latched_too() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(resting());
+        hub.poll();
+        assert_eq!(buttons(hub, 0), 0);
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: B | X,
+            left_x: 0.5,
+            ..Default::default()
+        });
+        hub.poll();
+        // B let go, X still held.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: X,
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: B | X,
+                ..Default::default()
+            }
+        );
+        release(r);
+        assert_eq!(buttons(hub, 0), X);
+    }
+
+    /// Different buttons tapped one after another between two reads are
+    /// handed out one per read, not as a chord nobody pressed.
+    #[test]
+    fn taps_in_sequence_are_not_reported_as_a_chord() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(resting());
+        hub.poll();
+        assert_eq!(buttons(hub, 0), 0);
+        for b in [A, 0, B, 0] {
+            host.lock().unwrap().pads[0] = Some(PadState {
+                buttons: b,
+                ..Default::default()
+            });
+            hub.poll();
+        }
+        assert_eq!(buttons(hub, 0), A, "the first tap");
+        assert_eq!(buttons(hub, 0), B, "then the second, alone");
+        assert_eq!(buttons(hub, 0), 0);
+        // Pressed together in one poll: still one chord.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A | B,
+            ..Default::default()
+        });
+        hub.poll();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(buttons(hub, 0), A | B);
+        assert_eq!(buttons(hub, 0), 0);
+    }
+
+    #[test]
+    fn key_taps_in_sequence_are_not_reported_together() {
+        let (hub, host) = fake();
+        assert_eq!(held_keys(hub), Vec::<u8>::new());
+        for keys in [vec![key(b'Q')], vec![], vec![key(b'E')], vec![]] {
+            host.lock().unwrap().keys = keys;
+            hub.poll();
+        }
+        assert_eq!(held_keys(hub), [b'Q']);
+        assert_eq!(held_keys(hub), [b'E']);
+        assert_eq!(held_keys(hub), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_key_tap_between_current_reads_is_latched_on_the_keyboard() {
+        let (hub, host) = fake();
+        host.lock().unwrap().keys = vec![key(b'Q')];
+        hub.poll();
+        assert_eq!(held_keys(hub), [b'Q']);
+        host.lock().unwrap().keys = vec![key(b'Q'), key(b'E')];
+        hub.poll();
+        host.lock().unwrap().keys = vec![key(b'Q')];
+        hub.poll();
+        assert_eq!(held_keys(hub), [b'Q', b'E']);
+        assert_eq!(held_keys(hub), [b'Q']);
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(held_keys(hub), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn without_current_reads_or_with_the_latch_off_the_history_is_as_recorded() {
+        for off in [false, true] {
+            let (hub, host) = fake();
+            let first = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            if off {
+                hub.state().latch = false;
+            } else {
+                // No current read for longer than the latch waits.
+                hub.state().slots[FALLBACK].latch.read = Some(0);
+                std::thread::sleep(Duration::from_micros(LATCH_IDLE.saturating_sub(now())));
+            }
+            host.lock().unwrap().keys = vec![key(0x0D)];
+            hub.poll();
+            host.lock().unwrap().keys.clear();
+            hub.poll();
+            let press = walk(hub, 0x28, first).unwrap();
+            assert_eq!(pad(press).buttons, A);
+            let up = walk(hub, 0x28, press).unwrap();
+            assert_eq!(pad(up).buttons, 0);
+            assert_eq!(walk(hub, 0x28, up), Err(READING_NOT_FOUND));
+            assert_eq!(buttons(hub, FALLBACK), 0);
+            for r in [first, press, up] {
+                release(r);
+            }
+        }
     }
 
     /// A receiver whose pad is switched off answers with an all-zero state:

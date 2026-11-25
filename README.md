@@ -53,7 +53,10 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
 (`-Cache`, `-Data`; by default under `%LOCALAPPDATA%\steenax`) and presses no buttons for you. Controller: XInput pads
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
-keyboard acts as one while the game window has focus (Enter is A).
+keyboard acts as one while the game window has focus (Enter is A). A tap
+shorter than a frame is not lost: a button or key pressed between two of the
+game's reads stays pressed for its next read, and the release follows in the
+read after (`VICTORY_INPUT_LATCH=0` turns this off).
 
 `VICTORY_AUTO_START=1` answers the start screen's "press A" for you: A is
 pressed briefly every 2 s from the moment the game adds its user until it
