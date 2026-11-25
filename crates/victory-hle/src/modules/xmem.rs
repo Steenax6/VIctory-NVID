@@ -659,31 +659,116 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
-/// Whether every page under `[offset, offset + len)` is known (a write that
-/// fails with them known is a host failure).
-pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
-    runs(pages, offset, len).is_some()
+/// Bytes `[offset, offset + len)` of physical pages, resolved to the
+/// sections behind them: the page numbers are read once, and the sections
+/// are held, so the title may change its page list, or free the pages,
+/// before the bytes are written without the write going astray.
+/// DirectStorage resolves a request's list when the title submits it.
+pub(crate) struct PageRuns {
+    runs: Vec<(Slice, usize)>,
+    within: usize,
+    len: usize,
 }
 
-/// Copies `data` into physical pages, from `offset` bytes into the first,
-/// whether or not they are mapped anywhere (DirectStorage destinations).
-/// One view per run of consecutive pages, not one per page: each view
-/// costs a map, a commit and an unmap (which flushes every core's TLB).
-/// False if a page is unknown or the host fails.
-pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
-    };
-    let (mut within, mut done) = (offset % PAGE, 0);
-    for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
-            return false;
+/// Bytes `[offset, offset + len)` of `pages`, resolved; `None` if a page is
+/// unknown or `pages` ends early.
+pub(crate) fn resolve_pages(pages: &[usize], offset: usize, len: usize) -> Option<PageRuns> {
+    Some(PageRuns {
+        runs: runs(pages, offset, len)?,
+        within: offset % PAGE,
+        len,
+    })
+}
+
+impl PageRuns {
+    /// The bytes in place when they are consecutive pages of one section
+    /// (how titles usually hand them out); `None` otherwise or on a host
+    /// failure, when [`PageRuns::write`] serves.
+    pub(crate) fn window(&self) -> Option<PageWindow> {
+        let [(slice, n)] = self.runs.as_slice() else {
+            return None;
         };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
-        (within, done) = (0, done + k);
+        Some(PageWindow {
+            view: View::map(slice, *n)?,
+            within: self.within,
+            len: self.len,
+        })
     }
-    true
+
+    /// Copies `data` (at most the resolved bytes) in, whether or not the
+    /// pages are mapped anywhere. One view per run of consecutive pages,
+    /// not one per page: each view costs a map, a commit and an unmap
+    /// (which flushes every core's TLB). False if the host fails.
+    pub(crate) fn write(&self, data: &[u8]) -> bool {
+        let data = &data[..data.len().min(self.len)];
+        let (mut within, mut done) = (self.within, 0);
+        for (slice, n) in &self.runs {
+            if done == data.len() {
+                break;
+            }
+            let Some(mut view) = View::map(slice, *n) else {
+                return false;
+            };
+            let k = (n * PAGE - within).min(data.len() - done);
+            view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+            (within, done) = (0, done + k);
+        }
+        true
+    }
+
+    /// The title addresses that show the first `len` of the bytes now, as
+    /// runs (address, bytes) in address order: a write through a view of
+    /// our own lands there too, and nothing that watches those addresses
+    /// sees it (the GPU side's guards fault only on a write at the guarded
+    /// address itself). Byte for byte, not by whole pages: the title packs
+    /// several small textures into one page and fills each with a request
+    /// of its own. A page no view shows (unmapped since) adds nothing.
+    fn shown(&self, len: usize) -> Vec<(usize, usize)> {
+        let mut pieces = Vec::new();
+        {
+            let physical = physical();
+            let (mut within, mut left) = (self.within, len.min(self.len));
+            for (slice, n) in &self.runs {
+                for k in 0..*n {
+                    if left == 0 {
+                        break;
+                    }
+                    let bytes = (PAGE - within).min(left);
+                    if let Some(addresses) = physical.shown.get(&slice.key(k)) {
+                        pieces.extend(addresses.iter().map(|&at| (at + within, bytes)));
+                    }
+                    (within, left) = (0, left - bytes);
+                }
+            }
+        }
+        pieces.sort_unstable();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (at, bytes) in pieces {
+            match runs.last_mut() {
+                Some((start, n)) if *start + *n == at => *n += bytes,
+                _ => runs.push((at, bytes)),
+            }
+        }
+        runs
+    }
+
+    /// The first `len` bytes have been written through a view of our own:
+    /// the GPU side is told at every title address that shows them
+    /// (`victory_gpu::title_memory_written`; what it does with it is
+    /// `VICTORY_PAGE_WRITES`' to say, and it counts either way). Call when
+    /// the bytes are there, and without the page table's lock.
+    pub(crate) fn written(&self, len: usize) {
+        for (at, bytes) in self.shown(len) {
+            victory_gpu::title_memory_written(at, bytes, true);
+        }
+    }
+}
+
+/// Copies `data` into physical pages, from `offset` bytes into the first
+/// (see [`PageRuns::write`]). False if a page is unknown or the host fails.
+#[cfg(test)]
+pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    resolve_pages(pages, offset, data.len()).is_some_and(|runs| runs.write(data))
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -702,73 +787,18 @@ impl PageWindow {
     }
 }
 
-/// A window on bytes `[offset, offset + len)` of `pages` when they are
-/// consecutive pages of one allocation (how titles usually hand them out);
-/// `None` otherwise (pages of several allocations, out of order, or
-/// unknown, or a host failure), which `write_physical` then handles or
-/// reports.
+/// A window on bytes `[offset, offset + len)` of `pages` (see
+/// [`PageRuns::window`]).
+#[cfg(test)]
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
-        return None;
-    };
-    Some(PageWindow {
-        view: View::map(slice, *n)?,
-        within: offset % PAGE,
-        len,
-    })
+    resolve_pages(pages, offset, len)?.window()
 }
 
 /// The title addresses that show bytes `[offset, offset + len)` of `pages`
-/// now, byte for byte, as runs (address, bytes) in address order: a write
-/// to the pages through a view of our own ([`page_window`],
-/// [`write_physical`]) lands there too, and nothing that watches those
-/// addresses sees it (the GPU side's guards fault only on a write at the
-/// guarded address itself). Empty if no view shows them. Byte for byte,
-/// not by whole pages: the title packs several small textures into one
-/// page and fills each with a request of its own.
+/// now (see [`PageRuns::shown`]); empty if a page is unknown.
+#[cfg(test)]
 pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
-    let Some(end) = offset.checked_add(len) else {
-        return Vec::new();
-    };
-    let first = offset / PAGE;
-    let Some(touched) = pages.get(first..end.div_ceil(PAGE)) else {
-        return Vec::new();
-    };
-    let mut pieces: Vec<(usize, usize)> = Vec::new();
-    {
-        let physical = physical();
-        for (i, page) in touched.iter().enumerate() {
-            let Some(addresses) = physical.pages.get(page).and_then(|slice| physical.shown.get(&slice.key(0))) else {
-                continue;
-            };
-            // The bytes of this page that the write covers.
-            let lo = if i == 0 { offset % PAGE } else { 0 };
-            let hi = (end - (first + i) * PAGE).min(PAGE);
-            pieces.extend(addresses.iter().map(|&at| (at + lo, hi - lo)));
-        }
-    }
-    pieces.sort_unstable();
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (at, bytes) in pieces {
-        match runs.last_mut() {
-            Some((start, n)) if *start + *n == at => *n += bytes,
-            _ => runs.push((at, bytes)),
-        }
-    }
-    runs
-}
-
-/// Bytes `[offset, offset + len)` of `pages` have been written through a
-/// view of our own: the GPU side is told at every title address that
-/// shows them (`victory_gpu::title_memory_written`; what it does with it
-/// is `VICTORY_PAGE_WRITES`' to say, and it counts either way). Call when
-/// the bytes are there, and without the page table's lock ([`shown_at`]
-/// takes and leaves it).
-pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
-    for (at, bytes) in shown_at(pages, offset, len) {
-        victory_gpu::title_memory_written(at, bytes, true);
-    }
+    resolve_pages(pages, offset, len).map_or_else(Vec::new, |runs| runs.shown(len))
 }
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
