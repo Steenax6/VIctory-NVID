@@ -591,9 +591,13 @@ fn fill_block(context: Context, voice: &mut Voice, ring: &Mutex<Takes>) -> bool 
     }
     voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
     let write = (write + 1) % size;
-    context.set_field(0, 27, 5, write);
     // The read block and "writable" are the read-advance command's too.
+    // Taken before the write block moves: a read-advance between the two
+    // could take the block just written, leaving the ring empty with read
+    // at write, and the check below would then mark the empty ring full,
+    // stopping the voice for good.
     let _ring = lock(ring);
+    context.set_field(0, 27, 5, write);
     // The read block is the title's: taken modulo the ring like the write
     // block and `advance_read`'s. Compared as it is, one at or past the end
     // would never be met, and a stream that loops would keep this voice
