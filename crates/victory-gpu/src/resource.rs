@@ -1133,6 +1133,9 @@ pub(crate) struct HostTexture {
     pub(crate) tiled: Option<crate::tiles::Tiled>,
     /// For such a texture: kept for reuse when it goes ([`keep_reserved`]).
     reuse: Option<ReuseKey>,
+    /// Made in the PC's memory the card reads over the bus ([`spill_on`]):
+    /// counted in [`SPILLED`] while it lives, not as the card's.
+    spilled: bool,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1379,6 +1382,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             };
             leave_out = drop_policy().levels(&shape, filled_for_policy());
         }
+        // Into the PC's memory the card reads over the bus ([`spill_on`]):
+        // a texture the title fills, made whole while the card has no room
+        // and that memory has. While it has, no texture leaves levels out:
+        // the levels go only once both are full.
+        let spill_room = spill_on() && fills(&r.desc) && shared_room_lately();
+        if spill_room {
+            leave_out = 0;
+        }
+        let spill = spill_room && !room_lately();
         if shape_fits && r.host.placed.load(Relaxed) && (crate::tiles::wanted() || leave_out > 0) {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
@@ -1402,7 +1414,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                     }
                     None => {
                         RESERVED_REUSE[1].fetch_add(1, Relaxed);
-                        host_texture_as(&r.desc, r.host.state, clear, true, false)
+                        host_texture_as(&r.desc, r.host.state, clear, true, false, false).map(|(t, _)| t)
                     }
                 }
             } else {
@@ -1430,9 +1442,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && fills(&r.desc)
             && texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
         let began = std::time::Instant::now();
-        let texture = match texture {
-            Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear, placed),
+        let (texture, spilled) = match texture {
+            Some(texture) => (Some(texture), false),
+            None => host_texture(&r.desc, r.host.state, clear, placed, spill).map_or((None, false), |(t, s)| (Some(t), s)),
         };
         if r.host.placed.load(Relaxed) {
             MAKING[0].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
@@ -1465,6 +1477,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
+        }
+        if spilled {
+            host.spilled = true;
+            SPILLED[0].fetch_add(1, Relaxed);
+            SPILLED[1].fetch_add(host.bytes, Relaxed);
+            SPILLED[2].fetch_add(1, Relaxed);
+            SPILLED[3].fetch_add(host.bytes, Relaxed);
         }
         if r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
@@ -1568,7 +1587,8 @@ fn drop_policy() -> &'static crate::tiles::DropPolicy {
 #[cfg(windows)]
 fn filled_for_policy() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    KINDS[1].load(Relaxed) + crate::tiles::given_total() + crate::tiles::STATS[11].load(Relaxed)
+    (KINDS[1].load(Relaxed) + crate::tiles::given_total() + crate::tiles::STATS[11].load(Relaxed))
+        .saturating_sub(SPILLED[1].load(Relaxed))
 }
 
 /// Brings levels back to host copies made without them, while the card
@@ -1593,7 +1613,8 @@ pub(crate) fn promote_reduced(room: bool, waiting: u64) -> u64 {
     let per_frame = *PER_FRAME.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_PROMOTE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20
     });
-    if !room || waiting > 0 || per_frame == 0 || crate::tiles::STATS[12].load(Relaxed) == 0 {
+    // (`room` may be the PC's memory's: levels brought back are the card's.)
+    if !room || waiting > 0 || per_frame == 0 || crate::tiles::STATS[12].load(Relaxed) == 0 || !room_lately() {
         return 0;
     }
     let now = crate::host::now_ms();
@@ -1657,14 +1678,23 @@ pub(crate) fn host_made<'a>(
 }
 
 /// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// shaders that pick textures by index (`draw.rs` `heap_textures`): while
+/// the card has room for them ([`card_room`]) or, past that, the PC's
+/// memory the card reads over the bus has ([`spill_on`]).
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
+    card_room() || spill_on() && shared_room()
+}
+
+/// Whether the card has room for more host copies of textures the title
+/// fills: always up to `FLOOR` bytes of them on the card, beyond that while
+/// the card's memory in use by this process is under nine tenths of the
+/// budget the system gives it ([`room_percent`] says another share;
+/// `VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes
+/// instead). Past the budget the system moves the card's memory into the
+/// PC's, which ended runs 20 and 24.
+#[cfg(windows)]
+pub(crate) fn card_room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
@@ -1674,8 +1704,9 @@ pub(crate) fn room() -> bool {
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
     });
     // (With the tiles of the copies made level by level, whose own bytes
-    // count as none: `crate::tiles`.)
-    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    // count as none: `crate::tiles`; without the copies in the PC's
+    // memory.)
+    let filled = (KINDS[1].load(Relaxed) + crate::tiles::given_total()).saturating_sub(SPILLED[1].load(Relaxed));
     if let Some(limit) = limit {
         return filled < limit;
     }
@@ -1727,8 +1758,9 @@ pub(crate) fn targets_room_kept() -> u64 {
     most.saturating_sub(targets)
 }
 
-/// [`room`] as it was at most a tenth of a second ago, for a question
-/// asked of many textures a frame ([`room`] asks the system each time).
+/// [`card_room`] as it was at most a tenth of a second ago, for a question
+/// asked of many textures a frame ([`card_room`] asks the system each
+/// time).
 #[cfg(windows)]
 pub(crate) fn room_lately() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1740,10 +1772,108 @@ pub(crate) fn room_lately() -> bool {
     if last >> 1 == tenth {
         return last & 1 != 0;
     }
-    let room = room();
+    let room = card_room();
     LAST.store((tenth << 1) | u64::from(room), Relaxed);
     room
 }
+
+/// Whether host copies of textures the title fills go on into the PC's
+/// memory the system lets the card reach over the bus once the card has no
+/// room ([`card_room`]), made whole, instead of waiting for room or being
+/// made without their most detailed levels (on by default;
+/// `VICTORY_TEXTURE_SPILL=0`: they wait or leave levels out, as before).
+/// The order as memory fills: whole on the card, then whole in the PC's
+/// memory while it has room ([`shared_room`]), and only past that without
+/// levels (`crate::tiles::DropPolicy`). A texture there is read over the
+/// bus, slower than the card's own memory, but it is there and whole.
+/// From fxceless/victory-fork pull request #601 (DiogoPCastelos: on a
+/// 6 GB card skin, walls and clothes sampled black while their textures
+/// waited for room; with the spill they had their colours) and
+/// NitricAcidDev/VIctory-Omega-Fork 4237574084 (the textures made there
+/// explicitly: on an RTX 5080 the texels right, none of the card's memory
+/// taken, read at 46.9 GB/s against 218.8).
+#[cfg(windows)]
+pub(crate) fn spill_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SPILL").is_none_or(|v| v != "0"))
+}
+
+/// Whether the PC's memory shared with the card has room for more host
+/// copies of textures: its use by this process under
+/// `VICTORY_TEXTURE_SPILL_PERCENT` (50; 10 to 90) of the budget the system
+/// gives it (the rest for our upload and read-back buffers and the copies
+/// of title buffers kept there), and more than [`SPILL_RAM_FLOOR`] of the
+/// PC's memory free (the title commits much of it itself).
+#[cfg(windows)]
+fn shared_room() -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SPILL_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(50, |p| p.clamp(10, 90))
+    });
+    let Some([.., budget, used]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return false;
+    };
+    shared_has_room(budget, used, percent, crate::host::available_physical_ram())
+}
+
+/// The PC's memory left free that a texture in it may not take.
+#[cfg(windows)]
+const SPILL_RAM_FLOOR: u64 = 4 << 30;
+
+/// [`shared_room`]'s rule: `used` of the shared `budget` under `percent` of
+/// it, and (if known) more than [`SPILL_RAM_FLOOR`] of the PC's memory free.
+#[cfg(windows)]
+fn shared_has_room(budget: u64, used: u64, percent: u64, free_ram: Option<u64>) -> bool {
+    used < budget / 100 * percent && free_ram.is_none_or(|free| free > SPILL_RAM_FLOOR)
+}
+
+/// [`shared_room`] as it was at most a tenth of a second ago (as
+/// [`room_lately`]).
+#[cfg(windows)]
+fn shared_room_lately() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 1 == tenth {
+        return last & 1 != 0;
+    }
+    let room = shared_room();
+    LAST.store((tenth << 1) | u64::from(room), Relaxed);
+    room
+}
+
+/// Host copies in the PC's memory ([`spill_on`]): alive and their bytes,
+/// made since the start and their bytes, and those that memory refused
+/// (made on the card instead).
+#[cfg(windows)]
+pub(crate) static SPILLED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The line on host copies in the PC's memory, every few seconds; nothing
+/// until there is one.
+#[cfg(windows)]
+pub(crate) fn spill_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [alive, bytes, made, made_bytes, refused] = [0, 1, 2, 3, 4].map(|i| SPILLED[i].load(Relaxed));
+    if made + refused == 0 {
+        return;
+    }
+    let shared = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .map_or_else(|| "unknown".to_owned(), |[.., budget, used]| format!("{} of {} MB", used >> 20, budget >> 20));
+    tracing::info!(
+        "host copies of textures in the PC's memory the card reads over the bus (VICTORY_TEXTURE_SPILL; the card had no \
+         room): {alive} alive, {} MB; since the start {made} made, {} MB, {refused} refused and made on the card; {} \
+         heaps of placed textures there; the PC's shared memory in use: {shared}",
+        bytes >> 20,
+        made_bytes >> 20,
+        crate::placed::shared_heaps(),
+    );
+}
+
 
 /// The share of the card's budget, in percent, up to which host copies of
 /// textures picked by index are made ([`room`]): 90 unless
@@ -2222,6 +2352,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             reuse: None,
+            spilled: false,
         }
     }
 
@@ -2243,6 +2374,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             reuse: Some(reuse),
+            spilled: false,
         }
     }
 }
@@ -2256,6 +2388,10 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        if self.spilled {
+            SPILLED[0].fetch_sub(1, Relaxed);
+            SPILLED[1].fetch_sub(self.bytes, Relaxed);
         }
         // A texture without memory of its own is kept for the next one of
         // its description: its tiles are taken from it on the queue (ahead
@@ -2430,19 +2566,22 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags; with `spill`, in the PC's
+/// memory the card reads over the bus ([`spill_on`]). Also whether it went
+/// there (a texture that memory refuses is made on the card).
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
     placed: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_as(desc, state, clear, false, placed)
+    spill: bool,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, bool)> {
+    host_texture_as(desc, state, clear, false, placed, spill)
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
-/// tiles level by level (`crate::tiles`).
+/// tiles level by level (`crate::tiles`; never spilled).
 #[cfg(windows)]
 fn host_texture_as(
     desc: &ResourceDesc,
@@ -2450,7 +2589,8 @@ fn host_texture_as(
     clear: *const c_void,
     reserved: bool,
     placed: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    spill: bool,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, bool)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2500,21 +2640,54 @@ fn host_texture_as(
         }
         value
     });
+    // Only a texture the title fills goes to the PC's memory (the host
+    // never renders to it or writes it there).
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    let spill = spill && !reserved && d.flags & TARGET_DEPTH_UNORDERED == 0;
     if placed && !reserved {
         let state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
         // SAFETY: the description has the host layout (checked size, same
         // fields).
         let of = unsafe { &*(&raw const d).cast::<D3D12_RESOURCE_DESC>() };
-        if let Some(t) = crate::placed::make(&host.device, of, state) {
+        if let Some(t) = crate::placed::make(&host.device, of, state, spill) {
             crate::host::name(&t, || format!("placed texture {}x{} f{}", d.width, d.height, d.format));
-            return Some(t);
+            return Some((t, spill));
+        }
+    }
+    let mut texture: Option<ID3D12Resource> = None;
+    if spill {
+        // SAFETY: as below, in the PC's memory.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &crate::placed::shared_heap(),
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+                None,
+                &mut texture,
+            )
+        };
+        match made {
+            Ok(()) if texture.is_some() => {
+                crate::host::name(texture.as_ref()?, || {
+                    format!("texture in the PC's memory {}x{} f{}", d.width, d.height, d.format)
+                });
+                return texture.map(|t| (t, true));
+            }
+            Ok(()) => {}
+            Err(e) => {
+                SPILLED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(error = %e, desc = ?d, "a texture could not be made in the PC's memory: made on the card")
+                });
+            }
         }
     }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
@@ -2555,7 +2728,7 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|t| (t, false))
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -2598,7 +2771,7 @@ impl OnDemand {
     /// [`crate::tiles::Tiled::uploaded`]; `memory`: where the texture's
     /// title memory starts (its slots are made again if the first level
     /// they may show changed).
-    /// Held levels get tiles only while the card has room ([`room`]).
+    /// Held levels get tiles only while the card has room ([`card_room`]).
     /// `copied`: the levels the upload's list wrote.
     /// Returns whether a level is still without its tiles: the caller
     /// records the upload again later.
@@ -2606,7 +2779,7 @@ impl OnDemand {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, copied, room());
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, copied, card_room());
         if changed {
             self.views_changed(memory);
         }
@@ -3281,6 +3454,20 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// The PC's shared memory takes textures up to its share of the budget
+    /// and while the PC keeps its floor free.
+    #[cfg(windows)]
+    #[test]
+    fn the_shared_memory_takes_textures_up_to_its_share() {
+        const GB: u64 = 1 << 30;
+        assert!(shared_has_room(32 * GB, 2 * GB, 50, Some(40 * GB)));
+        assert!(shared_has_room(32 * GB, 2 * GB, 50, None));
+        assert!(!shared_has_room(32 * GB, 16 * GB, 50, Some(40 * GB)));
+        assert!(shared_has_room(32 * GB, 15 * GB, 50, Some(40 * GB)));
+        assert!(!shared_has_room(32 * GB, 2 * GB, 50, Some(SPILL_RAM_FLOOR)));
+        assert!(!shared_has_room(0, 0, 50, None));
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

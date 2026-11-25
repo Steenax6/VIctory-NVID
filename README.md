@@ -169,6 +169,23 @@ swizzle mode is counted as passed over until `victory-formats` has the
 address patterns of those modes (the log says "could not be tiled
 e=Unsupported" once).
 
+## When the card's memory is full
+
+`VICTORY_TEXTURE_SPILL` (on by default; `=0`: as on 2026-11-25): once the
+card has no room for more of the game's textures, their host copies are made
+whole in the PC's memory that the system lets the card read over the bus,
+instead of waiting for room. As memory fills, a texture is made whole on the
+card, then whole in the PC's memory, and only once that has no room either
+without its most detailed levels (`VICTORY_TEXTURE_DROP_LEVELS` above, which
+with the spill waits for that point). A texture in the PC's memory is read
+more slowly, but it is there and whole (fxceless/victory-fork pull request
+#601, NitricAcidDev/VIctory-Omega-Fork `4237574084`).
+`VICTORY_TEXTURE_SPILL_PERCENT` (50; 10 to 90) is the share of the system's
+budget for that memory the textures may fill; 4 GB of the PC's memory are
+always left free. The log line "host copies of textures in the PC's memory"
+counts them and their bytes. Not yet measured in a run here: compare the
+frame rate and the memory line with `=0`.
+
 ## Shader warm-up (optional)
 
 A build that changes the shader translator starts with an empty shader
