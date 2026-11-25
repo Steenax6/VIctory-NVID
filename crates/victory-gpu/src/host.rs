@@ -898,6 +898,11 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// The preludes of the second and later runs of the list in one
+    /// submission (a submission may name a list more than once): each run
+    /// needs its own, recorded while the one before still waits to be sent.
+    /// Held until the list is reset, after its last run.
+    preludes_again: Mutex<Vec<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -4240,6 +4245,7 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                preludes_again: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
@@ -6127,10 +6133,17 @@ impl Host {
                 }
             }
         }
+        // The lists run so far: a list run again records a prelude of its
+        // own (`HostList::prelude`).
+        let mut run_before: Vec<*const HostList> = Vec::new();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            let again = run_before.contains(&std::ptr::from_ref(*list));
+            if !again {
+                run_before.push(std::ptr::from_ref(*list));
+            }
+            if let Some(prelude) = list.prelude(again) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -6620,6 +6633,8 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Every run of the list has finished: the extra preludes are done.
+        self.preludes_again.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6643,6 +6658,12 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// The preludes held for second and later runs of the list (tests).
+    #[cfg(test)]
+    pub(crate) fn preludes_again(&self) -> usize {
+        self.preludes_again.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -6868,7 +6889,11 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// `again`: the submission runs the list a second time or more, after a
+    /// run whose prelude is recorded and not yet sent; this one is recorded
+    /// into a prelude of its own (the list's would be reset under the one
+    /// before, which would then run this one's transitions).
+    fn prelude(&self, again: bool) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -6937,17 +6962,30 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && hoisted.is_none() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let mut again_held = self.preludes_again.lock().unwrap_or_else(|e| e.into_inner());
+        let prelude = if again {
+            match host().and_then(|h| h.make_prelude()) {
+                Some(made) => {
+                    again_held.push(made);
+                    again_held.last()
+                }
+                None => None,
+            }
+        } else {
+            self.prelude
+                .get_or_init(|| host().and_then(|h| h.make_prelude()))
+                .as_ref()
+        };
+        let Some((allocator, list)) = prelude else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // What the last prelude's clamp noted, and where this one's goes.
-        let notes = hoisted.is_some().then(|| self.hoist_notes()).flatten();
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // What the last prelude's clamp noted, and where this one's goes;
+        // nothing for a second run, whose earlier prelude has not run yet.
+        let notes = (hoisted.is_some() && !again).then(|| self.hoist_notes()).flatten();
+        // SAFETY: the prelude is not executing: the list's own was last
+        // sent in a submission that has finished (every one is waited for,
+        // a list in the air is taken from the title's at its submission),
+        // a second run's is new; the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
