@@ -84,14 +84,19 @@ to about 47 ms of work a frame.
 Experiments, off: `VICTORY_ASYNC_PRESENT=1` (the title records the next
 frame while the last is sent; as it stands the title faults with it within
 two minutes, because waits between its queues are passed at the present; a
-variant that met them in order ran four minutes without a fault, at the same
-frame rate, since the card sets the pace by then, and was not kept),
+variant that met them in order ran without a fault, at the same frame rate
+in the first room, where the card sets the pace, and no faster in the
+opening cutscene either (160 ms a frame with it, 136 without: the title no
+longer stands at its present, but waits for the frame before elsewhere);
+it was not kept),
 `VICTORY_HOT_BLOCKS=1`, `VICTORY_MERGE_FORGET=1`, `VICTORY_NAMED_WRITES=1`
 (not yet tried in a run), the argument clamp between enhanced barriers
 (Zettrox/ztrx pull request #139; on this card the same time on the card and
 in the title, left on the branch `narrow-waits`), page marks set by shaders
 for copy-backs (Marvisak/VIctory `cd94d35`: its gain is the CPU compare this
-tree no longer does; not ported), `--console series-s` (a quarter faster, but the
+tree no longer does; not ported), copy-backs written without the kernel's
+call (fxceless/victory-fork pull request #1032: no time goes into that call
+here, the merges already write directly), `--console series-s` (a quarter faster, but the
 picture is black: the title upscales with FidelityFX there, whose programs
 do not run yet).
 
