@@ -811,23 +811,26 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    // An unknown page fails the call before anything is unmapped: what the
+    // range showed stays.
+    // SAFETY: the title passes `n` page numbers unless `pages` is null.
+    let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
+    if let Some(&unknown) = pages.and_then(|p| p.iter().find(|p| !physical.pages.contains_key(p))) {
+        tracing::warn!(page = unknown, "XMemMapPhysicalPages: unknown page");
+        return std::ptr::null_mut();
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
-    if pages.is_null() {
+    let Some(pages) = pages else {
         return address;
-    }
-    // SAFETY: the title passes `n` page numbers.
-    let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    };
     let mut i = 0;
     while i < n {
-        let Some(first) = physical.pages.get(&pages[i]).cloned() else {
-            tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
-        };
+        let first = physical.pages[&pages[i]].clone();
         // One view per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
             .iter()
@@ -839,6 +842,8 @@ pub extern "system" fn XMemMapPhysicalPages(
             })
             .count();
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+            // All or nothing: the runs mapped before go too.
+            unmap(&mut physical, base, i * PAGE);
             return std::ptr::null_mut();
         }
         i += run;
@@ -2028,5 +2033,22 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// A call naming an unknown page fails before it unmaps anything: the
+    /// range keeps what it showed.
+    #[test]
+    fn an_unknown_page_leaves_the_mapping_alone() {
+        let (pages, a) = pages_and_reservation(2);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        unsafe { a.cast::<u8>().write(7) };
+        let wrong = [pages[0], 0x10];
+        assert!(XMemMapPhysicalPages(a, 2, wrong.as_ptr()).is_null());
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        // SAFETY: still mapped read-write.
+        assert_eq!(unsafe { a.cast::<u8>().read() }, 7);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
