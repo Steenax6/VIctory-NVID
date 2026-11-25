@@ -2661,9 +2661,10 @@ struct Sent {
     /// Its title buffer copies left to its landing ([`copy_goes_late`]):
     /// destination, source, bytes.
     copies: Vec<(usize, usize, usize)>,
-    /// The title memory its copies of shader-written textures write when
-    /// it lands (`crate::texback`): address, end.
-    texture_backs: Vec<(usize, usize)>,
+    /// The title memory its read-backs write when it lands ([`read_backs`]:
+    /// texture to buffer copies and copies of shader-written textures,
+    /// `crate::texback`): address, end.
+    read_backs: Vec<(usize, usize)>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -2679,8 +2680,8 @@ struct Flight {
     back: Vec<Declared>,
     /// Title buffer copies done when it lands ([`copy_goes_late`]).
     copies: Vec<(usize, usize, usize)>,
-    /// What its copies of shader-written textures write ([`Sent`]).
-    texture_backs: Vec<(usize, usize)>,
+    /// What its read-backs write ([`Sent`]).
+    read_backs: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3867,6 +3868,17 @@ mod late_tests {
         assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
     }
 
+    /// A read-back's span runs from its first row to the end of its last;
+    /// one of nothing, or past the end of the address space, has none.
+    #[test]
+    fn a_read_back_spans_its_rows() {
+        assert_eq!(super::read_back_span(0x1000, [16, 3, 64]), Some((0x1000, 0x1090)));
+        assert_eq!(super::read_back_span(0x1000, [16, 1, 64]), Some((0x1000, 0x1010)));
+        assert_eq!(super::read_back_span(0x1000, [0, 3, 64]), None);
+        assert_eq!(super::read_back_span(0x1000, [16, 0, 64]), None);
+        assert_eq!(super::read_back_span(usize::MAX - 8, [16, 1, 16]), None);
+    }
+
     /// Ranges are found by what they hold, not by where they start, and a
     /// range that only touches another's end does not touch it.
     #[test]
@@ -4027,13 +4039,16 @@ fn read_backs(list: &HostList) {
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
-        // run; the title's destination holds every row (checked when the
-        // copy was recorded).
+        // run. Each row goes to title memory as a copy-back does
+        // (`copy_mapped`): through the guards, its dirty bits the layer's
+        // own, and nothing written where the title unmapped its memory
+        // meanwhile (a plain copy there was an access violation:
+        // fxceless/victory-fork pull request #565).
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    copy_mapped((*at as *mut u8).wrapping_add(line * pitch), from.add(line * row.next_multiple_of(256)), *row, true);
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
@@ -4052,6 +4067,31 @@ fn read_backs(list: &HostList) {
             }
         }
     }
+}
+
+/// The title memory the read-backs of `runs` write when they land
+/// ([`read_backs`]): address, end. A flight's count as memory it writes
+/// (`Line::written`), so a later submission or wait that reads there waits
+/// for them as for its shaders' writes; the texture to buffer read-backs
+/// were left out before (fxceless/victory-fork pull request #565).
+fn read_back_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for list in runs {
+        let deferred = list.deferred();
+        ranges.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
+        ranges.extend(deferred.backs.iter().filter_map(|&(_, at, shape)| read_back_span(at, shape)));
+    }
+    ranges
+}
+
+/// The span `[at, end)` of title memory a read-back of `rows` rows of
+/// `row` bytes, `pitch` apart, writes; `None` for none.
+fn read_back_span(at: usize, [row, rows, pitch]: [usize; 3]) -> Option<(usize, usize)> {
+    if row == 0 || rows == 0 {
+        return None;
+    }
+    let end = at.checked_add((rows - 1).checked_mul(pitch)?.checked_add(row)?)?;
+    Some((at, end))
 }
 
 /// After the card ran what declared `back`: what shaders wrote there goes
@@ -5559,7 +5599,7 @@ impl Host {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                     ranges.extend(flight.copies.iter().map(|&(dst, _, len)| (dst, dst + len)));
-                    ranges.extend(flight.texture_backs.iter().copied());
+                    ranges.extend(flight.read_backs.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -5803,7 +5843,7 @@ impl Host {
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
             join_ranges(written, sent.copies.iter().map(|&(dst, _, len)| (dst, dst + len)));
-            join_ranges(written, sent.texture_backs.iter().copied());
+            join_ranges(written, sent.read_backs.iter().copied());
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5814,7 +5854,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 copies: sent.copies,
-                texture_backs: sent.texture_backs,
+                read_backs: sent.read_backs,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5851,7 +5891,7 @@ impl Host {
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
             join_ranges(written, sent.copies.iter().map(|&(dst, _, len)| (dst, dst + len)));
-            join_ranges(written, sent.texture_backs.iter().copied());
+            join_ranges(written, sent.read_backs.iter().copied());
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5862,7 +5902,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 copies: sent.copies,
-                texture_backs: sent.texture_backs,
+                read_backs: sent.read_backs,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -6204,10 +6244,7 @@ impl Host {
                 back,
                 writes,
                 copies: std::mem::take(&mut batch.went_late),
-                texture_backs: runs
-                    .iter()
-                    .flat_map(|l| l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>())
-                    .collect(),
+                read_backs: read_back_ranges(runs),
             };
             working(was_working);
             return Some((submitted, sent));
