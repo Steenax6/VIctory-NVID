@@ -1038,13 +1038,24 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            // Our root signatures index the sampler heap directly, and one
+            // must be bound before such a signature is set (NVIDIA removes
+            // the device otherwise): ours where the title binds none.
+            let samplers = self.heaps[1] != 0
+                && crate::descriptor::heap(self.heaps[1] as This).host().is_some();
+            if !samplers {
+                match crate::descriptor::host::fallback_samplers() {
+                    Some(h) => heaps.push(Some(h.heap.clone())),
+                    None => once!("no sampler heap of ours to bind"),
+                }
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };

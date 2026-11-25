@@ -1177,6 +1177,24 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// A sampler heap of our own, for a list that sets one of our root
+/// signatures while the title binds no sampler heap: every one says its
+/// sampler heap is indexed directly (`SAMPLER_HEAP_DIRECTLY_INDEXED`), and
+/// D3D12 requires such a heap to be bound before such a signature is set
+/// (the debug layer's id 1419); NVIDIA removes the device for it
+/// (Marvisak/VIctory #1754, a compute list that reads views and no
+/// samplers). Slot 0 holds a point sampler, so an indexed read of it gives
+/// something defined.
+pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
+    static HEAP: std::sync::OnceLock<Option<HostHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let heap = HostHeap::new(true, 1)?;
+        heap.null_sampler(0);
+        Some(heap)
+    })
+    .as_ref()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -4187,6 +4205,20 @@ mod tests {
         heap.constant_at(0, gpu, 969_472);
         heap.constant_at(1, gpu, 0);
         heap.constant_at(2, 0, 256);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Our sampler heap, for lists whose title binds none, is made once: a
+    /// shader-visible sampler heap with its point sampler.
+    #[test]
+    fn our_sampler_heap_is_made_once() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let first = fallback_samplers().expect("a sampler heap of ours");
+        assert!(std::ptr::eq(first, fallback_samplers().unwrap()));
+        assert!(first.sampler);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
