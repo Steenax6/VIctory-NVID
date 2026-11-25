@@ -1975,6 +1975,9 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    // A moment with nothing in flight (the sweep's): the slots of textures
+    // whose views changed are made again now (`crate::tiles::publishing`).
+    crate::descriptor::remake_at_quiet_point();
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -2573,7 +2576,7 @@ impl OnDemand {
         };
         let (changed, waiting) = tiled.uploaded(&self.0.texture, held, copied, room());
         if changed {
-            crate::descriptor::host::levels_changed(memory);
+            self.views_changed(memory);
         }
         if waiting {
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2586,7 +2589,55 @@ impl OnDemand {
         if let Some(tiled) = &self.0.tiled
             && tiled.card_wrote(&self.0.texture, levels)
         {
+            self.views_changed(memory);
+        }
+    }
+
+    /// The tiles changed what the views may show, in a step of the
+    /// submission being prepared now. With `crate::tiles::publishing`: the
+    /// views follow once that submission has landed ([`Publish`]), and
+    /// their slots are made again at the next moment with nothing in
+    /// flight (`crate::descriptor::host::levels_changed`). Without: at
+    /// once, as before.
+    fn views_changed(&self, memory: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !crate::tiles::publishing() {
             crate::descriptor::host::levels_changed(memory);
+            return;
+        }
+        crate::tiles::ORDER[0].fetch_add(1, Relaxed);
+        // (The step runs while its submission is prepared: it counts as
+        // started, so `retire` keeps this until it lands.)
+        if crate::host::submissions_in_flight() == 0 {
+            crate::tiles::ORDER[1].fetch_add(1, Relaxed);
+        }
+        crate::host::retire(Publish {
+            host: self.0.clone(),
+            memory,
+        });
+    }
+}
+
+/// A change of what the views of a texture made level by level may show,
+/// held until the submission whose step made it has landed: by then its
+/// copies into the levels newly given tiles have run, and the views go by
+/// them (`crate::tiles::Tiled::publish`).
+#[cfg(windows)]
+struct Publish {
+    host: std::sync::Arc<HostTexture>,
+    memory: u64,
+}
+
+#[cfg(windows)]
+impl Drop for Publish {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::tiles::ORDER[2].fetch_add(1, Relaxed);
+        if let Some(tiled) = &self.host.tiled
+            && tiled.publish()
+        {
+            crate::tiles::ORDER[3].fetch_add(1, Relaxed);
+            crate::descriptor::host::levels_changed(self.memory);
         }
     }
 }

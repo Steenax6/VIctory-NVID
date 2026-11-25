@@ -330,7 +330,32 @@ pub(crate) struct Tiled {
     /// When the host copy was last asked for (`crate::host::moment`): the
     /// order in which levels left out are brought back.
     used: AtomicU64,
+    /// What the views show ([`Tiled::view_levels`], [`Tiled::publish`]).
+    published: Mutex<Option<ViewLevels>>,
+    /// Made without levels (whether or not they came back since).
+    reduced: std::sync::atomic::AtomicBool,
 }
+
+/// Whether the views of textures made level by level follow their tiles
+/// only once the submission that gave the tiles has landed
+/// ([`Tiled::view_levels`]): `VICTORY_TILED_VIEW_PUBLISH` (on; `0`: at
+/// once, as before; the slots are then also made again by the texture
+/// pass, while submissions run, as before:
+/// `descriptor/host.rs` `levels_changed`).
+pub(crate) fn publishing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TILED_VIEW_PUBLISH").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: view changes left for their submission's landing; of
+/// them, those whose step ran with no submission in flight (it should not
+/// happen: the step runs while its submission is prepared); published at
+/// a landing, and with a change; slots made again at a moment with nothing
+/// in flight, and slots made again while submissions were in flight (the
+/// old way, `VICTORY_TILED_VIEW_PUBLISH=0`); and texture reads a list had
+/// not held the texture for before (`texture.rs` `upload`); moments taken
+/// for quiet that found submissions in flight (the slots wait for the next).
+pub(crate) static ORDER: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// What the views of a texture made this way show ([`shape_view`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -413,6 +438,8 @@ impl Tiled {
             title_first: AtomicU32::new(u32::MAX),
             planned: AtomicU64::new(0),
             used: AtomicU64::new(0),
+            published: Mutex::new(None),
+            reduced: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -423,6 +450,7 @@ impl Tiled {
     pub(crate) fn leave_out(&self, count: u32) {
         let count = count.min(self.standard.len() as u32).min(self.levels.saturating_sub(1));
         let before = self.dropped.swap(count, Ordering::Relaxed);
+        self.reduced.store(count > 0, Ordering::Relaxed);
         self.count_dropped(before, count);
         if before == 0 && count > 0 {
             STATS[14].fetch_add(1, Ordering::Relaxed);
@@ -432,6 +460,8 @@ impl Tiled {
         let was = self.planned.swap(planned, Ordering::Relaxed);
         STATS[11].fetch_add(planned, Ordering::Relaxed);
         STATS[11].fetch_sub(was, Ordering::Relaxed);
+        // The views stop above the levels left out from the first one made.
+        self.publish();
     }
 
     /// The counts of textures alive without levels and the bytes left out,
@@ -512,16 +542,44 @@ impl Tiled {
         self.every_level() & !(self.dropped_mask() & self.without(self.dropped_mask()))
     }
 
-    /// What the views show ([`ViewLevels`]); `None` while no level is both
-    /// held and given and none is left out (the views are then as the
-    /// title made them, and read zeros). With levels left out the views
-    /// stop above them from the making on, before any level has tiles (a
-    /// level without tiles reads zeros either way): the first upload then
-    /// changes no view, and the texture's slots are not made again while
-    /// the card may be reading them (`descriptor/host.rs`
-    /// `texture_views_remade` rewrites slots that lists in flight use).
+    /// What the views of the texture show ([`ViewLevels`]). With
+    /// [`publishing`] (the default): what was published, the shape the
+    /// tiles had once the submission that gave them landed
+    /// ([`Tiled::publish`]); a view made from it never reaches a level
+    /// whose tiles were mapped in a submission whose copies into them may
+    /// not have run yet. (The step that gives a level its tiles runs when
+    /// its submission is prepared, before any of that submission's lists
+    /// run: a list sent with it, or one recorded on another thread and
+    /// sent later, ahead of the upload's copies, read a level so shown
+    /// through tiles that still held what their last owner left.)
+    /// `VICTORY_TILED_VIEW_PUBLISH=0`: what the tiles are now, as before.
     pub(crate) fn view_levels(&self) -> Option<ViewLevels> {
-        let dropped = self.dropped();
+        if publishing() {
+            *self.published.lock().unwrap_or_else(|e| e.into_inner())
+        } else {
+            self.view_now()
+        }
+    }
+
+    /// Makes the views go by the tiles as they are now ([`Tiled::view_now`]);
+    /// whether that changes what they show. To be called once the
+    /// submission whose step changed the tiles has landed
+    /// (`resource.rs` `Publish`), or at the making.
+    pub(crate) fn publish(&self) -> bool {
+        let now = self.view_now();
+        let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *published, now) != now
+    }
+
+    /// What the views would show by the tiles as they are now: `None`
+    /// while no level is both held and given and none is left out (the
+    /// views are then as the title made them, and read zeros). With levels
+    /// left out the views stop above them from the making on, before any
+    /// level has tiles (a level without tiles reads zeros either way).
+    fn view_now(&self) -> Option<ViewLevels> {
+        // A texture made without levels keeps views of that kind (moved by
+        // their clamp alone, [`shape_view`]) after its levels came back.
+        let dropped = if self.reduced.load(Ordering::Relaxed) { self.dropped().max(1) } else { self.dropped() };
         let first_tiled = match self.first_shown() {
             Some(first) => first,
             None if dropped > 0 => dropped,
@@ -543,7 +601,7 @@ impl Tiled {
     /// [`Tiled::view_levels`] as far as [`shape_view`] goes by it: without
     /// levels left out the first level held does not count.
     fn view_shape(&self) -> Option<ViewLevels> {
-        self.view_levels().map(|v| if v.dropped == 0 { ViewLevels { first_held: 0, ..v } } else { v })
+        self.view_now().map(|v| if v.dropped == 0 { ViewLevels { first_held: 0, ..v } } else { v })
     }
 
     /// Notes the first level the title or the card holds.
@@ -1036,15 +1094,57 @@ pub(crate) fn min_lod_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u3
 /// it, is the title's. `VICTORY_TEXTURE_DROP_VIEWS=shift`: from the first
 /// level with tiles, as without (a `Gather` and a `Load` then read that
 /// level, and the size is that level's: 2, 4 times smaller).
+///
+/// By default (`clamp`) a view of a texture with levels left out never
+/// moves at all: its first level, its levels and its format stay the
+/// title's, and only `ResourceMinLODClamp` rises to the first level with
+/// tiles, also where the title holds fewer levels (a view that starts
+/// below the first level held) or the view names only levels without
+/// tiles (it then reads zeros, as a level without tiles does). The slots
+/// of such a texture are made again as its tiles change; a view made again
+/// differs from the one before in its clamp alone, never in the levels or
+/// the place in the card's memory it starts from. `keep`: as the first
+/// version (moved to the first level the title holds, and to the first
+/// level with tiles where the view ends before it).
 pub(crate) fn shape_view(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, view: ViewLevels, levels: u32) {
-    static SHIFT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let shift = *SHIFT.get_or_init(|| std::env::var("VICTORY_TEXTURE_DROP_VIEWS").is_ok_and(|v| v.trim() == "shift"));
-    if view.dropped == 0 || shift {
+    #[derive(PartialEq)]
+    enum How {
+        Clamp,
+        Keep,
+        Shift,
+    }
+    static HOW: std::sync::OnceLock<How> = std::sync::OnceLock::new();
+    let how = HOW.get_or_init(|| match std::env::var("VICTORY_TEXTURE_DROP_VIEWS").as_deref().map(str::trim) {
+        Ok("shift") => How::Shift,
+        Ok("keep") => How::Keep,
+        _ => How::Clamp,
+    });
+    if view.dropped == 0 || *how == How::Shift {
         show_from(desc, view.first_tiled, levels);
         return;
     }
-    show_from(desc, view.first_held, levels);
-    min_lod_from(desc, view.first_tiled, levels);
+    if *how == How::Keep {
+        show_from(desc, view.first_held, levels);
+        min_lod_from(desc, view.first_tiled, levels);
+        return;
+    }
+    clamp_from(desc, view.first_tiled, levels);
+}
+
+/// Raises a two-dimensional view's `ResourceMinLODClamp` to `first` (in
+/// the texture's levels) and changes nothing else.
+pub(crate) fn clamp_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
+    if first == 0 || first >= levels {
+        return;
+    }
+    let raise = |min_lod: &mut f32| *min_lod = min_lod.max(first as f32);
+    match desc.ViewDimension {
+        // SAFETY: `ViewDimension` selects `Texture2D`.
+        D3D12_SRV_DIMENSION_TEXTURE2D => raise(unsafe { &mut desc.Anonymous.Texture2D.ResourceMinLODClamp }),
+        // SAFETY: `ViewDimension` selects `Texture2DArray`.
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => raise(unsafe { &mut desc.Anonymous.Texture2DArray.ResourceMinLODClamp }),
+        _ => {}
+    }
 }
 
 /// Whether a texture's host copy is made without its most detailed levels,
@@ -1188,6 +1288,15 @@ pub(crate) fn status() {
     if s[4] == 0 {
         return;
     }
+    let o: Vec<u64> = ORDER.iter().map(|o| o.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "views of textures made level by level (VICTORY_TILED_VIEW_PUBLISH): since the start {} changes left for their \
+         submission's landing, {} of them with no submission in flight at the step (should be 0), {} published at a \
+         landing ({} with a change); slots made again with nothing in flight {}, made again while submissions were in \
+         flight {} (the old way; should be 0), quiet moments that found submissions in flight {}; texture reads held by \
+         their list that were not before {}",
+        o[0], o[1], o[2], o[3], o[4], o[5], o[7], o[6],
+    );
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
     let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
     tracing::info!(
@@ -2117,6 +2226,14 @@ void read() {
         if !rig.card {
             assert_eq!((read[2], read[3]), (0, 0), "the software adapter: gather and load under the clamp");
         }
+        // A view of level 0 alone, clamped past its own levels (it is not
+        // moved, `clamp_from`): the debug layer takes it, and it reads the
+        // level without tiles: zeros.
+        let mut only_top = whole;
+        only_top.Anonymous.Texture2D.MipLevels = 1;
+        clamp_from(&mut only_top, 1, u32::from(LEVELS));
+        let read = read_through(rig, &texture, &only_top)?;
+        assert_eq!(read[0], 0, "a view of the level left out alone reads zeros");
         // Brought back: the next upload writes level 0 and gives it tiles.
         assert_eq!(tiled.promote(), Some(u64::from(tiled.standard[0]) * TILE));
         assert_eq!(tiled.promote(), None, "one level was left out");
@@ -2127,8 +2244,15 @@ void read() {
         assert!(changed && !waiting && tiled.whole());
         assert_eq!(tiled.given_bytes(), without_top + u64::from(tiled.standard[0]) * TILE);
         rig.round_trip(&texture, &layout, Some(&upload));
+        // The views follow once the submission that gave the tiles landed
+        // (`resource.rs` `Publish`); not before.
+        if publishing() {
+            assert_eq!(tiled.view_levels().map(|v| v.first_tiled), Some(1), "not published before the landing");
+        }
+        assert!(tiled.publish(), "the landing changes the views");
         let levels = tiled.view_levels().expect("a level is shown");
-        assert_eq!((levels.first_tiled, levels.dropped), (0, 0));
+        assert_eq!(levels.first_tiled, 0);
+        assert!(levels.dropped > 0, "a view of a texture made without levels moves by its clamp alone");
         let read = read_through(rig, &texture, &whole)?;
         assert_eq!((read[0], read[2], read[3]), (16, 16, 16), "level 0 is back");
         // The clamp is in the texture's levels: a view from level 1 with a
@@ -2348,24 +2472,25 @@ void read() {
         let mut v = view2d(0, 11, 2.5);
         shape_view(&mut v, dropped(0, 1, 1), 11);
         assert_eq!(of(&v), (0, 11, 2.5));
-        // A view that names exactly the level left out is moved to the
-        // first level with tiles.
+        // A view that names exactly the level left out is not moved: it is
+        // clamped past its own levels (and reads zeros, as a level without
+        // tiles does); a view never changes but in its clamp.
         let mut v = view2d(0, 1, 0.0);
         shape_view(&mut v, dropped(0, 1, 1), 11);
-        assert_eq!(of(&v), (1, 1, 0.0));
-        // A view of levels 0 and 1 with two left out: moved to level 2.
+        assert_eq!(of(&v), (0, 1, 1.0));
         let mut v = view2d(0, 2, 0.0);
         shape_view(&mut v, dropped(0, 2, 2), 11);
-        assert_eq!(of(&v), (2, 1, 0.0));
+        assert_eq!(of(&v), (0, 2, 2.0));
         // The title holds from level 3 and views from 0 (a neighbour where
-        // its large levels would be): moved to 3, as before.
+        // its large levels would be): clamped at 3, not moved.
         let mut v = view2d(0, u32::MAX, 0.0);
         shape_view(&mut v, dropped(3, 3, 1), 11);
-        assert_eq!(of(&v), (3, u32::MAX, 0.0));
-        // A view that starts below the levels left out is left alone.
+        assert_eq!(of(&v), (0, u32::MAX, 3.0));
+        // A view that starts below the levels left out keeps a clamp under
+        // its own first level, which changes nothing it samples.
         let mut v = view2d(4, u32::MAX, 0.0);
         shape_view(&mut v, dropped(0, 1, 1), 11);
-        assert_eq!(of(&v), (4, u32::MAX, 0.0));
+        assert_eq!(of(&v), (4, u32::MAX, 1.0));
         // Nothing left out: as before, from the first level with tiles.
         let mut v = view2d(0, u32::MAX, 0.0);
         shape_view(&mut v, dropped(0, 2, 0), 11);
@@ -2485,6 +2610,8 @@ void read() {
             title_first: AtomicU32::new(u32::MAX),
             planned: AtomicU64::new(0),
             used: AtomicU64::new(0),
+            published: Mutex::new(None),
+            reduced: std::sync::atomic::AtomicBool::new(false),
         };
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);
