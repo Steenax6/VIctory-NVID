@@ -5,7 +5,10 @@ param(
     [string]$Data = "$env:LOCALAPPDATA\ztrx\data",
     [string]$Exe,
     # Leaves the faster settings (README) as the environment has them.
-    [switch]$Plain
+    [switch]$Plain,
+    # Holds A through the opening scene (VICTORY_AUTO_SKIP=1): the title
+    # skips a scene while A is held.
+    [switch]$SkipIntro
 )
 # Resolved here, not as a param default: Windows PowerShell 5.1 leaves $PSScriptRoot
 # empty in param defaults of scripts that use [Parameter()].
@@ -28,6 +31,7 @@ if (-not $Plain) {
         if (-not (Test-Path "Env:$v")) { Set-Item "Env:$v" "1" }
     }
 }
+if ($SkipIntro -and -not (Test-Path "Env:VICTORY_AUTO_SKIP")) { $env:VICTORY_AUTO_SKIP = "1" }
 New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
 $env:VICTORY_CACHE_DIR = $Cache
 $env:VICTORY_DATA_DIR = $Data

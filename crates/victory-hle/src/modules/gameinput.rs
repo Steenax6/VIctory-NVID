@@ -1078,6 +1078,164 @@ pub(crate) fn module() -> HleModule {
 /// taken), and presses during the film that follows change nothing (it ran
 /// its 30 s either way). Its first-start menus (settings, privacy) come only
 /// after the screen and that film, so no press reaches them.
+/// `VICTORY_AUTO_SKIP=<n>`: holds A through the first `n` scenes a title
+/// lets the player skip that way (a title that shows "skip" while A is held
+/// and skips after about three seconds).
+///
+/// Nothing here knows the title: a scene is frames of 500 draws and more for
+/// four seconds, as the frame meter counts them
+/// (`victory_gpu::frame::recent_draws`). Then A is held for four seconds; if
+/// the draws fall under 100 a frame within the next eight (the cut to black
+/// a skip makes), that scene counts as skipped, and the next one is waited
+/// for. A hold that changes nothing is tried again twice, eight seconds
+/// apart, and then the holding ends for the run: where A does something else
+/// (a scene the player walks in), three presses are all it gets.
+pub(crate) mod auto_skip {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const SCENE_DRAWS: u32 = 500;
+    const BLACK_DRAWS: u32 = 100;
+    const SCENE_FOR: Duration = Duration::from_secs(4);
+    const HOLD: Duration = Duration::from_secs(4);
+    const WATCH: Duration = Duration::from_secs(8);
+    const TRIES: u32 = 3;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) enum State {
+        /// No scene yet, or one for less than [`SCENE_FOR`] (since when).
+        Waiting(Option<Instant>),
+        /// A is down since then; the hold's number in this scene.
+        Holding(Instant, u32),
+        /// A is up since then: did the scene end?
+        Watching(Instant, u32),
+        Done,
+    }
+
+    struct Skip {
+        state: State,
+        left: u32,
+    }
+
+    /// How many scenes to skip (0: none, the switch is off).
+    fn scenes() -> u32 {
+        static N: OnceLock<u32> = OnceLock::new();
+        *N.get_or_init(|| std::env::var("VICTORY_AUTO_SKIP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    }
+
+    /// The next state and whether a scene was skipped, from the draws a
+    /// frame now (`None`: no frames shown yet).
+    pub(super) fn step(state: State, draws: Option<u32>, now: Instant) -> (State, bool) {
+        let scene = draws.is_some_and(|d| d >= SCENE_DRAWS);
+        match state {
+            State::Waiting(since) => match (scene, since) {
+                (false, _) => (State::Waiting(None), false),
+                (true, None) => (State::Waiting(Some(now)), false),
+                (true, Some(since)) if now.duration_since(since) >= SCENE_FOR => (State::Holding(now, 1), false),
+                (true, since) => (State::Waiting(since), false),
+            },
+            State::Holding(since, n) if now.duration_since(since) >= HOLD => (State::Watching(now, n), false),
+            State::Holding(..) => (state, false),
+            State::Watching(_, _) if draws.is_some_and(|d| d < BLACK_DRAWS) => (State::Waiting(None), true),
+            State::Watching(since, n) if now.duration_since(since) >= WATCH => {
+                if n >= TRIES {
+                    (State::Done, false)
+                } else {
+                    (State::Holding(now, n + 1), false)
+                }
+            }
+            State::Watching(..) | State::Done => (state, false),
+        }
+    }
+
+    /// Whether A is down now.
+    pub(super) fn pressing() -> bool {
+        if scenes() == 0 {
+            return false;
+        }
+        static SKIP: Mutex<Option<Skip>> = Mutex::new(None);
+        let mut skip = SKIP.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = skip.get_or_insert_with(|| {
+            tracing::info!(scenes = scenes(), "auto skip: A is held through scenes that can be skipped (VICTORY_AUTO_SKIP)");
+            Skip { state: State::Waiting(None), left: scenes() }
+        });
+        if skip.state == State::Done {
+            return false;
+        }
+        let before = skip.state;
+        let (state, skipped) = step(before, victory_gpu::frame::recent_draws(), Instant::now());
+        skip.state = state;
+        if skipped {
+            skip.left -= 1;
+            tracing::info!(left = skip.left, "auto skip: a scene was skipped");
+            if skip.left == 0 {
+                skip.state = State::Done;
+            }
+        }
+        match (before, skip.state) {
+            (State::Waiting(_), State::Holding(..)) => tracing::info!("auto skip: holding A"),
+            (State::Watching(..), State::Done) if !skipped => {
+                tracing::info!("auto skip: holding A changed nothing, no more holds")
+            }
+            _ => {}
+        }
+        matches!(skip.state, State::Holding(..))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_scene_is_held_through_and_a_cut_to_black_counts() {
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            // Loading screens: nothing.
+            let (s, _) = step(State::Waiting(None), Some(11), at(0));
+            assert_eq!(s, State::Waiting(None));
+            // A scene begins; four seconds of it start the hold.
+            let (s, _) = step(s, Some(2600), at(1));
+            assert_eq!(s, State::Waiting(Some(at(1))));
+            let (s, _) = step(s, Some(2600), at(3));
+            assert_eq!(s, State::Waiting(Some(at(1))));
+            let (s, _) = step(s, Some(2600), at(5));
+            assert_eq!(s, State::Holding(at(5), 1));
+            // Held four seconds, then watched; the cut to black counts.
+            let (s, _) = step(s, Some(2600), at(7));
+            assert_eq!(s, State::Holding(at(5), 1));
+            let (s, _) = step(s, Some(2600), at(9));
+            assert_eq!(s, State::Watching(at(9), 1));
+            let (s, skipped) = step(s, Some(1), at(10));
+            assert_eq!((s, skipped), (State::Waiting(None), true));
+        }
+
+        #[test]
+        fn holds_that_change_nothing_end_after_three() {
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            let mut s = State::Holding(at(0), 1);
+            let mut holds = 1;
+            for second in 1..60 {
+                let (next, skipped) = step(s, Some(5000), at(second));
+                assert!(!skipped);
+                if matches!(next, State::Holding(..)) && !matches!(s, State::Holding(..)) {
+                    holds += 1;
+                }
+                s = next;
+            }
+            assert_eq!((s, holds), (State::Done, 3));
+        }
+
+        #[test]
+        fn a_scene_that_ends_by_itself_starts_the_wait_again() {
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            let (s, _) = step(State::Waiting(Some(at(0))), Some(3), at(2));
+            assert_eq!(s, State::Waiting(None));
+        }
+    }
+}
+
 pub(crate) mod auto_start {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1244,7 +1402,7 @@ mod host {
                 }
             }
             // The same for `VICTORY_AUTO_START`.
-            if slot == 0 && auto_start::pressing() {
+            if slot == 0 && (auto_start::pressing() || auto_skip::pressing()) {
                 pad.buttons |= A;
             }
             Some(pad)
@@ -1256,7 +1414,7 @@ mod host {
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
             // Enter is A on the stand-in pad; with or without focus.
-            if auto_start::pressing() && !down.contains(&0x0D) {
+            if (auto_start::pressing() || auto_skip::pressing()) && !down.contains(&0x0D) {
                 down.push(0x0D);
             }
             if focused() {

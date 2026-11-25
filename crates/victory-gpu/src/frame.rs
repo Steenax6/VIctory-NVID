@@ -84,6 +84,27 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
+/// Draws a frame over the last second of presented frames, as the window's
+/// caption shows them; `u32::MAX` until a second of frames has been shown.
+static RECENT_DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// The meter's newest count of draws a frame.
+#[cfg(windows)]
+pub(crate) fn set_recent_draws(draws: u32) {
+    RECENT_DRAWS.store(draws, Ordering::Relaxed);
+}
+
+/// Draws a frame over the last second of presented frames, if a second of
+/// frames has been shown: what tells a scene from a loading screen or a
+/// black frame without knowing the title (a scene draws thousands of times
+/// a frame, the others a handful).
+pub fn recent_draws() -> Option<u32> {
+    match RECENT_DRAWS.load(Ordering::Relaxed) {
+        u32::MAX => None,
+        draws => Some(draws),
+    }
+}
+
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a
 /// wait for it ended on.
 static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
