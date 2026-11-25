@@ -327,7 +327,7 @@ pub(crate) fn builder_off(why: &'static str) {
 
 /// `VICTORY_BVH_BUILDER=1`: the structure builder may run ([`Builder`]).
 #[cfg(windows)]
-fn builder_allowed() -> bool {
+pub(crate) fn builder_allowed() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
 }
