@@ -3187,12 +3187,113 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
-/// Whether the host can make a shader (or unordered access) view of
+/// A shader view whose format has the same bytes as its texture's but
+/// the channels in other places: in which format of the texture's family
+/// the host makes it, and which channel of that view each channel of the
+/// title's comes from (0 to 3: red to alpha; 4: zero; 5: one). The console
+/// reads the bytes as the view's format says; the host allows views only
+/// in the texture's own family. So an alpha-only (A8) view of an R8
+/// texture reads (0, 0, 0, r), an R8 view of an A8 texture (a, 0, 0, 1),
+/// a B8G8R8X8 view of a B8G8R8A8 texture (r, g, b, 1), and B8G8R8A8 views
+/// of R8G8B8A8 textures (and the other way round) have red and blue
+/// swapped. Only UNORM (and sRGB) views of UNORM, sRGB or typeless
+/// textures: the others would read the bytes as another kind of number.
+/// `None`: not such a pair (the view is made, or refused, as it names).
+/// Unordered access views have no component mapping: such a view of
+/// another family is refused (`fits`).
+pub(crate) fn other_channels(view: u32, own: u32) -> Option<(u32, [u32; 4])> {
+    const R8_TYPELESS: u32 = 60;
+    const R8_UNORM: u32 = 61;
+    const A8_UNORM: u32 = 65;
+    // Typeless, UNORM and sRGB.
+    const RGBA: [u32; 3] = [27, 28, 29];
+    const BGRA: [u32; 3] = [90, 87, 91];
+    const SRGB: [u32; 3] = [29, 91, 93];
+    // A typeless texture's view in the UNORM or sRGB format of its family
+    // (as the title's view is one or the other), a typed texture's in its
+    // own format.
+    let host = |family: [u32; 3]| {
+        if own != family[0] {
+            own
+        } else if SRGB.contains(&view) {
+            family[2]
+        } else {
+            family[1]
+        }
+    };
+    match view {
+        A8_UNORM if matches!(own, R8_TYPELESS | R8_UNORM) => Some((R8_UNORM, [4, 4, 4, 0])),
+        R8_UNORM if own == A8_UNORM => Some((A8_UNORM, [3, 4, 4, 5])),
+        // B8G8R8A8 and B8G8R8X8 views of R8G8B8A8 textures.
+        87 | 91 if RGBA.contains(&own) => Some((host(RGBA), [2, 1, 0, 3])),
+        88 | 93 if RGBA.contains(&own) => Some((host(RGBA), [2, 1, 0, 5])),
+        // B8G8R8X8 and R8G8B8A8 views of B8G8R8A8 textures.
+        88 | 93 if BGRA.contains(&own) => Some((host(BGRA), [0, 1, 2, 5])),
+        28 | 29 if BGRA.contains(&own) => Some((host(BGRA), [2, 1, 0, 3])),
+        _ => None,
+    }
+}
+
+/// The title's component mapping `title` for a view whose channels come
+/// from the host view's as `from` says ([`other_channels`]): each channel
+/// the title's mapping takes from the view takes what the view has there.
+pub(crate) fn mapped_through(title: u32, from: [u32; 4]) -> u32 {
+    // Set in every mapping the host takes.
+    const ALWAYS: u32 = 1 << 12;
+    let mut mapping = title & !0xfff | ALWAYS;
+    for channel in 0..4 {
+        let source = title >> (3 * channel) & 7;
+        let source = from.get(source as usize).copied().unwrap_or(source);
+        mapping |= source << (3 * channel);
+    }
+    mapping
+}
+
+/// Shader views read through other channels ([`other_channels`]), since
+/// the start.
+pub(crate) static OTHER_CHANNELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The title's shader view `desc` of `texture` as the host makes it when
+/// its format has the texture's bytes in other channels
+/// ([`other_channels`]). Each distinct case is logged once (at most 32),
+/// and so is each distinct alpha-only view of an alpha-only texture, which
+/// needs no change: they say how the title's A8 tables are read.
+fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    const A8_UNORM: u32 = 65;
+    // SAFETY: a live resource.
+    let own = unsafe { texture.GetDesc() }.Format.0 as u32;
+    let view = desc.Format.0 as u32;
+    let other = other_channels(view, own);
+    if let Some((format, from)) = other {
+        OTHER_CHANNELS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        desc.Format = DXGI_FORMAT(format as i32);
+        desc.Shader4ComponentMapping = mapped_through(desc.Shader4ComponentMapping, from);
+    }
+    if other.is_some() || view == A8_UNORM || own == A8_UNORM {
+        static SEEN: Mutex<Vec<(u32, u32, i32, u32)>> = Mutex::new(Vec::new());
+        let case = (view, own, desc.ViewDimension.0, desc.Shader4ComponentMapping);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 32 && !seen.contains(&case) {
+            seen.push(case);
+            tracing::info!(
+                view_format = view,
+                texture_format = own,
+                host_format = desc.Format.0,
+                dimension = desc.ViewDimension.0,
+                mapping = desc.Shader4ComponentMapping,
+                through_other_channels = other.is_some(),
+                "a shader view of an alpha-only format, or read through other channels"
+            );
+        }
+    }
+}
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
+/// family takes the texture's format. A shader view in a format with the
+/// texture's bytes in other channels is one of the texture's family by
+/// now ([`read_through`]).
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
@@ -3370,6 +3471,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(desc) = desc.as_mut() {
+                    read_through(texture, desc);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -3947,6 +4051,250 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Views read through other channels, made as [`make`] makes them and
+/// read by a shader on the software adapter.
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows::core::Interface;
+
+    const DEFAULT: u32 = 5768;
+    const A8_UNORM: u32 = 65;
+    const R8_TYPELESS: u32 = 60;
+    const R8_UNORM: u32 = 61;
+    const TEXTURE_2D: u32 = 4;
+
+    /// Each texel of a 4x1 texture, as a float4.
+    const LOAD: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float4> t : register(t0);
+RWStructuredBuffer<float4> o : register(u0);
+[RootSignature(RS)]
+[numthreads(4, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); }
+"#;
+
+    fn warp() -> Option<ID3D12Device> {
+        // SAFETY: plain DXGI queries and device creation on the software
+        // adapter; a card is never opened.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                return None;
+            }
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            device
+        }
+    }
+
+    /// The title's 2D view of mip 0 in `format` with `mapping`.
+    fn view(format: u32, mapping: u32) -> [u32; 10] {
+        [format, TEXTURE_2D, mapping, 0, 0, 1, 0, 0, 0, 0]
+    }
+
+    /// What a shader reads from a 4x1 texture of `format` holding `bytes`
+    /// through the title's view `words`, made as [`make`] makes it.
+    fn read(device: &ID3D12Device, format: u32, bytes: &[u8], words: [u32; 10]) -> [[f32; 4]; 4] {
+        let cpu_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let one = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+        let code = crate::host::compile(LOAD, windows::core::s!("main"), windows::core::s!("cs_5_1"))
+            .expect("the test's shader");
+        // SAFETY: plain object creation on the software adapter; the
+        // mappings hold what is written and read; the list is waited for.
+        unsafe {
+            let mut texture: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &cpu_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 4,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT(format as i32),
+                        SampleDesc: one,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+                .expect("a texture");
+            let texture = texture.unwrap();
+            texture.Map(0, None, None).expect("a mapped texture");
+            let len = bytes.len() as u32;
+            texture
+                .WriteToSubresource(0, None, bytes.as_ptr().cast(), len, len)
+                .expect("the texels");
+            texture.Unmap(0, None);
+            let mut desc = srv_desc(&words);
+            read_through(&texture, &mut desc);
+            assert!(fits(&texture, Some(&mut desc.Format), false), "a view the host makes");
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("a heap");
+            device.CreateShaderResourceView(&texture, Some(&desc), heap.GetCPUDescriptorHandleForHeapStart());
+            let mut out: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &cpu_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 64,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: one,
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut out,
+                )
+                .expect("an output buffer");
+            let out = out.unwrap();
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("a queue");
+            let allocator: ID3D12CommandAllocator =
+                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("an allocator");
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso)
+                .expect("a list");
+            list.SetComputeRootSignature(&root);
+            list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+            list.Close().expect("a closed list");
+            queue.ExecuteCommandLists(&[Some(list.cast().expect("a command list"))]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("a fence");
+            queue.Signal(&fence, 1).expect("a signal");
+            // No event: the call returns when the fence has the value.
+            fence
+                .SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default())
+                .expect("the list ran");
+            let mut data = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut data)).expect("a mapped output");
+            let texels = data.cast::<[[f32; 4]; 4]>().read();            out.Unmap(0, None);
+            texels
+        }
+    }
+
+    fn near(got: [[f32; 4]; 4], want: [[f32; 4]; 4]) -> bool {
+        got.iter().flatten().zip(want.iter().flatten()).all(|(g, w)| (g - w).abs() < 1e-6)
+    }
+
+    /// The bytes of each texel over 255.
+    fn unorm(bytes: [u8; 4]) -> [f32; 4] {
+        bytes.map(|b| f32::from(b) / 255.0)
+    }
+
+    #[test]
+    fn mappings_take_each_channel_from_where_the_view_has_it() {
+        // (0, 0, 0, r): the A8 view of an R8 texture.
+        assert_eq!(mapped_through(DEFAULT, [4, 4, 4, 0]), 4388);
+        // The title's own (a, a, a, a) of an A8 view: (r, r, r, r).
+        let alpha = 3 | 3 << 3 | 3 << 6 | 3 << 9 | 1 << 12;
+        assert_eq!(mapped_through(alpha, [4, 4, 4, 0]), 1 << 12);
+        // The title's constants stay.
+        let constants = 4 | 5 << 3 | 4 << 6 | 5 << 9 | 1 << 12;
+        assert_eq!(mapped_through(constants, [3, 4, 4, 5]), constants);
+        assert_eq!(other_channels(A8_UNORM, R8_UNORM), Some((R8_UNORM, [4, 4, 4, 0])));
+        assert_eq!(other_channels(A8_UNORM, R8_TYPELESS), Some((R8_UNORM, [4, 4, 4, 0])));
+        assert_eq!(other_channels(R8_UNORM, A8_UNORM), Some((A8_UNORM, [3, 4, 4, 5])));
+        // Integer and signed views read other numbers: not mapped.
+        assert_eq!(other_channels(62, A8_UNORM), None);
+        assert_eq!(other_channels(A8_UNORM, 62), None);
+        // Typeless textures: in the UNORM or sRGB format the view names.
+        assert_eq!(other_channels(91, 27), Some((29, [2, 1, 0, 3])));
+        assert_eq!(other_channels(88, 90), Some((87, [0, 1, 2, 5])));
+        assert_eq!(other_channels(28, 91), Some((91, [2, 1, 0, 3])));
+        // Views of their own family are left to `fits`.
+        assert_eq!(other_channels(A8_UNORM, A8_UNORM), None);
+        assert_eq!(other_channels(R8_UNORM, R8_TYPELESS), None);
+        assert_eq!(other_channels(28, 27), None);
+    }
+
+    /// The case of the title's blur strength table: its alpha is read
+    /// (it read 1 everywhere when the A8 view became an R8 view).
+    #[test]
+    fn warp_an_alpha_only_view_of_an_r8_texture_reads_alpha() {
+        let Some(device) = warp() else {
+            return;
+        };
+        let bytes = [0x00, 0x40, 0x80, 0xff];
+        let alpha = bytes.map(|b| [0.0, 0.0, 0.0, f32::from(b) / 255.0]);
+        for texture in [R8_UNORM, R8_TYPELESS, A8_UNORM] {
+            let got = read(&device, texture, &bytes, view(A8_UNORM, DEFAULT));
+            assert!(near(got, alpha), "A8 view of a texture of format {texture}: {got:?}");
+        }
+        // The other way round: an R8 view of an A8 texture.
+        let red = bytes.map(|b| [f32::from(b) / 255.0, 0.0, 0.0, 1.0]);
+        let got = read(&device, A8_UNORM, &bytes, view(R8_UNORM, DEFAULT));
+        assert!(near(got, red), "R8 view of an A8 texture: {got:?}");
+        // The title's mapping (a, a, a, a) of the A8 view.
+        let all = 3 | 3 << 3 | 3 << 6 | 3 << 9 | 1 << 12;
+        let wide = bytes.map(|b| [f32::from(b) / 255.0; 4]);
+        let got = read(&device, R8_UNORM, &bytes, view(A8_UNORM, all));
+        assert!(near(got, wide), "A8 view with (a, a, a, a): {got:?}");
+    }
+
+    #[test]
+    fn warp_views_of_four_bytes_in_another_order_swap_and_fill_channels() {
+        let Some(device) = warp() else {
+            return;
+        };
+        let texel = [10, 20, 30, 40];
+        let bytes: Vec<u8> = texel.repeat(4);
+        // B8G8R8A8 view of an R8G8B8A8 texture: byte 0 is blue.
+        let got = read(&device, 28, &bytes, view(87, DEFAULT));
+        assert!(near(got, [unorm([30, 20, 10, 40]); 4]), "BGRA of RGBA: {got:?}");
+        // B8G8R8X8 view of a B8G8R8A8 texture: alpha 1.
+        let mut opaque = unorm([30, 20, 10, 40]);
+        opaque[3] = 1.0;
+        let got = read(&device, 87, &bytes, view(88, DEFAULT));
+        assert!(near(got, [opaque; 4]), "BGRX of BGRA: {got:?}");
+        // R8G8B8A8 view of a typeless B8G8R8A8 texture: byte 0 is red.
+        let got = read(&device, 90, &bytes, view(28, DEFAULT));
+        assert!(near(got, [unorm(texel); 4]), "RGBA of BGRA: {got:?}");
+    }
 }
 
 #[cfg(test)]

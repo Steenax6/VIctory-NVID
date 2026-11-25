@@ -573,6 +573,9 @@ fn twin_texture(
 }
 
 /// The typeless format of a format's family (itself if it has none).
+/// A8_UNORM (65) has none: the host casts it to no R8 format, and an R8
+/// view reads its bytes as red where A8 has them as alpha (views of one
+/// read as the other: `descriptor::host::other_channels`).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
         (1, 4),
@@ -587,7 +590,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -3244,6 +3247,19 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// The R8 family is R8 typeless (60) with UNORM, UINT, SNORM and SINT
+    /// (61 to 64); A8_UNORM (65) is a family of its own (Marvisak 97c8783).
+    #[test]
+    fn a8_unorm_is_not_in_the_r8_family() {
+        assert_eq!(family(60), 60);
+        for f in 61..=64 {
+            assert_eq!(family(f), 60);
+        }
+        assert_eq!(family(65), 65);
+        assert_eq!(family(59), 53);
+        assert_eq!(family(66), 66);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
