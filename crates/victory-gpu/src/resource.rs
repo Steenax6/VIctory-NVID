@@ -4426,4 +4426,210 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+
+    /// A list cut after the title set its targets: the next host list binds
+    /// the views the title set, though it wrote the render target or depth
+    /// descriptor (or both) again in between (DexNom PR #48, by Cuebert).
+    #[cfg(windows)]
+    #[test]
+    fn a_list_continued_after_a_cut_draws_into_the_views_that_were_set() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::s;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const RENDER_TARGET: u32 = 0x4;
+        const DEPTH_WRITE: u32 = 0x10;
+        let image = |format: u32, flags: u32, state: u32| {
+            let desc = ResourceDesc {
+                flags,
+                ..texture(4, 4, format, 1)
+            };
+            let mut out = std::ptr::null();
+            let made = create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &desc,
+                state,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(made, S_OK);
+            out
+        };
+        // Two colour targets and two depth targets (render target; depth
+        // without shader access).
+        let colours = [0, 1].map(|_| image(28, 1, RENDER_TARGET));
+        let depths = [0, 1].map(|_| image(40, 2 | 8, DEPTH_WRITE));
+        let colour = colours.map(|r| host_resource(r).unwrap().clone());
+        let depth = depths.map(|r| host_resource(r).unwrap().clone());
+        let source = r#"
+            [RootSignature("RootFlags(0)")]
+            float4 vs(uint id : SV_VertexID) : SV_Position {
+                float2 p = float2((id << 1) & 2, id & 2);
+                return float4(2 * p - 1, 0.5, 1);
+            }
+            float4 ps() : SV_Target { return float4(1, 0, 0, 1); }
+        "#;
+        let vs = crate::host::compile(source, s!("vs"), s!("vs_5_1")).unwrap();
+        let ps = crate::host::compile(source, s!("ps"), s!("ps_5_1")).unwrap();
+        let code = |s: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: s.as_ptr().cast(),
+            BytecodeLength: s.len(),
+        };
+        let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+        formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        // SAFETY: plain creation; the description points at live data.
+        let (root, pipeline) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &vs).unwrap();
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs),
+                PS: code(&ps),
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                // Drawn where the depth target holds 1 (the first), not 0.
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: true.into(),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                    DepthFunc: D3D12_COMPARISON_FUNC_LESS,
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                DSVFormat: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = host.device.CreateGraphicsPipelineState(&desc).unwrap();
+            (root, pipeline)
+        };
+        let readback = host.read_back_buffer(2048).unwrap();
+        let mut results = Vec::new();
+        for (colour_again, depth_again) in [(false, false), (true, false), (false, true), (true, true)] {
+            // The title's descriptor slots (at least 112 bytes each).
+            let mut colour_slot = [0u64; 16];
+            let mut depth_slot = [0u64; 16];
+            let (c, d) = (colour_slot.as_mut_ptr() as u64, depth_slot.as_mut_ptr() as u64);
+            let write = |ci: usize, di: usize| {
+                crate::descriptor::create_rtv(std::ptr::null(), colours[ci], std::ptr::null(), c);
+                crate::descriptor::create_dsv(std::ptr::null(), depths[di], std::ptr::null(), d);
+            };
+            write(0, 0);
+            let first = host.new_list().unwrap();
+            let mut state = crate::draw::State::default();
+            state.set_targets(&first, &[c], d);
+            // SAFETY: an open list; the targets are in the states named.
+            unsafe {
+                for i in 0..2 {
+                    first.list.ClearRenderTargetView(host.rtv(Some(&colour[i]), None), &[0.0; 4], None);
+                    let far = if i == 0 { 1.0 } else { 0.0 };
+                    first
+                        .list
+                        .ClearDepthStencilView(host.dsv(&depth[i], None), D3D12_CLEAR_FLAG_DEPTH, far, 0, None);
+                }
+            }
+            first.close();
+            host.execute(&[&first]);
+            write(usize::from(colour_again), usize::from(depth_again));
+            let list = host.new_list().unwrap();
+            state.replay(&list);
+            // SAFETY: an open list; what it uses lives past its execution.
+            unsafe {
+                let l = &list.list;
+                l.SetGraphicsRootSignature(&root);
+                l.SetPipelineState(&pipeline);
+                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                l.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: 4.0,
+                    Height: 4.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+                l.RSSetScissorRects(&[RECT {
+                    left: 0,
+                    top: 0,
+                    right: 4,
+                    bottom: 4,
+                }]);
+                l.DrawInstanced(3, 1, 0, 0);
+                for (i, image) in colour.iter().enumerate() {
+                    l.ResourceBarrier(&[crate::host::transition(
+                        image,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&readback),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: 1024 * i as u64,
+                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    Width: 4,
+                                    Height: 4,
+                                    Depth: 1,
+                                    RowPitch: 256,
+                                },
+                            },
+                        },
+                    };
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(image),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                    l.ResourceBarrier(&[crate::host::transition(
+                        image,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    )]);
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            let mut red = [0; 2];
+            // SAFETY: the copies finished (execute waits); both images lie
+            // in rows of 256 bytes in the 2048.
+            unsafe {
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                for (i, count) in red.iter_mut().enumerate() {
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            let texel = mapped.cast::<u8>().add(i * 1024 + y * 256 + x * 4).cast::<[u8; 4]>().read();
+                            assert!(matches!(texel, [0, 0, 0, 0] | [255, 0, 0, 255]), "texel {texel:?}");
+                            *count += usize::from(texel[0] == 255);
+                        }
+                    }
+                }
+                readback.Unmap(0, Some(&D3D12_RANGE::default()));
+            }
+            results.push((colour_again, depth_again, red));
+        }
+        for r in colours.into_iter().chain(depths) {
+            slot::<Release>(r, 0x10)(r);
+        }
+        assert_eq!(
+            results,
+            [(false, false), (true, false), (false, true), (true, true)].map(|(c, d)| (c, d, [16, 0])),
+            "a descriptor written again changed the targets of a list continued after a cut"
+        );
+    }
 }
