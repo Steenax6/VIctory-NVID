@@ -2001,6 +2001,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Copies of shader-written textures back into it are dropped.
+    crate::texback::remapped(at, len);
     // Whether its blocks are there is asked anew (`texture::block_there`).
     crate::texture::blocks_remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
