@@ -351,6 +351,14 @@ impl Voice {
             },
         }
     }
+
+    /// Queues decoded samples, less what is still to skip: a frame's, or
+    /// the overlap tail's when the skip reaches past the last frame.
+    fn append_samples(&mut self, pcm: &[i16], channels: usize) {
+        let skip = (self.skip * channels).min(pcm.len());
+        self.skip -= skip / channels;
+        self.pcm.extend(&pcm[skip..]);
+    }
 }
 
 /// What a voice did, for the debug log when it is disabled.
@@ -633,8 +641,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
                 let mut tail = Vec::new();
+                let channels = decoder.channels();
                 decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.append_samples(&tail, channels);
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -696,9 +705,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     }
     // What is still to skip is this frame's (the stream's first, or a
     // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
-    voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.append_samples(&pcm, channels);
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
@@ -1440,6 +1447,40 @@ mod tests {
         assert_eq!((write, full), (2, true));
         assert!(ring[..0x200].iter().all(|&b| b == 0));
         assert!(ring[0x200..].iter().all(|&b| b == 0x55));
+    }
+
+    /// A start skip longer than the one frame of a stream reaches into the
+    /// overlap tail flushed after it: a frame is four subframes, the tail
+    /// two more, and what is skipped of the six is not queued.
+    #[test]
+    fn a_start_skip_can_reach_into_the_final_overlap() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x800, 0x800, 1), S_OK);
+        let mut stream = silent_stream();
+        stream[..4].copy_from_slice(&(1u32 << 26).to_be_bytes());
+        // SAFETY: one packet, into an allocation of that size.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), xma::PACKET_BYTES) };
+
+        for skip in 4..=7 {
+            let mut words = [0u32; 16];
+            let context = Context(words.as_mut_ptr());
+            context.set(0, 1 | 1 << 20);
+            context.set(2, 32);
+            context.set(5, input_apu);
+            let mut voice = Voice::new(skip * xma::SUBFRAME_SAMPLES);
+            assert!(decode(context, &mut voice));
+            assert_eq!(voice.trace.bad_frames, 0);
+            assert!(voice.pcm.is_empty());
+
+            let expected = 6usize.saturating_sub(skip) * xma::SUBFRAME_SAMPLES;
+            let has_tail = decode(context, &mut voice);
+            assert_eq!(voice.pcm.len(), expected, "skip {skip} subframes");
+            assert_eq!(has_tail, expected != 0);
+            assert!(voice.ended);
+            assert!(!decode(context, &mut voice));
+        }
+        ApuFree(input);
     }
 
     /// A loop over the first two frames, which ends after the second
