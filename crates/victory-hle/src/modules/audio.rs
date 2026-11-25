@@ -328,8 +328,29 @@ struct Voice {
     pcm: VecDeque<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
+    /// Both inputs ran out. Input the title gives later resumes the voice.
     ended: bool,
     trace: Trace,
+}
+
+impl Voice {
+    fn new(skip: usize) -> Voice {
+        Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+                resumes: 0,
+            },
+        }
+    }
 }
 
 /// What a voice did, for the debug log when it is disabled.
@@ -343,6 +364,8 @@ struct Trace {
     peak: i16,
     /// Milliseconds after enabling when the input ran out.
     ended_ms: Option<u128>,
+    /// How often input came after it had run out.
+    resumes: u32,
 }
 
 /// Blocks the title took (command 18), how often, and how often it found
@@ -449,20 +472,9 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
-        *voice = Some(Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        });
+        *voice = Some(Voice::new(
+            context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
+        ));
         *lock(&slot.ring) = Takes::default();
         drop(voice);
         wake_decoder();
@@ -490,6 +502,7 @@ impl Xma {
             bad_frames = t.bad_frames,
             peak = t.peak,
             input_ended_ms = ?t.ended_ms,
+            resumes = t.resumes,
             read_bit = context.field(2, 0, 26),
             input_bits = context.field(0, 0, 12) * xma::PACKET_BYTES as u32 * 8,
             "XMA voice disabled"
@@ -593,10 +606,20 @@ fn fill_block(context: Context, voice: &mut Voice, ring: &Mutex<Takes>) -> bool 
 }
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
-/// when there is nothing left to decode.
+/// when there is nothing left to decode until the title gives more input.
 fn decode(context: Context, voice: &mut Voice) -> bool {
     if voice.ended {
-        return false;
+        if context.field(0, 20, 2) == 0 {
+            return false;
+        }
+        // Input after it ran out (a stream the title refilled late, its
+        // refills paced by its frames): the hardware decodes it, so the
+        // voice resumes from a cold decoder at the start of the input, with
+        // the error cleared as enabling does. Its tail was flushed.
+        voice.ended = false;
+        voice.decoder = None;
+        voice.trace.resumes += 1;
+        context.set(2, 0);
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
@@ -1442,20 +1465,7 @@ mod tests {
         context.set(3, first);
         context.set(4, second);
         context.set(5, input_apu);
-        let mut voice = Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: 0,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        };
+        let mut voice = Voice::new(0);
         let mut step = |expect_next: u32| {
             let before = voice.pcm.len();
             assert!(decode(context, &mut voice));
@@ -1472,6 +1482,50 @@ mod tests {
         assert_eq!(step(second), 2 * subframe, "the loop's first frame");
         // No loops left: both frames whole, and on to the third.
         assert_eq!(step(third), 4 * subframe);
+        ApuFree(input);
+    }
+
+    /// A voice whose inputs both ran out decodes again once the title
+    /// marks an input valid, from its start and with the error cleared: a
+    /// streaming title may refill late. It used to stay silent until
+    /// enabled again.
+    #[test]
+    fn a_voice_that_ran_out_resumes_on_new_input() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        // Two packets, input 0 valid; 48 kHz mono, from the first frame.
+        context.set(0, 2 | 1 << 20 | 4 << 22);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(5, input_apu);
+        let mut voice = Voice::new(0);
+
+        // Six frames and the tail, then nothing.
+        let mut steps = 0;
+        while decode(context, &mut voice) {
+            steps += 1;
+            assert!(steps < 100, "the input never ran out");
+        }
+        assert!(voice.ended);
+        assert_eq!(context.field(2, 26, 6), INPUT_INVALID | 1 << 5);
+        assert!(!decode(context, &mut voice), "no input, nothing decoded");
+
+        // The title refills input 1 and marks it valid.
+        context.set(6, input_apu);
+        context.set_field(1, 0, 12, 2);
+        context.set_field(0, 21, 1, 1);
+        let before = voice.pcm.len();
+        assert!(decode(context, &mut voice), "resumed");
+        assert_eq!(voice.pcm.len() - before, xma::FRAME_SAMPLES);
+        assert_eq!(context.field(2, 26, 6), 0, "error cleared");
+        assert_eq!(context.field(4, 31, 1), 1, "on input 1");
+        assert_eq!((voice.ended, voice.trace.resumes), (false, 1));
         ApuFree(input);
     }
 
