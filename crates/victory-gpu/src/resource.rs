@@ -1131,6 +1131,8 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// For such a texture: kept for reuse when it goes ([`keep_reserved`]).
+    reuse: Option<ReuseKey>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1170,6 +1172,11 @@ struct Hosted {
 #[cfg(windows)]
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Nanoseconds spent making host textures of the title's placed textures,
+/// and how many, since the line that says so.
+#[cfg(windows)]
+pub(crate) static MAKING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
@@ -1318,6 +1325,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // one if the card will not have it so, is made as before.
         const TEXTURE_2D: u32 = 3;
         let mut tiled = None;
+        let mut reused_state = None;
         let mut texture = None;
         let shape_fits = fills(&r.desc)
             && r.desc.dimension == TEXTURE_2D
@@ -1351,7 +1359,23 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly || leave_out > 0 { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            // One kept from a texture of the same description that went
+            // (`take_reserved`), or a new one.
+            let reserved = if partly || leave_out > 0 {
+                match take_reserved(ReuseKey::of(&r.desc)) {
+                    Some((texture, state)) => {
+                        RESERVED_REUSE[0].fetch_add(1, Relaxed);
+                        reused_state = Some(state);
+                        Some(texture)
+                    }
+                    None => {
+                        RESERVED_REUSE[1].fetch_add(1, Relaxed);
+                        host_texture_as(&r.desc, r.host.state, clear, true, false)
+                    }
+                }
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1362,12 +1386,26 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 cut.leave_out(leave_out);
                 tiled = Some(cut);
                 texture = reserved;
+            } else {
+                reused_state = None;
             }
         }
+        // A texture the title views in its own memory, whose contents are
+        // uploaded whole, may be placed in memory another had. (One that is
+        // not uploaded must read zeros.)
+        let placed = r.host.placed.load(Relaxed)
+            && crate::placed::on()
+            && fills(&r.desc)
+            && texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+        let began = std::time::Instant::now();
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+            None => host_texture(&r.desc, r.host.state, clear, placed),
         };
+        if r.host.placed.load(Relaxed) {
+            MAKING[0].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+            MAKING[1].fetch_add(1, Relaxed);
+        }
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
             return None;
@@ -1384,9 +1422,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 "depth texture with unordered access"
             );
         }
-        let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+        // (A texture kept for reuse is in the state its last list left it.)
+        let state = reused_state
+            .unwrap_or_else(|| crate::host::legal_state(&texture, crate::host::texture_state(r.host.state)));
         let mut host = match tiled {
-            Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
+            Some(tiled) => HostTexture::new_tiled(texture, state, tiled, ReuseKey::of(&r.desc)),
             None => HostTexture::new(texture, state),
         };
         host.filled = fills(&r.desc);
@@ -1615,8 +1655,9 @@ pub(crate) fn room() -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
+        // What the heaps of placed textures have free is room.
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            used.saturating_sub(crate::placed::free_bytes()) + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1939,6 +1980,16 @@ pub(crate) fn let_go_idle() {
         return;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    // Host copies made without memory of their own (`crate::tiles`: levels
+    // left out, or on demand) wait longer while the card is not pressed
+    // (`vram_idle_ms` above its least): they hold little of it, and the
+    // opening cutscene made 12,168 copies again in 110 s with them where it
+    // made 2,938 without. `VICTORY_TILED_IDLE_MS` (5,000; 0: as the others).
+    static TILED_IDLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let tiled_idle = *TILED_IDLE.get_or_init(|| {
+        std::env::var("VICTORY_TILED_IDLE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(5000).min(60_000)
+    });
+    let tiled_idle_ms = if idle_ms > 1000 { idle_ms.max(tiled_idle) } else { idle_ms };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1953,7 +2004,8 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                let ms = if host.tiled.is_some() { tiled_idle_ms } else { idle_ms };
+                crate::host::long_ago(r.host.used.load(Relaxed), ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2134,15 +2186,19 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            reuse: None,
         }
     }
 
     /// A texture made without memory of its own (`crate::tiles`): counted
-    /// as a host texture of no bytes.
+    /// as a host texture of no bytes. `reuse`: what it is kept under for
+    /// the next texture of that description when it goes
+    /// ([`take_reserved`]).
     fn new_tiled(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
         tiled: crate::tiles::Tiled,
+        reuse: ReuseKey,
     ) -> HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
@@ -2151,6 +2207,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            reuse: Some(reuse),
         }
     }
 }
@@ -2165,7 +2222,129 @@ impl Drop for HostTexture {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
         }
+        // A texture without memory of its own is kept for the next one of
+        // its description: its tiles are taken from it on the queue (ahead
+        // of anything a later list does with it) and go back to the pool.
+        // A host copy goes only when nothing on the card uses it any more
+        // (a list holds it until it is reset, and the sweep's and the
+        // title's releases wait for the next landing).
+        // (Only a texture nothing else names: a descriptor slot keeps the
+        // texture it views, and a slot of a texture the title released may
+        // still be read.)
+        if reserved_reuse_most() > 0
+            && self.reuse.is_some()
+            && crate::host::references(&self.texture) == 1
+            && let (Some(key), Some(tiled)) = (self.reuse, self.tiled.take())
+            && tiled.unmap_all(&self.texture)
+        {
+            drop(tiled);
+            keep_reserved(key, self.texture.clone(), self.state.load(Relaxed));
+        }
     }
+}
+
+/// What a texture without memory of its own is kept under for reuse: the
+/// title description's dimension, width, height, layers, levels, format
+/// and flags (the host's description follows from them).
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct ReuseKey(u32, u64, u32, u16, u16, u32, u32);
+
+#[cfg(windows)]
+impl ReuseKey {
+    fn of(desc: &ResourceDesc) -> ReuseKey {
+        ReuseKey(
+            desc.dimension,
+            desc.width,
+            desc.height,
+            desc.depth_or_array_size,
+            desc.mip_levels,
+            desc.format,
+            desc.flags,
+        )
+    }
+}
+
+/// Textures without memory of their own kept for reuse, by description:
+/// the texture and the state its last list left it in; and how many in all.
+/// Making one is two calls into the kernel (its allocation and its range
+/// of the card's addresses: `NtGdiDdDDICreateAllocation`, 33 ms a frame of
+/// the texture pass in the opening cutscene with some 700 made a second),
+/// releasing it two more; it holds no memory of the card, only addresses.
+#[cfg(windows)]
+static SPARE_RESERVED: std::sync::Mutex<(
+    std::collections::BTreeMap<ReuseKey, Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>>,
+    usize,
+)> = std::sync::Mutex::new((std::collections::BTreeMap::new(), 0));
+
+/// Since the start: textures without memory taken from the spare ones,
+/// made anew, kept when let go, and released because the spare ones were
+/// as many as allowed ([`reserved_reuse_most`]).
+#[cfg(windows)]
+pub(crate) static RESERVED_REUSE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// How many textures without memory are kept spare at most:
+/// `VICTORY_RESERVED_REUSE` (4,096; 0: none is kept, each is made and
+/// released as before).
+#[cfg(windows)]
+fn reserved_reuse_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_RESERVED_REUSE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4096)
+            .min(1 << 16)
+    })
+}
+
+/// Keeps `texture` (without memory, no tiles mapped any more, in host
+/// state `state`) for the next texture of description `key`, or releases
+/// it if as many are kept as allowed.
+#[cfg(windows)]
+fn keep_reserved(key: ReuseKey, texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let most = reserved_reuse_most();
+    let mut spare = SPARE_RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+    if spare.1 >= most {
+        drop(spare);
+        RESERVED_REUSE[3].fetch_add(1, Relaxed);
+        drop(texture);
+        return;
+    }
+    spare.1 += 1;
+    spare.0.entry(key).or_default().push((texture, state));
+    RESERVED_REUSE[2].fetch_add(1, Relaxed);
+}
+
+/// A spare texture without memory of description `key`, and its host
+/// state ([`keep_reserved`]).
+#[cfg(windows)]
+fn take_reserved(key: ReuseKey) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    if reserved_reuse_most() == 0 {
+        return None;
+    }
+    let mut spare = SPARE_RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+    let taken = spare.0.get_mut(&key).and_then(Vec::pop);
+    if taken.is_some() {
+        spare.1 -= 1;
+    }
+    taken
+}
+
+/// For the 5-second line: textures without memory taken from the spare
+/// ones, made anew, kept, released for want of places; and spare now.
+#[cfg(windows)]
+pub(crate) fn reserved_reuse_stats() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let spare = SPARE_RESERVED.lock().unwrap_or_else(|e| e.into_inner()).1 as u64;
+    [
+        RESERVED_REUSE[0].load(Relaxed),
+        RESERVED_REUSE[1].load(Relaxed),
+        RESERVED_REUSE[2].load(Relaxed),
+        RESERVED_REUSE[3].load(Relaxed),
+        spare,
+    ]
 }
 
 /// How many textures placed in title memory have a resource of ours
@@ -2222,8 +2401,9 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    placed: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_as(desc, state, clear, false)
+    host_texture_as(desc, state, clear, false, placed)
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -2234,6 +2414,7 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
+    placed: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -2284,6 +2465,16 @@ fn host_texture_as(
         }
         value
     });
+    if placed && !reserved {
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+        // SAFETY: the description has the host layout (checked size, same
+        // fields).
+        let of = unsafe { &*(&raw const d).cast::<D3D12_RESOURCE_DESC>() };
+        if let Some(t) = crate::placed::make(&host.device, of, state) {
+            crate::host::name(&t, || format!("placed texture {}x{} f{}", d.width, d.height, d.format));
+            return Some(t);
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
