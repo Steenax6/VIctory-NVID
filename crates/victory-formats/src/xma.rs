@@ -167,6 +167,58 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     })
 }
 
+/// Reads a frame that begins near the end of one input buffer (`head`, of
+/// which `head_bits` hold data) and finishes at the start of the other: a
+/// title fills the two in turn, and the frame's last bits are the
+/// continuation at the head of the other's first packet, the
+/// `first_frame_bit` bits after its header. Returns the frame and where the
+/// frame after it begins in `tail`; `None` when the bits do not add up to
+/// one frame.
+pub fn read_frame_spanning(
+    head: &[u8],
+    head_bits: usize,
+    tail: &[u8],
+    start: usize,
+) -> Option<(Frame, usize)> {
+    let mut cursor = Cursor { data: head, pos: start };
+    let bits = cursor.bits(LENGTH_BITS)? as usize;
+    if bits <= LENGTH_BITS as usize || bits == 0x7fff {
+        return None;
+    }
+    let continuation = packet(tail, 0)?.first_frame_bit as usize;
+    if continuation == 0 || HEADER_BITS + continuation >= PACKET_BITS || start >= head_bits {
+        return None;
+    }
+    let mut out = vec![0u8; bits.div_ceil(8)];
+    // The head through the packet-aware cursor: a frame that crosses
+    // packets in the head has their headers and the packets of other
+    // streams between its bits.
+    let mut cursor = Cursor { data: head, pos: start };
+    let mut got = 0;
+    while got < bits && cursor.pos < head_bits {
+        out[got / 8] |= (cursor.bit()? as u8) << (7 - got % 8);
+        got += 1;
+    }
+    // The rest must be the continuation exactly, or the tail holds another
+    // frame's.
+    if got >= bits || bits - got != continuation {
+        return None;
+    }
+    for i in 0..continuation {
+        let at = HEADER_BITS + i;
+        let bit = (*tail.get(at / 8)? >> (7 - at % 8)) & 1;
+        out[(got + i) / 8] |= bit << (7 - (got + i) % 8);
+    }
+    let next = HEADER_BITS + continuation;
+    let frame = Frame {
+        data: out,
+        bits,
+        start,
+        next: Some(next),
+    };
+    Some((frame, next))
+}
+
 /// Where the frame after the one at `start`..`end` begins: right after it,
 /// unless it was the last frame to begin in its packet and the rest of that
 /// packet is padding.
@@ -1493,6 +1545,87 @@ mod tests {
         let payload_bits = (PACKET_BITS - HEADER_BITS) as u32;
         put_bits(&mut data, PACKET_BITS, 32, (1 << 26) | (payload_bits << 11));
         assert_eq!(read_frame(&data, HEADER_BITS).unwrap().next, None);
+    }
+
+    /// A frame whose last eleven bits sit in the other input buffer comes
+    /// back bit for bit as the same frame unsplit.
+    #[test]
+    fn a_frame_can_finish_in_the_other_input_buffer() {
+        const BITS: usize = 31;
+        let whole = {
+            let mut d = vec![0u8; PACKET_BYTES];
+            put_bits(&mut d, 0, 32, 1 << 26);
+            put_bits(&mut d, 32, LENGTH_BITS, BITS as u32);
+            put_bits(&mut d, 47, 2, 0b10);
+            put_bits(&mut d, 49, 16, 0xABCD);
+            d
+        };
+        let unsplit = read_frame(&whole, 32).expect("whole frame");
+        assert_eq!(unsplit.bits, BITS);
+
+        // 20 bits in the head, 11 in the tail.
+        let split_at = 52;
+        let mut head = vec![0u8; PACKET_BYTES];
+        for bit in 0..split_at {
+            if whole[bit / 8] >> (7 - bit % 8) & 1 == 1 {
+                head[bit / 8] |= 1 << (7 - bit % 8);
+            }
+        }
+        let mut tail = vec![0u8; PACKET_BYTES];
+        put_bits(&mut tail, 0, 32, (1 << 26) | (11 << 11));
+        for bit in split_at..32 + BITS {
+            let at = 32 + bit - split_at;
+            if whole[bit / 8] >> (7 - bit % 8) & 1 == 1 {
+                tail[at / 8] |= 1 << (7 - at % 8);
+            }
+        }
+
+        let (spanning, next) =
+            read_frame_spanning(&head, split_at, &tail, 32).expect("spanning frame");
+        assert_eq!(spanning.bits, BITS);
+        assert_eq!(spanning.data, unsplit.data);
+        assert_eq!(next, 43);
+        // A continuation of another length is another frame's.
+        put_bits(&mut tail, 0, 32, (1 << 26) | (12 << 11));
+        assert!(read_frame_spanning(&head, split_at, &tail, 32).is_none());
+    }
+
+    /// A spanning frame that crosses a packet header in the head keeps that
+    /// header out of its payload.
+    #[test]
+    fn a_spanning_frame_skips_the_packet_header_it_crosses() {
+        const BITS: usize = 500;
+        // Late in packet 1, on into the payload of packet 2.
+        const START: usize = 2 * PACKET_BITS - 352;
+        const HEAD_BITS: usize = 2 * PACKET_BITS + HEADER_BITS + 100;
+        const NEEDED: usize = BITS - 352 - 100;
+
+        let mut whole = vec![0u8; 3 * PACKET_BYTES];
+        for p in 0..3 {
+            put_bits(&mut whole, p * PACKET_BITS, 32, 1 << 26);
+        }
+        put_bits(&mut whole, START, LENGTH_BITS, BITS as u32);
+        // Payload bits that make a stray header bit show.
+        for i in LENGTH_BITS as usize..BITS {
+            let at = START + i;
+            if !(2 * PACKET_BITS..2 * PACKET_BITS + HEADER_BITS).contains(&at) {
+                put_bits(&mut whole, at, 1, ((i * 7) % 251) as u32 & 1);
+            }
+        }
+
+        let mut tail = vec![0u8; PACKET_BYTES];
+        put_bits(&mut tail, 0, 32, (1 << 26) | ((NEEDED as u32) << 11));
+        for i in 0..NEEDED {
+            let at = HEAD_BITS + i;
+            let value = (whole[at / 8] >> (7 - at % 8)) & 1;
+            put_bits(&mut tail, HEADER_BITS + i, 1, value as u32);
+        }
+
+        let (spanning, next) =
+            read_frame_spanning(&whole, HEAD_BITS, &tail, START).expect("spanning frame");
+        let expected = read_frame(&whole, START).expect("whole frame");
+        assert_eq!(spanning.data, expected.data, "no header bits in the payload");
+        assert_eq!(next, HEADER_BITS + NEEDED);
     }
 
     #[test]

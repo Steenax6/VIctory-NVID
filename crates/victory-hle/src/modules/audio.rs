@@ -693,20 +693,39 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         context.set_field(4, 31, 1, current);
         context.set_field(2, 0, 26, 0);
     }
-    let (address, packets) = match current {
-        0 => (context.get(5), context.field(0, 0, 12)),
-        _ => (context.get(6), context.field(1, 0, 12)),
+    let input = |bank: u32| {
+        let (address, packets) = match bank {
+            0 => (context.get(5), context.field(0, 0, 12)),
+            _ => (context.get(6), context.field(1, 0, 12)),
+        };
+        heap_bytes(address & !0x7ff, packets as usize * xma::PACKET_BYTES).map(|data| &*data)
     };
-    let Some(data) = heap_bytes(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
+    let Some(data) = input(current) else {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
     let at = context.field(2, 0, 26) as usize;
     let start = if at < 32 { xma::first_frame(data) } else { Some(at) };
-    let Some(frame) = start.and_then(|pos| xma::read_frame(data, pos)) else {
-        // This input is used up.
-        context.set_field(0, 20 + current, 1, 0);
-        return true;
+    // The bank the frame ends in, which the read position is then of.
+    let (frame, bank) = match start.and_then(|pos| xma::read_frame(data, pos)) {
+        Some(frame) => (frame, current),
+        None => {
+            // This input is used up. A frame can begin near its end and
+            // finish at the start of the other input (the title fills the
+            // two in turn): it is read across both and decoding goes on in
+            // the other, instead of dropping it and starting there at the
+            // first frame that begins in it.
+            context.set_field(0, 20 + current, 1, 0);
+            let other = 1 - current;
+            let spanning = start
+                .filter(|_| valid & (1 << other) != 0)
+                .and_then(|pos| xma::read_frame_spanning(data, data.len() * 8, input(other)?, pos));
+            let Some((frame, _)) = spanning else {
+                return true;
+            };
+            context.set_field(4, 31, 1, other);
+            (frame, other)
+        }
     };
     let decoder = voice.decoder.get_or_insert_with(|| {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
@@ -750,7 +769,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
     }
     if next.is_none() {
-        context.set_field(0, 20 + current, 1, 0);
+        context.set_field(0, 20 + bank, 1, 0);
     }
     context.set_field(2, 0, 26, next.unwrap_or(0) as u32);
     true
@@ -1491,6 +1510,74 @@ mod tests {
         assert_eq!((write, full), (2, true));
         assert!(ring[..0x200].iter().all(|&b| b == 0));
         assert!(ring[0x200..].iter().all(|&b| b == 0x55));
+    }
+
+    /// One frame whose last eleven bits sit in the other input: it is
+    /// decoded across both, and decoding goes on in the other input right
+    /// after the continuation. Switching inputs used to drop it.
+    #[test]
+    fn xma_frames_split_across_the_two_inputs_are_decoded() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+
+        let start = xma::PACKET_BYTES * 8 - 20;
+        let bits = 31usize;
+        let put = |data: &mut [u8], at: usize, value: u32, width: usize| {
+            for i in 0..width {
+                if value >> (width - 1 - i) & 1 == 1 {
+                    data[(at + i) / 8] |= 1 << (7 - (at + i) % 8);
+                }
+            }
+        };
+        let mut head = vec![0u8; xma::PACKET_BYTES];
+        // One frame, no other streams; one 512-sample subframe.
+        put(&mut head, 0, 1 << 26, 32);
+        put(&mut head, start, bits as u32, 15);
+        put(&mut head, start + 15, 0b10, 2);
+        let mut tail = vec![0u8; xma::PACKET_BYTES];
+        put(&mut tail, 0, (1 << 26) | ((bits - 20) as u32) << 11, 32);
+
+        let (mut input0, mut apu0) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input0, &mut apu0, 0x1000, 0x800, 1), S_OK);
+        let (mut input1, mut apu1) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input1, &mut apu1, 0x1000, 0x800, 1), S_OK);
+        // SAFETY: both inputs have room for a packet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(head.as_ptr(), input0.cast(), head.len());
+            std::ptr::copy_nonoverlapping(tail.as_ptr(), input1.cast(), tail.len());
+        }
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+
+        // Input 0: one packet; both valid; a ring of four; input 1: one
+        // packet; writable, 48 kHz mono; reading at the split frame.
+        context.set(0, 1 | 1 << 20 | 1 << 21 | 4 << 22);
+        context.set(1, 1 | 1 << 31 | 3 << 27);
+        context.set(2, start as u32);
+        context.set(5, apu0);
+        context.set(6, apu1);
+        context.set(7, output_apu);
+        let mut voice = Voice::new(0);
+        assert!(decode(context, &mut voice));
+        let decoded = (voice.trace.frames, voice.trace.bad_frames, voice.pcm.len());
+        let bank = context.field(4, 31, 1);
+        let (read, valid) = (context.field(2, 0, 26), context.field(0, 20, 2));
+        ApuFree(input0);
+        ApuFree(input1);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+        assert_eq!(decoded, (1, 0, xma::FRAME_SAMPLES), "the split frame was decoded");
+        // On in input 1, after the continuation; input 0 is used up.
+        assert_eq!((bank, read, valid), (1, 43, 0b10));
     }
 
     /// Decode steps that give no samples (an empty input 0 before input 1,
