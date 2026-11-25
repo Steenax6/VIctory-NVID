@@ -24,7 +24,7 @@ foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VIC
 # The faster settings (README, "Faster settings"): on unless the caller set
 # them or asked for -Plain.
 if (-not $Plain) {
-    foreach ($v in "VICTORY_ASYNC_SUBMIT", "VICTORY_QUEUE2", "VICTORY_INDIRECT_WINDOW", "VICTORY_TEXTURE_NO_WAIT") {
+    foreach ($v in "VICTORY_ASYNC_SUBMIT", "VICTORY_QUEUE2", "VICTORY_INDIRECT_WINDOW", "VICTORY_TEXTURE_NO_WAIT", "VICTORY_PLACED_TEX") {
         if (-not (Test-Path "Env:$v")) { Set-Item "Env:$v" "1" }
     }
 }

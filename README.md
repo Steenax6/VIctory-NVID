@@ -15,7 +15,7 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 | Boot, first-boot screens, intro, opening credits | works |
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase (wanted level, minimap), boat, binoculars |
 | Stability | 1 h 30 min+ in one session without a crash |
-| Frame rate | 1-3 fps in the world on that card (the first run is slower while shaders translate; they are cached after that). On an RTX 4070 Ti with a Ryzen 7 9800X3D, with `scripts\play.ps1`: 5-9 fps in the opening cutscene and 10-11 fps in the first room (they were 1-5 and about 4 before the changes of 2026-11-25, see "Faster settings") |
+| Frame rate | 1-3 fps in the world on that card (the first run is slower while shaders translate; they are cached after that). On an RTX 4070 Ti with a Ryzen 7 9800X3D, with `scripts\play.ps1`: 6-9 fps in the opening cutscene and about 11 fps in the first room (they were 1-5 and about 4 before the changes of 2026-11-25, see "Faster settings"); the first room is lit and complete there in every run, and the band of stale blocks along the bottom of the picture is gone |
 | Known problems | anything in shadow is black and bright scenes overexpose (the game's ray-traced lighting does not run yet); some blocky artifacts; boats sit low in the water |
 
 ## Requirements
@@ -30,6 +30,10 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 ```powershell
 cargo build --release -p victory
 ```
+
+The release profile builds with thin LTO and one codegen unit (about a
+minute; 10-25 % less frame time than without, measured on the opening
+cutscene and the first room).
 
 ## Play
 
@@ -49,10 +53,11 @@ you.
 
 ## Faster settings
 
-`scripts\play.ps1` turns four of upstream's opt-in switches on unless you set
-them yourself: `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`,
-`VICTORY_INDIRECT_WINDOW=1`, `VICTORY_TEXTURE_NO_WAIT=1` (`-Plain` leaves
-them as the environment has them; `victory.exe` run by hand has them off).
+`scripts\play.ps1` turns five opt-in switches on unless you set them
+yourself: `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`,
+`VICTORY_INDIRECT_WINDOW=1`, `VICTORY_TEXTURE_NO_WAIT=1`,
+`VICTORY_PLACED_TEX=1` (`-Plain` leaves them as the environment has them;
+`victory.exe` run by hand has them off).
 Do not combine `VICTORY_INDIRECT_WINDOW=1` with `VICTORY_CARD_FETCH_INFLIGHT=1`
 (a device loss upstream).
 
@@ -70,6 +75,10 @@ to about 47 ms of work a frame.
 | `VICTORY_HEAP_SYNC_FAST`, `VICTORY_DESCRIPTOR_STRIPES` | descriptor records the title copies into its heap are found by the write watch's 4 KiB pages and mirrored in runs; slots have striped locks, so recording threads no longer stand behind that pass |
 | `VICTORY_SHADOW_CACHE` | recording threads remember which host copy an address range has |
 | `VICTORY_USER_COPY`, `VICTORY_REFRESH_PARTS`, `VICTORY_REFRESH_4K`, `VICTORY_GUARD_4K`, `VICTORY_MARK_ONLY`, `VICTORY_VIEW_KNOWN`, `VICTORY_ABSENT_ONCE`, `VICTORY_ASK_SKIP_VIEWS`, `VICTORY_ALIAS_RUNS`, `VICTORY_SEND_CHANGED` | title memory is copied by the processor (a fault falls back to the kernel's copy), by 4 KiB pages and only where written; guards are not re-armed over other views; unmapped runs are remembered (`VICTORY_ABSENT_FRAMES`, 30); bytes the copy-back itself wrote are not sent up to the card again |
+| `VICTORY_TEXTURE_DROP_LEVELS` (`0`, `auto`, `force1`, `force2`), `VICTORY_TEXTURE_PROMOTE_MB`, `VICTORY_RESERVED_REUSE`, `VICTORY_STAGE_LEFT_OUT`, `VICTORY_TILED_IDLE_MS`, `VICTORY_STAGING_POOL_MB` | large block-compressed title textures (1024 a side and more) are made as reserved textures and, past a line of host-copy bytes, without their one or two most detailed levels; their views clamp the level of detail, so the sizes shaders read stay the title's. On a 12 GB card the title's textures did not all fit: some 22,000 waited for room in every run, and which were there differed from run to run (the first room came up lit in one run, dark in the next). Now none is held back there: 17,400 title textures alive in 2.9 GB where 9,500 took 3.9 GB. Reserved textures and staging buffers are reused, not made and released |
+| `VICTORY_PLACED_TEX=1` (opt-in; `play.ps1` sets it) | the other host textures of placed textures come out of 16 MiB heaps instead of an allocation each (fxceless/victory-fork pull request #903 with smaller heaps, filled fullest first): making one takes 9 us, the opening cutscene 158 -> about 125 ms a frame with the levels switch on; about 1 GB of the card stays free inside the heaps after the cutscene |
+| `VICTORY_GROUP_SPLIT`, `VICTORY_GROUP_PIECES=2` | a dispatch that asks for more than 65,535 thread groups in x runs in pieces, each told where its groups start (pull request #976), indirect records too: one of the title's indirect lighting passes asks for about 75,000 and lost its tail, a band of stale blocks along the bottom of the picture |
+| `VICTORY_PIPELINE_FIX`, `VICTORY_VIEW_RAW_OWN_COPY` | a pipeline the host refuses as the title described it is made again with its state put right (blending on integer targets and the like: the one mesh pipeline refused in the first room); a raw buffer view whose bytes do not start on 16 gets a copy of its own bytes instead of reading zeros |
 | `VICTORY_CARD_FINE`, `VICTORY_CARD_WIDE_HASH`, `VICTORY_CARD_SYNC_BATCH`, `VICTORY_MERGE_PAGES`, `VICTORY_FAST_MERGE`, `VICTORY_WIDE_COMPARE`, `VICTORY_BURY_ASIDE` | shader writes to copies in the card's memory are found per 4 KiB block (was 64 KiB), fetched as runs and merged where they differ; title bytes under flights go up a page at a time where shaders never wrote |
 
 Experiments, off: `VICTORY_ASYNC_PRESENT=1` (the title records the next
@@ -78,7 +87,11 @@ two minutes, because waits between its queues are passed at the present; a
 variant that met them in order ran four minutes without a fault, at the same
 frame rate, since the card sets the pace by then, and was not kept),
 `VICTORY_HOT_BLOCKS=1`, `VICTORY_MERGE_FORGET=1`, `VICTORY_NAMED_WRITES=1`
-(not yet tried in a run), `--console series-s` (a quarter faster, but the
+(not yet tried in a run), the argument clamp between enhanced barriers
+(Zettrox/ztrx pull request #139; on this card the same time on the card and
+in the title, left on the branch `narrow-waits`), page marks set by shaders
+for copy-backs (Marvisak/VIctory `cd94d35`: its gain is the CPU compare this
+tree no longer does; not ported), `--console series-s` (a quarter faster, but the
 picture is black: the title upscales with FidelityFX there, whose programs
 do not run yet).
 
