@@ -61,6 +61,14 @@ yourself: `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`,
 Do not combine `VICTORY_INDIRECT_WINDOW=1` with `VICTORY_CARD_FETCH_INFLIGHT=1`
 (a device loss upstream).
 
+`scripts\play.ps1 -SkipIntro` (`VICTORY_AUTO_SKIP=1`; a number skips that
+many scenes) holds A through the opening scene, which the title skips while
+A is held for about three seconds: the first room is there some 55 s
+sooner. The layer knows a scene by its draws (500 and more a frame for four
+seconds), holds A for four seconds and takes the cut to black for the skip;
+holds that change nothing end after three. By hand it is the same: hold A
+(Enter on the keyboard).
+
 What 2026-11-25 added is on by default; each has a switch that puts the old
 way back (`=0`). Measured on an RTX 4070 Ti in the first room, with the four
 switches above: from 5.5 to 10-11 frames a second (182 to about 95 ms a
