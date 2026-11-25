@@ -231,6 +231,22 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+
+    /// The copies (indices into `copies`) that [`Memory::name`] of
+    /// `address` gave or found: the directory's entries for its two pages.
+    fn named(&self, address: u64, out: &mut Vec<usize>) {
+        for at in [address, (address & !(CELL - 1)) + CELL] {
+            let page = at / PAGE;
+            if page >= u64::from(MEMORY_PAGES) - 1 {
+                continue;
+            }
+            // SAFETY: inside the directory's mapping.
+            let n = unsafe { self.directory.1.add(page as usize * 2).read() };
+            if n != 0 && !out.contains(&(n as usize - 1)) {
+                out.push(n as usize - 1);
+            }
+        }
+    }
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -258,8 +274,11 @@ pub(crate) fn ready(
         m.take_faults();
     }
     let numbered = m.copies.len();
+    // The copies this dispatch names (`crate::card_fine::named_writes`).
+    let mut named: Vec<usize> = Vec::new();
     for &address in addresses {
         m.name(address);
+        m.named(address, &mut named);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -269,10 +288,13 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            let address = u64::from(c) | u64::from(high) << 32;
+            m.name(address);
+            m.named(address, &mut named);
         }
         if c >= 0x0100_0000 {
             m.name(u64::from(c) << 8);
+            m.named(u64::from(c) << 8, &mut named);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -298,13 +320,24 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    // With `VICTORY_NAMED_WRITES=1`, but for every few frames: only the
+    // copies a dispatch names are declared written (`card_fine::named_writes`
+    // says what that risks).
+    let narrow = writes && crate::card_fine::named_writes() && !frame.is_multiple_of(crate::card_fine::named_net());
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if !writes {
+            continue;
+        }
+        // Noted for the count of flags in copies no dispatch named.
+        let fresh = named.contains(&n) && list.address_named(shadow);
+        let declare = if narrow { fresh } else { first_write || n >= numbered };
+        if declare {
             shadow.gpu_writes(list, start, len);
+            list.address_declared(shadow);
         }
     }
     if first_read {

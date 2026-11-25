@@ -17,6 +17,8 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod card_fine;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -35,6 +37,8 @@ mod indirect;
 mod inplace;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+mod own_time;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;

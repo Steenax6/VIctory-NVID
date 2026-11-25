@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod slots;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -63,6 +65,11 @@ pub(crate) struct Heap {
     /// descriptor records into it as bytes, without a descriptor API call.
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    /// The asking at which the batched pass over `written` last took each
+    /// changed 64 KiB page (`Pass`; `written` keeps its own for the pass
+    /// one record at a time).
+    #[cfg(windows)]
+    seen: std::sync::Mutex<std::collections::BTreeMap<usize, u64>>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -126,12 +133,12 @@ const SHADER_VISIBLE: u32 = 1;
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -147,6 +154,15 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
+    // Once the host heap is published (after the queued writes were
+    // replayed into it, `Heap::host`), every write goes to it directly:
+    // the queue's lock is only for before that.
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            host.mirror(index, handle, false);
+        }
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -176,9 +192,15 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let (mut pages, mut looked, mut mirrored, mut quick) = (0u64, 0u64, 0u64, 0u64);
+    let mut kernel_pages = 0u64;
     let mut page_bytes: Vec<u8> = Vec::new();
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    // (Shared: the recording threads look heaps up in it for every view
+    // they write, and stood behind this pass while it was a mutex.)
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut shapes = sync_fast().then(|| SHAPES_SEEN.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut picked: Vec<u32> = Vec::new();
+    let mut scratch = host::PickScratch::default();
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -191,6 +213,24 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        if let Some(shapes) = shapes.as_mut() {
+            let mut pass = Pass {
+                heap,
+                host,
+                start,
+                end,
+                step,
+                mirrored_count,
+                bytes: &mut page_bytes,
+                picked: &mut picked,
+                scratch: &mut scratch,
+                shapes,
+            };
+            let [p, l, m, q, k] = pass.run();
+            (pages, looked, mirrored, quick) = (pages + p, looked + l, mirrored + m, quick + q);
+            kernel_pages += k;
+            continue;
+        }
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -225,34 +265,195 @@ pub(crate) fn sync_heaps() {
             }
         }
     }
+    drop(shapes);
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64, quick, kernel_pages]) {
         count.fetch_add(n, Relaxed);
     }
 }
 
+/// Whether [`sync_heaps`] takes a page's records at once and mirrors the
+/// buffer views among them in runs (`HostHeap::mirror_picked`);
+/// `VICTORY_HEAP_SYNC_FAST=0`: one record at a time, as before.
+#[cfg(windows)]
+fn sync_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FAST").is_none_or(|v| v != "0"))
+}
+
+/// One heap's part of [`sync_heaps`] with [`sync_fast`]: the pages the
+/// write watch says changed since this pass last looked, and of each only
+/// the kernel's 4 KiB pages it says were written (`crate::watch::Written`)
+/// when it knows, and only the part with host slots (a capped host heap has
+/// none for the title's last slots, its per-draw tables). The records read
+/// are the slots on them; the new ones (`HostHeap::scan_copied`) are
+/// mirrored in runs (`HostHeap::mirror_picked`).
+///
+/// The pass before read every slot of every changed 64 KiB page, and
+/// hashed each: 2.9 million slots a frame for some 41,000 new records once
+/// the watch reported pages per submission (run e13), most of them on
+/// pages past the host slots.
+#[cfg(windows)]
+struct Pass<'a> {
+    heap: &'a Heap,
+    host: &'a host::HostHeap,
+    start: u64,
+    end: u64,
+    step: u64,
+    mirrored_count: u32,
+    bytes: &'a mut Vec<u8>,
+    picked: &'a mut Vec<u32>,
+    scratch: &'a mut host::PickScratch,
+    shapes: &'a mut Vec<Shape>,
+}
+
+#[cfg(windows)]
+impl Pass<'_> {
+    /// Returns the 64 KiB pages with host slots taken, the slots looked
+    /// at, the new records mirrored, those done in runs, and the 4 KiB
+    /// pages read.
+    fn run(&mut self) -> [u64; 5] {
+        use crate::watch::PAGE;
+        const KERNEL: usize = 4096;
+        let mut out = [0u64; 5];
+        let (start, end, step) = (self.start as usize, self.end as usize, self.step as usize);
+        let Some((_, written)) = crate::watch::writes_fine(start, end, true) else {
+            return out;
+        };
+        // Where the slots with host counterparts end.
+        let mirrored_end = start.saturating_add(self.mirrored_count as usize * step).min(end);
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut seen = self.heap.seen.lock().unwrap_or_else(|e| e.into_inner());
+            for (page, w) in written {
+                let last = seen.get(&page).copied();
+                if last.is_some_and(|l| l >= w.at) {
+                    continue;
+                }
+                seen.insert(page, w.at);
+                let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(mirrored_end));
+                if lo >= hi {
+                    continue;
+                }
+                out[0] += 1;
+                for (a, z) in written_parts(page * PAGE, kernel_mask(last, w), KERNEL) {
+                    let (a, z) = (a.max(lo), z.min(hi));
+                    if a >= z {
+                        continue;
+                    }
+                    match runs.last_mut() {
+                        Some((_, e)) if *e >= a => *e = (*e).max(z),
+                        _ => runs.push((a, z)),
+                    }
+                }
+            }
+        }
+        // At most a 64 KiB page's records read at once.
+        let most = (PAGE / step).max(1);
+        for (a, z) in runs {
+            // Whole records: from the one that holds the first written byte.
+            let (mut first, last) = ((a - start) / step, (z - start).div_ceil(step).min(self.mirrored_count as usize));
+            while first < last {
+                let n = (last - first).min(most);
+                let from = start + first * step;
+                self.bytes.resize(n * step, 0);
+                // Read through the kernel, into a copy: a page the title
+                // unmaps meanwhile fails the read where reads in place
+                // would fault.
+                if crate::host::read_into(from as *const u8, self.bytes) {
+                    out[4] += (n * step).div_ceil(KERNEL) as u64;
+                    self.picked.clear();
+                    {
+                        let mut copied = self.host.copied_prints();
+                        out[1] += self.host.scan_copied(&mut copied, first as u32, self.bytes, step, self.picked);
+                    }
+                    out[2] += self.picked.len() as u64;
+                    let (base, shapes) = (self.start, &mut *self.shapes);
+                    out[3] += self.host.mirror_picked(
+                        self.picked,
+                        |index| base + u64::from(index) * self.step,
+                        &mut |i, generation| view_at_cached(i, generation, shapes),
+                        self.scratch,
+                    );
+                }
+                first += n;
+            }
+        }
+        out
+    }
+}
+
+/// The 4 KiB pages of a 64 KiB page to look at, a bit each: those the
+/// journal says were written since this pass last looked (`last`: the
+/// asking it took the page at), if it knows; all of them otherwise. It
+/// knows when this pass looked at the page's write before the last one
+/// (`before`), and the journal knows where (not [`crate::watch::FULL`]).
+#[cfg(windows)]
+fn kernel_mask(last: Option<u64>, w: crate::watch::Written) -> u16 {
+    if w.mask != crate::watch::FULL && w.before != 0 && last == Some(w.before) {
+        w.mask
+    } else {
+        crate::watch::FULL
+    }
+}
+
+/// The byte ranges of the kernel pages `mask` names in the page at `base`
+/// (`kernel` bytes a bit), runs of neighbours joined.
+#[cfg(windows)]
+fn written_parts(base: usize, mask: u16, kernel: usize) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    let mut b = 0;
+    while b < 16 {
+        if mask & (1 << b) == 0 {
+            b += 1;
+            continue;
+        }
+        let e = (b..16).find(|&e| mask & (1 << e) == 0).unwrap_or(16);
+        parts.push((base + b * kernel, base + e * kernel));
+        b = e;
+    }
+    parts
+}
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
+/// not the one last seen (mirrored), the microseconds it took, and of the
+/// mirrored the buffer views done in runs; the kernel's 4 KiB pages of
+/// them read (by the batched pass, [`Pass`]).
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [pages, looked, mirrored, micros, quick, kernel_pages] =
+        [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let picked = [0, 1, 2, 3, 4, 5].map(|i| host::PICKED[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
+         {:.1} changed heap pages ({:.0} of their 4 KiB pages read), {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \
+         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms; \
+         {:.1} of the mirrored were buffer views done in runs (VICTORY_HEAP_SYNC_FAST=0: one by one); \
+         of the new records: {:.0} the view their slot is made from already, {:.0} nothing in a slot showing nothing, \
+         {:.0} buffer views and {:.0} nothing where the slot showed something (in runs), {:.0} placed texture views \
+         and {:.0} other views (one by one)",
         pages as f64 / frames,
+        kernel_pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames
+        micros as f64 / 1000.0 / frames,
+        quick as f64 / frames,
+        picked[0],
+        picked[1],
+        picked[2],
+        picked[3],
+        picked[4],
+        picked[5]
     );
 }
 
@@ -277,7 +478,7 @@ fn changed_slots(
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -290,7 +491,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -592,15 +793,45 @@ impl Views {
 
     /// The view of placed memory [`placed_words`] named.
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
-        let payload = payload(i, generation);
-        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&rest[..10]);
-        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        desc[12..].copy_from_slice(&rest[10..]);
-        Some(View::Placed(unordered, resource, desc))
+        placed_from(&self.shapes, i, generation)
     }
+}
+
+/// The view of placed memory [`placed_words`] named, of the shapes `shapes`.
+fn placed_from(shapes: &[Shape], i: u32, generation: u32) -> Option<View> {
+    let payload = payload(i, generation);
+    let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+    let &(unordered, resource, rest) = shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+    let mut desc = [0u32; 16];
+    desc[..10].copy_from_slice(&rest[..10]);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    desc[12..].copy_from_slice(&rest[10..]);
+    Some(View::Placed(unordered, resource, desc))
+}
+
+/// [`view_at`] with the shapes of placed views read from `shapes`, a copy
+/// of the table's that is brought up to date when a record names one past
+/// it: shapes are only ever added, and never change, so a copy answers as
+/// the table does without its lock (which the threads that write views
+/// take). For the pass over records copied in ([`sync_heaps`]).
+#[cfg(windows)]
+fn view_at_cached(i: u32, generation: u32, shapes: &mut Vec<Shape>) -> Option<View> {
+    if generation >> KIND_SHIFT != PLACED {
+        return view_at(i, generation);
+    }
+    let shape = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
+    if shape >= shapes.len() {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        shapes.extend_from_slice(views.shapes.get(shapes.len()..).unwrap_or_default());
+    }
+    placed_from(shapes, i, generation)
+}
+
+/// The copy of the shapes [`view_at_cached`] reads.
+#[cfg(windows)]
+static SHAPES_SEEN: std::sync::Mutex<Vec<Shape>> = std::sync::Mutex::new(Vec::new());
+
+impl Views {
 
     /// The record words of `view` as a table entry, if it has one.
     fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
@@ -1092,11 +1323,13 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        seen: Default::default(),
     });
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -1412,5 +1645,32 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod pass_tests {
+    use super::{kernel_mask, written_parts};
+    use crate::watch::{FULL, Written};
+
+    #[test]
+    fn written_parts_join_neighbouring_kernel_pages() {
+        assert_eq!(written_parts(0x10000, 0b1, 4096), [(0x10000, 0x11000)]);
+        assert_eq!(written_parts(0, 0b0110_0001, 4096), [(0, 0x1000), (0x5000, 0x7000)]);
+        assert_eq!(written_parts(0, FULL, 4096), [(0, 0x10000)]);
+        assert!(written_parts(0, 0, 4096).is_empty());
+        assert_eq!(written_parts(0, 0x8000, 4096), [(0xf000, 0x10000)]);
+    }
+
+    /// Only a page this pass took at the write before the last one is
+    /// looked at in part.
+    #[test]
+    fn the_kernel_mask_is_used_only_when_it_covers_every_write_since() {
+        let w = Written { at: 9, before: 7, mask: 0b100 };
+        assert_eq!(kernel_mask(Some(7), w), 0b100);
+        assert_eq!(kernel_mask(Some(5), w), FULL, "written at 7 too");
+        assert_eq!(kernel_mask(None, w), FULL, "never taken");
+        assert_eq!(kernel_mask(None, Written { before: 0, ..w }), FULL, "first write");
+        assert_eq!(kernel_mask(Some(7), Written { mask: FULL, ..w }), FULL);
     }
 }

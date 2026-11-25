@@ -136,8 +136,53 @@ struct Window {
     scratch: ID3D12Resource,
 }
 
-/// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+/// The records of a window's second pass (the first clamps one record:
+/// the step is not known yet) and the most clamped in one pass
+/// ([`windows`]): 64 and 1024, each pass four times the one before
+/// (`VICTORY_INDIRECT_WINDOW_SIZES=first,most`; they were 16 and 64,
+/// doubling: a run of 180 records took five passes, now three).
+fn window_sizes() -> (u32, u64) {
+    static SIZES: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    *SIZES.get_or_init(|| {
+        let asked = std::env::var("VICTORY_INDIRECT_WINDOW_SIZES").ok().and_then(|v| {
+            let (first, most) = v.split_once(',')?;
+            Some((first.trim().parse::<u32>().ok()?, most.trim().parse::<u64>().ok()?))
+        });
+        let (first, most) = asked.unwrap_or((64, 1024));
+        (first.clamp(1, 4096), most.clamp(1, 4096))
+    })
+}
+
+/// Whether the records of indirect dispatches and of draws whose shaders
+/// store are left to their list's prelude like the others
+/// (`VICTORY_INDIRECT_HOIST_ALL=0`: they are clamped where they run).
+fn hoist_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_HOIST_ALL").is_none_or(|v| v != "0"))
+}
+
+/// Whether the once-a-frame pass over the heap's buffer views spreads its
+/// slots over the threads kept for wide work (`VICTORY_HEAP_PASS_WIDE=0`:
+/// on the recording thread alone, as before).
+fn heap_pass_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_WIDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a direct draw whose shaders store to no buffer leaves a window
+/// standing (`VICTORY_INDIRECT_WINDOW_KEEP=0`: it ends it, as before).
+fn window_keeps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW_KEEP").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: windows ended by a direct draw; then,
+/// of the records clamped where they are drawn, the ones whose draw can
+/// have no window (a dispatch, a count buffer, several records, shaders
+/// that store), that found no window, that found another buffer's or
+/// kind's, that did not go on a step after the window's last record; and
+/// the windows clamped ahead.
+pub(crate) static WINDOW_WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -1401,14 +1446,16 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        // (By slot with a multiply for a hash, not SipHash: the pass looks
+        // at tens of thousands of slots a frame, on a recording thread.)
+        type Ranges = crate::descriptor::slots::SlotMap<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::default()));
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
@@ -1422,51 +1469,114 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
+        // The slots' views are made and their copies found on the threads
+        // kept for wide work, a part of the slots each, where there are
+        // many (`heap_pass_wide`): the pass runs on one of the title's
+        // recording threads, which its render thread waits for, and stood
+        // there 30 ms every other frame (48,000 slots a pass in the intro).
+        // Each slot is its own work (`HostHeap::mirror` locks by slot, the
+        // copies' table is read); what they find is put into `ranges` here.
+        if heap_pass_wide() && slots.len() >= 2048 {
+            type Found = Vec<(u32, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)>;
+            const PARTS: usize = 4;
+            let each = slots.len().div_ceil(PARTS);
+            let found: std::sync::Arc<Vec<std::sync::Mutex<Found>>> =
+                std::sync::Arc::new((0..PARTS).map(|_| std::sync::Mutex::new(Vec::new())).collect());
+            let (heap_at, host_at) = (std::ptr::from_ref(heap) as usize, std::ptr::from_ref(host) as usize);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = slots
+                .chunks(each)
+                .enumerate()
+                .map(|(part, chunk)| {
+                    let (chunk, found) = (chunk.to_vec(), found.clone());
+                    Box::new(move || {
+                        // SAFETY: the heap and its host side outlive the
+                        // pass: the caller holds them and waits for this
+                        // work before it goes on.
+                        let (heap, host) = unsafe {
+                            (&*(heap_at as *const crate::descriptor::Heap), &*(host_at as *const crate::descriptor::host::HostHeap))
+                        };
+                        let mut out: Found = Vec::with_capacity(chunk.len());
+                        for index in chunk {
+                            let range = heap
+                                .handle(index)
+                                .and_then(|handle| host.mirror(index, handle, true))
+                                .and_then(|view| crate::descriptor::host::buffer_copy(&view))
+                                .map(|(shadow, address, len)| (shadow, address, address + len));
+                            out.push((index, range));
+                        }
+                        *found[part].lock().unwrap_or_else(|e| e.into_inner()) = out;
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            for part in found.iter() {
+                for (index, range) in part.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+                    ranges.remove(&index);
+                    if let Some(range) = range {
+                        #[cfg(feature = "diagnostics")]
+                        if host.shows(index, &range.0.buffer) == Some(false) {
+                            HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ranges.insert(index, range);
+                    }
+                }
+            }
+            if alive && let Some(why) = crate::descriptor::host::device_removed() {
                 GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                tracing::error!(why, "the host device went while buffer views of the heap were made (VICTORY_HEAP_PASS_WIDE=0 names the views)");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
-            };
-            #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            for (n, &index) in slots.iter().enumerate() {
+                ranges.remove(&index);
+                let Some(handle) = heap.handle(index) else {
+                    continue;
+                };
+                let Some(view) = host.mirror(index, handle, true) else {
+                    continue;
+                };
+                // Every 64 views while the device lives (a cheap query).
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = slots[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                    crate::host::log_removal_context();
+                }
+                // The copy the slot shows (`buffer_copy`), not the one the
+                // view's range alone would find.
+                let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                    continue;
+                };
+                #[cfg(feature = "diagnostics")]
+                if host.shows(index, &shadow.buffer) == Some(false) {
+                    HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                ranges.insert(index, (shadow, address, address + len));
             }
-            ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+        // Per host copy, the span its picked views cover. (Borrowed from
+        // `ranges`, whose lock is held to the end of the pass: only this pass
+        // takes it, once a frame.)
+        let mut spans: std::collections::HashMap<
+            usize,
+            (&std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+            std::hash::BuildHasherDefault<crate::descriptor::slots::SlotHasher>,
+        > = Default::default();
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+            let span = spans.entry(key).or_insert((shadow, *from, *to));
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -2337,7 +2447,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.window_guard();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2612,6 +2722,18 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Constants in memory shaders were seen to write:
+                        // read from the buffer's host copy, where the card
+                        // finds what the lists before this one wrote
+                        // (`crate::host::fill_hot`).
+                        if crate::host::fill_hot(address as usize, size as usize)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && shadow.gpu(address).is_multiple_of(256)
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            host.constant_at(index, shadow.gpu(address), size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2728,7 +2850,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.window_guard();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2833,7 +2955,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.window_guard();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -2868,6 +2990,21 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    /// A direct draw is about to be recorded: if its shaders can store to
+    /// buffers (they may write the records a window holds clamped), the
+    /// window ends. `VICTORY_INDIRECT_WINDOW_KEEP=0`: every direct draw
+    /// ends it, as before.
+    fn window_guard(&mut self) {
+        if self.window.is_some()
+            && (!window_keeps()
+                || crate::pipeline::host_pipeline(self.pipeline as This)
+                    .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)))
+        {
+            WINDOW_WHY[0].fetch_add(1, Ordering::Relaxed);
+            self.window = None;
+        }
+    }
+
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
@@ -2976,8 +3113,27 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
-        let (bounded, at) = match hit {
-            Some((scratch, at, step)) => {
+        // A single record, in a list whose shaders so far declared no
+        // write over it: its clamp is left to the list's prelude
+        // (`crate::indirect::hoists`). A dispatch's record too, and that of
+        // a draw whose shaders store: what they write, they write after
+        // the card has read their record, and it is declared only when
+        // they are bound, below. (The indirect dispatches were most of the
+        // records still clamped where they run: 958 a frame in the intro,
+        // which can have no window.)
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        let hoisted = (crate::indirect::hoists() && max == 1 && count.is_none() && (hoist_all() || (kind != DISPATCH && !stores)))
+            .then(|| list.hoist((&args.buffer, offset, arguments), kind, stride))
+            .flatten();
+        // (Running records with no clamp at all was tried, for timing: in
+        // the intro the card ran one frame for seven seconds and the title
+        // ended. The records the clamp empties are real.)
+        let (bounded, at) = match (hoisted, hit) {
+            (Some(ahead), _) => {
+                args.refresh(list, arguments, len);
+                ahead
+            }
+            (None, Some((scratch, at, step))) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -2994,7 +3150,7 @@ impl State {
                 }
                 (scratch, at)
             }
-            None => {
+            (None, None) => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
@@ -3008,13 +3164,28 @@ impl State {
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            let (first, most) = window_sizes();
+                            let fit = (args.left(arguments) / step).min(most) as u32;
+                            WINDOW_WHY[5].fetch_add(1, Ordering::Relaxed);
+                            (step as u32, (if w.records == 1 { first } else { w.records.saturating_mul(4) }).min(fit).max(1))
                         } else {
+                            WINDOW_WHY[4].fetch_add(1, Ordering::Relaxed);
                             (stride, max)
                         }
                     }
-                    _ => (stride, max),
+                    _ => {
+                        // Why no window goes on here: the draw cannot have
+                        // one, there was none, or it was another buffer's.
+                        let why = if !windowed {
+                            1
+                        } else if self.window.is_none() {
+                            2
+                        } else {
+                            3
+                        };
+                        WINDOW_WHY[why].fetch_add(1, Ordering::Relaxed);
+                        (stride, max)
+                    }
                 };
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
