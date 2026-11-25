@@ -577,7 +577,7 @@ fn tabled_out() -> bool {
 /// are mirrored again, as with `VICTORY_HEAP_SYNC_TABLES=1`). `off`: the
 /// window is [`TABLED_FRAMES`] and the read bit is not asked for.
 ///
-/// ztrx: unset is 2, not `off`. With the window of [`TABLED_FRAMES`] the
+/// steenax: unset is 2, not `off`. With the window of [`TABLED_FRAMES`] the
 /// title died at world entry, reproducibly (a write to 0 at
 /// `victory-image+0x23cf683`, pull request #827 upstream), and 2 gave clean
 /// runs through the world there.

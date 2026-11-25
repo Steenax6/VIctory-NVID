@@ -1,6 +1,6 @@
-# ztrx
+# steenax
 
-**ztrx** runs the Xbox Series build of the game natively on Windows PCs with
+**steenax** runs the Xbox Series build of the game natively on Windows PCs with
 NVIDIA graphics cards, from game files you supply yourself.
 
 **This repository contains no game files or assets.** You need your own copy
@@ -15,14 +15,16 @@ cards below shows a gain or a fix. The fork's `main` is upstream's, untouched.
 
 ## Status (2026-11-25)
 
-Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
+Developed and measured on Windows 11 with an **NVIDIA GeForce RTX 4070 Ti**
+(12 GB), an AMD Ryzen 7 9800X3D (8 cores, 16 threads) and 64 GB of DDR5-6400
+memory. Where a row names another card, the figure is from that card.
 
 | | |
 |---|---|
 | Boot, first-boot screens, intro, opening credits | works |
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase (wanted level, minimap), boat, binoculars |
-| Stability | 1 h 30 min+ in one session without a crash. The card's driver gave up in the opening cutscene in about one run of ten on the RTX 4070 Ti (a fault in the card's memory, after 100 s and more); two causes were closed on 2026-11-25 (view slots rewritten and textures let go under lists still in flight), and nine runs past that point have been clean since |
-| Frame rate | 1-3 fps in the world on that card (the first run is slower while shaders translate; they are cached after that). On an RTX 4070 Ti with a Ryzen 7 9800X3D, with `scripts\play.ps1`: 6-9 fps in the opening cutscene and about 11 fps in the first room (they were 1-5 and about 4 before the changes of 2026-11-25, see "Faster settings"); the first room is lit and complete there in every run, and the band of stale blocks along the bottom of the picture is gone |
+| Stability | 1 h 30 min+ in one session without a crash (on an RTX 3050, 8 GB, before 2026-11-25). The card's driver gave up in the opening cutscene in about one run of ten (a fault in the card's memory, after 100 s and more); two causes were closed on 2026-11-25 (view slots rewritten and textures let go under lists still in flight), and nine runs past that point have been clean since |
+| Frame rate | With `scripts\play.ps1`: 6-9 fps in the opening cutscene and about 11 fps in the first room (they were 1-5 and about 4 before the changes of 2026-11-25, see "Faster settings"); the first room is lit and complete in every run, and the band of stale blocks along the bottom of the picture is gone. The first run is slower while shaders translate; they are cached after that. On an RTX 3050 (8 GB): 1-3 fps in the world, before those changes |
 | Known problems | anything in shadow is black and bright scenes overexpose (the game's ray-traced lighting does not run yet); faces are soft and eyes glow white in cutscenes (a blur pass of the title's own, a Gaussian pyramid meant for the picture's edges, works at full strength over the whole picture; the cause is not found yet); some blocky artifacts; boats sit low in the water |
 
 ## Requirements
@@ -49,7 +51,7 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 ```
 
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
-(`-Cache`, `-Data`) and presses no buttons for you. Controller: XInput pads
+(`-Cache`, `-Data`; by default under `%LOCALAPPDATA%\steenax`) and presses no buttons for you. Controller: XInput pads
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus (Enter is A).
 
@@ -152,7 +154,7 @@ cache, and the first run is slow while the shaders translate. They can be
 translated beforehand, on the processor only (4.5 to 6.5 minutes upstream):
 
 ```powershell
-$env:VICTORY_CACHE_DIR = "$env:LOCALAPPDATA\ztrx\cache"; $env:VICTORY_HOST_WAVE = 32; $env:VICTORY_VIEW_LIMIT = 999999
+$env:VICTORY_CACHE_DIR = "$env:LOCALAPPDATA\steenax\cache"; $env:VICTORY_HOST_WAVE = 32; $env:VICTORY_VIEW_LIMIT = 999999
 target\release\victory.exe translate "<your game folder>\shaders.rpf" --warm all --jobs 14
 ```
 
@@ -169,7 +171,7 @@ these are an NVIDIA card's.
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built (objects can go missing meanwhile) |
-| `VICTORY_TABLED_SKIP_FRAMES=off` | upstream's 240-frame window for table-read descriptor slots; ztrx uses 2 frames, since the window crashed at world entry (upstream pull request #827) |
+| `VICTORY_TABLED_SKIP_FRAMES=off` | upstream's 240-frame window for table-read descriptor slots; steenax uses 2 frames, since the window crashed at world entry (upstream pull request #827) |
 | `VICTORY_BACK_RUN_GAP=0` | every run of a copy-back is a write of its own; by default runs under 64 bytes apart are one write (upstream pull request #857) |
 | `VICTORY_WAVE_PAIRS=0` | no paired form for 64-lane programs on 32-lane cards (upstream pull request #854) |
 | `VICTORY_MESH_LINK=0` | mesh programs over 32 KiB are not linked with their pixel program (upstream pull request #854) |

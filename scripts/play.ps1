@@ -1,8 +1,8 @@
-# ztrx launcher: runs the game for normal play (no scripted presses, no capture).
+# steenax launcher: runs the game for normal play (no scripted presses, no capture).
 param(
     [Parameter(Mandatory = $true)][string]$Game,
-    [string]$Cache = "$env:LOCALAPPDATA\ztrx\cache",
-    [string]$Data = "$env:LOCALAPPDATA\ztrx\data",
+    [string]$Cache,
+    [string]$Data,
     [string]$Exe,
     # Leaves the faster settings (README) as the environment has them.
     [switch]$Plain,
@@ -13,6 +13,13 @@ param(
 # Resolved here, not as a param default: Windows PowerShell 5.1 leaves $PSScriptRoot
 # empty in param defaults of scripts that use [Parameter()].
 if (-not $Exe) { $Exe = Join-Path $PSScriptRoot "..\target\release\victory.exe" }
+# Cache and saves: %LOCALAPPDATA%\steenax, or the folder of the tree's earlier
+# name where that one is there and the new one is not (its shader cache is good).
+$Home2 = Join-Path $env:LOCALAPPDATA "steenax"
+$Old = Join-Path $env:LOCALAPPDATA "ztrx"
+if (-not (Test-Path -LiteralPath $Home2) -and (Test-Path -LiteralPath $Old)) { $Home2 = $Old }
+if (-not $Cache) { $Cache = Join-Path $Home2 "cache" }
+if (-not $Data) { $Data = Join-Path $Home2 "data" }
 if (-not (Test-Path -LiteralPath $Exe)) {
     Write-Error "victory.exe not found at $Exe - build it with: cargo build --release -p victory"
     exit 1
@@ -36,5 +43,5 @@ New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
 $env:VICTORY_CACHE_DIR = $Cache
 $env:VICTORY_DATA_DIR = $Data
 # "$_" turns stderr lines (ErrorRecords in 5.1) into plain text for the log.
-& $Exe run $Game --execute 2>&1 | ForEach-Object { "$_" } | Out-File "$env:TEMP\ztrx.log" -Encoding utf8
-Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\ztrx.log"
+& $Exe run $Game --execute 2>&1 | ForEach-Object { "$_" } | Out-File "$env:TEMP\steenax.log" -Encoding utf8
+Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\steenax.log"
