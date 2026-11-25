@@ -1659,20 +1659,51 @@ mod state {
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`. One whose
+    /// group count is in memory (`indirect`, a title address) runs as an
+    /// indirect execution of one mesh record (`D3D12_DISPATCH_MESH_ARGUMENTS`,
+    /// three group counts, 12 bytes) through `State::execute_indirect`, as
+    /// an `ExecuteIndirect` with a mesh signature does: its count is
+    /// clamped there like any record's. The layout is inferred from the
+    /// direct form and the PC's method, not seen in the title's code
+    /// (Marvisak/VIctory#1546, which this follows; before, such dispatches
+    /// were dropped). The flags and payload are logged the first time one
+    /// is not 0; the host has no use for them.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
-        _flags: u64,
+        flags: u64,
         indirect: u64,
-        _payload: u64,
+        payload: u64,
     ) {
         super::count_draw();
-        if indirect != 0 {
+        if flags != 0 || payload != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            ONCE.call_once(|| {
+                tracing::info!(
+                    flags = format_args!("{flags:#x}"),
+                    payload = format_args!("{payload:#x}"),
+                    "a mesh dispatch with flags or a payload, which the host does not use (logged once)"
+                );
+            });
+        }
+        if indirect != 0 {
+            const MESH: u32 = 10;
+            const STRIDE: u32 = 12;
+            let mut ran = false;
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
+            });
+            if !ran {
+                super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        indirect = format_args!("{indirect:#x}"),
+                        "an indirect mesh dispatch did not run on the host (first time; counted with the dropped indirect executions)"
+                    );
+                });
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -2298,5 +2329,24 @@ mod tests {
         // A program whose group size is not known divides by 1.
         assert_eq!(dispatch_groups([7, 1, 1], [0; 3], 0x20), Some(([7, 1, 1], false)));
         assert_eq!(dispatch_groups([0, 1, 1], [64, 1, 1], 0x20), None);
+    }
+
+    /// An indirect `DispatchMeshX` goes to the indirect execution, which
+    /// without a host GPU or a bound pipeline does not run it: it is
+    /// counted with the dropped executions, not lost unseen.
+    #[cfg(windows)]
+    #[test]
+    fn an_indirect_mesh_dispatch_goes_to_the_indirect_execution() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let _ = take_indirect();
+        state::dispatch_mesh_x(list, 0, 0, 0x1_0000_0000, 0);
+        assert!(take_indirect() >= 1);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }
