@@ -121,8 +121,9 @@ in this tree), DirectStorage workers by physical cores (8 against 16: no
 gain, not in this tree), `VICTORY_INPLACE=1` (slower here: the first room
 99.6 ms a frame against 87), `VICTORY_CARD_WINDOWS_MB=1024` (the cutscene
 within the spread of runs, the card nearly full), `VICTORY_BVH_BUILDER=1`
-with `VICTORY_BVH_QUARANTINE=1` (the builder starts and the title faults
-within seconds of the first 3D frame; see `docs/fork-ray-tracing.md`),
+with `VICTORY_BVH_QUARANTINE=1` (the builder started and the title faulted
+within seconds of the first 3D frame; the likely causes are fixed since,
+not yet tried again; see `docs/fork-ray-tracing.md`),
 `--console series-s` (a quarter faster, but the
 picture is black: the title upscales with FidelityFX there, whose programs
 do not run yet).
