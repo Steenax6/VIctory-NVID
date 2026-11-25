@@ -30,6 +30,9 @@ impl Default for HostPolicy {
             // Off-machine traffic is refused in `modules::net`.
             "ws2_32.dll",
             "bcrypt.dll",
+            // ProcessPrng, the host's random generator: an unbound call
+            // ended a run.
+            "bcryptprimitives.dll",
             "crypt32.dll",
             "ncrypt.dll",
             "winhttp.dll",
