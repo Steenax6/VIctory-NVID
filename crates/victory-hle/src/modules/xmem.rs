@@ -92,12 +92,27 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    virtual_alloc(base, size, kind, flags, protect, 0)
+}
+
+/// [`XMemVirtualAlloc`] at a multiple of `align` where that is more than
+/// the host's 64 KiB.
+fn virtual_alloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+    align: usize,
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
         Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
+            (2 * MIB).max(align)
+        } else if align > PAGE {
+            align
         } else {
             0
         },
@@ -290,18 +305,21 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+    let Some(layout) = layout(size, attributes) else {
+        return std::ptr::null_mut();
+    };
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        // A whole reservation, at the alignment asked for (the host's own
+        // is 64 KiB).
+        return virtual_alloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            layout.align(),
         );
     }
-    let Some(layout) = layout(size, attributes) else {
-        return std::ptr::null_mut();
-    };
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -2050,5 +2068,20 @@ mod tests {
         assert_eq!(unsafe { a.cast::<u8>().read() }, 7);
         assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// 32-bit blocks lie below 4 GiB at the alignment asked for, past the
+    /// host's 64 KiB too.
+    #[test]
+    fn alloc_32bit_honours_alignment() {
+        for shift in [17u64, 18, 20, 21] {
+            let align = 1usize << shift;
+            let attributes = ALLOC_32BIT | (shift << ALIGNMENT_SHIFT);
+            let at = XMemAllocDefault(0x1000, attributes);
+            assert!(!at.is_null(), "shift {shift}");
+            assert!(at as usize <= u32::MAX as usize, "{at:p}");
+            assert_eq!(at as usize % align, 0, "{at:p}");
+            XMemFreeDefault(at, attributes);
+        }
     }
 }
