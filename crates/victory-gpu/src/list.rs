@@ -1237,6 +1237,14 @@ extern "system" fn clear_rtv(
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        #[cfg(feature = "diagnostics")]
+        crate::capture::op(std::ptr::from_ref(list) as usize, || {
+            format!(
+                "CLEAR target {:#x} to {color:?}, {} rectangles",
+                record.resource as usize,
+                rects.map_or(0, <[_]>::len)
+            )
+        });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.

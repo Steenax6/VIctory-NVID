@@ -248,6 +248,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::placed::let_go_idle();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -264,6 +265,20 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
+}
+
+/// Drops `object` at the next landing after every submission started by
+/// now, never here: on the thread that buries ([`bury_aside`]) where there
+/// is one. For the sweeps, which let go of hundreds of host textures in one
+/// call on the thread that submits: releasing a reserved texture is two
+/// calls into the kernel (its allocation, its range of the card's address
+/// space), 20 ms a frame of that thread in the opening cutscene.
+pub(crate) fn retire_later<T: 'static>(object: T) {
+    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((STARTED.load(Ordering::Acquire), Retired(Box::new(object))));
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -896,6 +911,11 @@ pub(crate) struct HostList {
     /// indirect arguments.
     hoist_buffers: OnceLock<Option<(ID3D12Resource, ID3D12Resource)>>,
     hoist_readable: std::sync::atomic::AtomicBool,
+    /// Memory the CPU maps (and its address) where the prelude's clamp
+    /// leaves the diagnostics of the records it clamped
+    /// (`crate::indirect::record_hoisted`), read when the next prelude is
+    /// recorded, after the last has run.
+    hoist_notes: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -1373,6 +1393,34 @@ pub(crate) fn dred_on() -> bool {
 /// count a record asked for, and the groups asked in all (from the lists'
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Indirect compute dispatches since the last frame line, as
+/// [`MESH_GROUPS`]: the largest group count in x a record asked for, the
+/// groups asked in all, the records that asked for more than one dispatch
+/// runs (65,535), those that asked for more than all their pieces run, and
+/// the pieces after the first that ran groups.
+static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Takes the diagnostics of a budget buffer the clamp wrote
+/// (`crate::indirect::BUDGET_WORDS`: word 0 the budget, then the notes)
+/// into the frame line's counters, and zeroes them.
+///
+/// # Safety
+/// `words` points at that many mapped words no run is writing.
+unsafe fn take_budget_notes(words: *mut u32) {
+    // SAFETY: as the caller says.
+    let at = |k: usize| unsafe { words.add(k).read_volatile() };
+    MESH_GROUPS[0].fetch_max(u64::from(at(1)), Ordering::Relaxed);
+    MESH_GROUPS[1].fetch_add(u64::from(at(2)), Ordering::Relaxed);
+    COMPUTE_GROUPS[0].fetch_max(u64::from(at(3)), Ordering::Relaxed);
+    for (k, counter) in COMPUTE_GROUPS.iter().enumerate().skip(1) {
+        counter.fetch_add(u64::from(at(3 + k)), Ordering::Relaxed);
+    }
+    for k in 0..crate::indirect::BUDGET_WORDS {
+        // SAFETY: as above.
+        unsafe { words.add(k).write_volatile(0) };
+    }
+}
 
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
@@ -4192,6 +4240,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 hoist_buffers: OnceLock::new(),
                 hoist_readable: std::sync::atomic::AtomicBool::new(false),
+                hoist_notes: OnceLock::new(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -6889,6 +6938,8 @@ impl HostList {
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        // What the last prelude's clamp noted, and where this one's goes.
+        let notes = hoisted.is_some().then(|| self.hoist_notes()).flatten();
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
@@ -6912,7 +6963,10 @@ impl HostList {
                     let readable = self.hoist_readable.load(Ordering::Relaxed);
                     let runs = &hoist_runs;
                     let timed = crate::own_time::begin(list, crate::own_time::Own::Hoisted);
-                    let clamped = crate::indirect::record_hoisted(list, (args, readable), budget, runs, &mut |bytes| self.scratch(bytes));
+                    let clamped =
+                        crate::indirect::record_hoisted(list, (args, readable), budget, notes.as_ref(), runs, &mut |bytes| {
+                            self.scratch(bytes)
+                        });
                     crate::own_time::end(list, timed);
                     if clamped {
                         self.hoist_readable.store(true, Ordering::Relaxed);
@@ -7154,18 +7208,10 @@ impl HostList {
             let at = *data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all; with the card's copy, as
-            // the list's end copied them here): taken, then zeroed.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                let words = at as *mut u32;
-                let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
-                MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
-                MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
-                    words.add(k).write_volatile(0);
-                }
-            })));
+            // list's last run (mesh and compute dispatch records,
+            // `crate::indirect::BUDGET_WORDS`; with the card's copy, as the
+            // list's end copied them here): taken, then zeroed.
+            deferred.copies.push(Step::Host(Box::new(move || unsafe { take_budget_notes(at as *mut u32) })));
             drop(deferred);
             if let Some(card) = card {
                 self.zero_card_budget(card);
@@ -7196,8 +7242,8 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
-            Dest: at + offset,
+        let zeros: [_; crate::indirect::BUDGET_WORDS] = std::array::from_fn(|k| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+            Dest: at + 4 * k as u64,
             Value: 0,
         });
         // SAFETY: an open list; the buffer is the list's own and in the
@@ -7237,7 +7283,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, crate::indirect::NOTE_BYTES);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -7253,12 +7299,14 @@ impl HostList {
     /// shaders recorded in the list so far may have written the record
     /// ([`HostList::hoist_wrote`]), if the hoist buffer is full, or if the
     /// record cannot be clamped there: the caller clamps it where it is
-    /// drawn.
+    /// drawn. A dispatch record run in `pieces` (`crate::indirect::bound`)
+    /// takes that many records' room, its pieces a `stride` apart.
     pub(crate) fn hoist(
         &self,
         (src, src_offset, title): (&ID3D12Resource, u64, u64),
         kind: u32,
         stride: u32,
+        pieces: u32,
     ) -> Option<(ID3D12Resource, u64)> {
         let (from, to) = (title as usize, title as usize + stride as usize);
         if self.deferred().hoist.written.iter().any(|w| w.0 < to && from < w.1) {
@@ -7283,7 +7331,8 @@ impl HostList {
         let mut deferred = self.deferred();
         let hoist = &mut deferred.hoist;
         let at = hoist.used.next_multiple_of(4);
-        let room = u64::from(stride).next_multiple_of(4);
+        let pieces = pieces.max(1);
+        let room = u64::from(stride).next_multiple_of(4) * u64::from(pieces);
         if at + room > HOIST_BYTES {
             HOIST_WHY[2].fetch_add(1, Ordering::Relaxed);
             return None;
@@ -7294,17 +7343,39 @@ impl HostList {
         match hoist
             .runs
             .iter_mut()
-            .find(|run| run.src.as_raw() == src.as_raw() && run.kind == kind && run.stride == stride)
+            .find(|run| {
+                run.src.as_raw() == src.as_raw() && run.kind == kind && run.stride == stride && run.pieces == pieces
+            })
         {
             Some(run) => run.entries.push(entry),
             None => hoist.runs.push(crate::indirect::HoistRun {
                 src: src.clone(),
                 kind,
                 stride,
+                pieces,
                 entries: vec![entry],
             }),
         }
         Some((buffer.clone(), at))
+    }
+
+    /// The buffer the prelude's clamp copies its diagnostics into
+    /// (the field of that name), made at the first use; what the last
+    /// prelude left there is taken into the frame line's counters first.
+    /// Only while no prelude of the list runs.
+    fn hoist_notes(&self) -> Option<ID3D12Resource> {
+        let (buffer, data) = self
+            .hoist_notes
+            .get_or_init(|| {
+                let (b, d) = host()?.shared_buffer(256)?;
+                // SAFETY: the mapping holds 256 bytes; nothing runs yet.
+                unsafe { std::ptr::write_bytes(d, 0, 256) };
+                Some((b, d as usize))
+            })
+            .as_ref()?;
+        // SAFETY: the buffer's own mapped words; no prelude is running.
+        unsafe { take_budget_notes(*data as *mut u32) };
+        Some(buffer.clone())
     }
 
     /// Shaders the list records may write `len` bytes of title memory at
@@ -8186,7 +8257,26 @@ impl Meter {
         // (Run 200 counted indirect compute records asking for 77,000 to
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
         // dispatch runs; the counter went when the clamp's budget moved to
-        // the card's memory.)
+        // the card's memory, and is back since those records run in
+        // pieces.)
+        {
+            let [largest, asked, over, cut, ran] = std::array::from_fn(|k| COMPUTE_GROUPS[k].swap(0, Ordering::Relaxed));
+            let [split, calls, direct] = std::array::from_fn(|k| crate::draw::GROUP_PIECES[k].swap(0, Ordering::Relaxed));
+            tracing::info!(
+                "indirect compute dispatches: the largest group count asked for {largest} (one dispatch runs at most 65535), \
+                 {:.0} groups asked per frame, {:.2} records a frame over 65535 ({:.2} over what their pieces run, \
+                 VICTORY_GROUP_PIECES={}), {:.2} pieces after the first ran groups; {:.2} executions a frame recorded \
+                 in pieces ({:.2} ExecuteIndirect calls), {:.2} direct dispatches split",
+                asked as f64 / frames,
+                over as f64 / frames,
+                cut as f64 / frames,
+                crate::draw::group_pieces(),
+                ran as f64 / frames,
+                split as f64 / frames,
+                calls as f64 / frames,
+                direct as f64 / frames,
+            );
+        }
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
@@ -8265,6 +8355,17 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             crate::tiles::status();
+            {
+                let [ns, made] = [0, 1].map(|i| crate::resource::MAKING[i].swap(0, Ordering::Relaxed) as f64);
+                let [heaps, placed, committed] = crate::placed::stats();
+                tracing::info!(
+                    "host textures of the title's placed textures since the last such line: {made:.0} made, {:.1} us each; \
+                     out of heaps (VICTORY_PLACED_TEX=0: an allocation each), since the start: {heaps} heaps made, \
+                     {placed} textures placed, {committed} given an allocation instead; {} MB free inside the heaps",
+                    ns / 1e3 / made.max(1.0),
+                    crate::placed::free_bytes() >> 20
+                );
+            }
             {
                 let [hb, hc, tb, tc] =
                     [0, 1, 2, 3].map(|i| COPY_MOVED[i].swap(0, Ordering::Relaxed) as f64 / logged_frames);

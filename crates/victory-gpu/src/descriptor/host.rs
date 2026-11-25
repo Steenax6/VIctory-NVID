@@ -2654,9 +2654,9 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     // of the copy they find, so that the copy brought up to date is the
     // one the slot shows.
     if let Some((base, width)) = buffer_extent(view)
-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
+        && let Some((first, count, element, stride, unknown, raw)) = buffer_fields(view)
         && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown, raw)
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
         return Some((own, start, bytes));
@@ -2764,13 +2764,15 @@ fn own_copy_on() -> bool {
 /// a view has no host view there; it is made on a copy of its own bytes
 /// (`crate::shadow::exact`), where it starts at element 0. `None`: the
 /// view is made on its buffer's copy, as every other.
-fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
-    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
-}
-
+///
+/// A raw view (`raw`: counted in dwords) is also made on a copy of its own
+/// bytes when they do not start on 16 in its buffer's copy: the host takes
+/// raw views only from a 16-byte boundary, so it was left null and read
+/// zeros ("buffer view the host would refuse left null", `first=2 ...
+/// raw=true`: 8 bytes in). Its own copy starts at the view's first byte
+/// (`VICTORY_VIEW_RAW_OWN_COPY=0`: left null, as before).
 #[allow(clippy::too_many_arguments)]
-fn own_bytes_if(
-    on: bool,
+fn own_bytes(
     offset: u64,
     base: u64,
     first: u64,
@@ -2778,8 +2780,45 @@ fn own_bytes_if(
     element: u64,
     stride: u32,
     unknown: bool,
+    raw: bool,
 ) -> Option<(u64, u64)> {
-    if !on || element == 0 || count == 0 || offset.is_multiple_of(element) {
+    own_bytes_if(own_copy_on(), raw_own_copy_on(), offset, base, first, count, element, stride, unknown, raw)
+}
+
+/// Whether a raw buffer view whose bytes do not start on 16 in its
+/// buffer's copy gets a copy of its own bytes ([`own_bytes`]).
+fn raw_own_copy_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_RAW_OWN_COPY").is_none_or(|v| v != "0"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn own_bytes_if(
+    on: bool,
+    raw_on: bool,
+    offset: u64,
+    base: u64,
+    first: u64,
+    count: u32,
+    element: u64,
+    stride: u32,
+    unknown: bool,
+    raw: bool,
+) -> Option<(u64, u64)> {
+    if !on || element == 0 || count == 0 {
+        return None;
+    }
+    // A raw view on its copy's dwords, not on 16 bytes there.
+    if raw_on
+        && raw
+        && element == 4
+        && offset.is_multiple_of(4)
+        && !first.checked_mul(4)?.checked_add(offset)?.is_multiple_of(16)
+    {
+        let start = base.checked_add(first.checked_mul(4)?)?;
+        return Some((start, u64::from(count) * 4));
+    }
+    if offset.is_multiple_of(element) {
         return None;
     }
     if unknown && raw_window(offset, first, count, stride).is_some() {
@@ -2790,9 +2829,10 @@ fn own_bytes_if(
 }
 
 /// Of a buffer view: its first element, its elements, the bytes of one (a
-/// raw view's: 4), its structure's stride, and whether it has no format.
-/// As [`buffer_srv`] and [`buffer_uav`] read them from the same words.
-fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
+/// raw view's: 4), its structure's stride, whether it has no format, and
+/// whether it is raw. As [`buffer_srv`] and [`buffer_uav`] read them from
+/// the same words.
+fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool, bool)> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -2811,12 +2851,14 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
         } else {
             crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
-        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+        let raw = b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw))
     } else {
         let d = srv_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { d.Anonymous.Buffer };
-        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+        let raw = b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw))
     }
 }
 
@@ -2878,6 +2920,83 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// Why [`buffer_view_ok`] refuses a view with these fields, in a few words.
+fn refusal(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> &'static str {
+    use crate::resource::family;
+    let f = format.0 as u32;
+    let element = if raw {
+        if format != DXGI_FORMAT_R32_TYPELESS {
+            return "raw, not R32 typeless";
+        }
+        if stride != 0 {
+            return "raw with a stride";
+        }
+        if !first.is_multiple_of(4) {
+            return "raw, not on 16 bytes";
+        }
+        4
+    } else if stride > 0 {
+        if format != DXGI_FORMAT_UNKNOWN {
+            return "structured with a format";
+        }
+        if stride > 2048 || !stride.is_multiple_of(4) {
+            return "a stride the host has no structured buffers for";
+        }
+        u64::from(stride)
+    } else {
+        let typeless = family(f) == f && family(f + 1) == f;
+        match crate::resource::element(f) {
+            Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => bytes,
+            _ => return "typed without a usable format (typeless, unknown or block)",
+        }
+    };
+    if count == 0 {
+        return "no elements";
+    }
+    match first.checked_add(u64::from(count)).and_then(|end| end.checked_mul(element)) {
+        Some(end) if end <= width => "accepted",
+        _ => "past the end of its buffer's copy",
+    }
+}
+
+/// A buffer view left null ([`buffer_view_ok`]): logged with its reason the
+/// first four times for each reason and at every power of two after (each
+/// site said it once, so the reasons behind the frame line's count of
+/// views left null were not known).
+fn refused_view(unordered: bool, format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const REASONS: [&str; 10] = [
+        "raw, not R32 typeless",
+        "raw with a stride",
+        "raw, not on 16 bytes",
+        "structured with a format",
+        "a stride the host has no structured buffers for",
+        "typed without a usable format (typeless, unknown or block)",
+        "no elements",
+        "past the end of its buffer's copy",
+        "accepted",
+        "",
+    ];
+    static SEEN: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+    let why = refusal(format, first, count, stride, raw, width);
+    let at = REASONS.iter().position(|r| *r == why).unwrap_or(REASONS.len() - 1);
+    let n = SEEN[at].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        tracing::warn!(
+            unordered,
+            why,
+            times = n,
+            format = format.0,
+            first,
+            count,
+            stride,
+            raw,
+            width,
+            "buffer view the host would refuse left null"
+        );
+    }
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -2892,7 +3011,8 @@ fn buffer_srv(
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
+        let raw = b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown, raw)
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
@@ -2937,15 +3057,7 @@ fn buffer_srv(
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "buffer view the host would refuse left null"
-        );
+        refused_view(false, desc.Format, first, count, stride, raw, width);
         return None;
     }
     // The console has no component mapping; one the host does not know is the default's.
@@ -2986,7 +3098,8 @@ fn buffer_uav(
             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown)
+        let raw = b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown, raw)
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
@@ -3040,15 +3153,7 @@ fn buffer_uav(
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "unordered buffer view the host would refuse left null"
-        );
+        refused_view(true, desc.Format, first, count, stride, raw, width);
         return None;
     }
     let host = host()?;
@@ -3250,9 +3355,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // level is shown from the first level that is the title's
                 // and has memory, if the title's view starts before it (a
                 // level without memory reads zeros: a black texture). The
-                // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
-                    && first > 0
+                // title's own view mostly starts there already. One made
+                // without its most detailed levels keeps its first level and
+                // is clamped above them (`crate::tiles::shape_view`).
+                if let Some(levels) = crate::resource::view_levels(resource)
+                    && levels.first_tiled > 0
                 {
                     // SAFETY: a live resource.
                     let own = unsafe { texture.GetDesc() };
@@ -3270,7 +3377,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                             },
                         },
                     };
-                    crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                    crate::tiles::shape_view(desc.get_or_insert(whole), levels, u32::from(own.MipLevels));
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4501,21 +4608,37 @@ mod own_copy_tests {
         let base = 0xd_9000_0000u64;
         // On an element: the buffer's copy (the two cases of every run's
         // log are the ones below).
-        assert_eq!(own_bytes_if(true, 24, base, 3, 10, 12, 0, false), None);
-        assert_eq!(own_bytes_if(true, 0, base, 0, 10, 12, 0, false), None);
+        assert_eq!(own_bytes_if(true, true, 24, base, 3, 10, 12, 0, false, false), None);
+        assert_eq!(own_bytes_if(true, true, 0, base, 0, 10, 12, 0, false, false), None);
         // A typed view of 12-byte elements, 5,222,240 bytes into its copy
         // (8 past an element): its own bytes, from its first element.
-        assert_eq!(own_bytes_if(true, 5_222_240, base, 3, 10, 12, 0, false), Some((base + 36, 120)));
+        assert_eq!(own_bytes_if(true, true, 5_222_240, base, 3, 10, 12, 0, false, false), Some((base + 36, 120)));
         // A structured view of 32-byte elements 8 bytes in: not on 16, so
         // no raw view of the copy either.
-        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 32, 32, true), Some((base + 64, 128)));
+        assert_eq!(own_bytes_if(true, true, 8, base, 2, 4, 32, 32, true, false), Some((base + 64, 128)));
         // The same 16 bytes in: off its elements, but a raw view of the
         // copy's bytes does (as before).
-        assert_eq!(own_bytes_if(true, 16, base, 2, 4, 32, 32, true), None);
+        assert_eq!(own_bytes_if(true, true, 16, base, 2, 4, 32, 32, true, false), None);
         // No elements, no size, or the switch off: as before.
-        assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
-        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
-        assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+        assert_eq!(own_bytes_if(true, true, 8, base, 2, 0, 32, 32, true, false), None);
+        assert_eq!(own_bytes_if(true, true, 8, base, 2, 4, 0, 0, false, false), None);
+        assert_eq!(own_bytes_if(false, true, 8, base, 2, 4, 32, 32, true, false), None);
+    }
+
+    /// A raw view whose bytes do not start on 16 in its buffer's copy (the
+    /// run's log: `first=2 count=16 raw=true`) gets a copy of its own bytes;
+    /// one that starts on 16 does not, nor any with its switch off.
+    #[test]
+    fn a_raw_view_off_sixteen_bytes_gets_its_own_bytes() {
+        let base = 0xd_9000_0000u64;
+        assert_eq!(own_bytes_if(true, true, 0, base, 2, 16, 4, 0, false, true), Some((base + 8, 64)));
+        assert_eq!(own_bytes_if(true, true, 8, base, 0, 16, 4, 0, false, true), Some((base, 64)));
+        assert_eq!(own_bytes_if(true, true, 0, base, 4, 16, 4, 0, false, true), None);
+        assert_eq!(own_bytes_if(true, true, 8, base, 2, 16, 4, 0, false, true), None);
+        assert_eq!(own_bytes_if(true, false, 0, base, 2, 16, 4, 0, false, true), None);
+        assert_eq!(own_bytes_if(false, true, 0, base, 2, 16, 4, 0, false, true), None);
+        // Not raw (a typed view of dwords): as before.
+        assert_eq!(own_bytes_if(true, true, 0, base, 2, 16, 4, 0, false, false), None);
     }
 }
 
