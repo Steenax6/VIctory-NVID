@@ -2863,11 +2863,25 @@ impl State {
                             host.constant_at(index, shadow.gpu(address), size);
                             continue;
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                        // A view of nothing, or no room: a null constant
+                        // view (reads give zeros).
+                        let scratch = (address != 0 && size != 0)
+                            .then(|| list.scratch(u64::from(size)))
+                            .flatten();
+                        let Some((gpu, to)) = scratch else {
+                            host.constant_at(index, 0, 0);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
+                        // The host view is whole 256s, and the scratch holds
+                        // what an earlier list left there: past the title's
+                        // size the shader reads zeros, as through the
+                        // title's view, not that.
+                        let padded = size.next_multiple_of(256);
+                        // SAFETY: the scratch range is `padded` bytes long
+                        // (`HostList::scratch` gives whole 256s) and the
+                        // list's own until it has run.
+                        unsafe { to.add(size as usize).write_bytes(0, (padded - size) as usize) };
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
