@@ -154,21 +154,85 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (1024; it was 16 MiB once) and
+/// `VICTORY_CARD_BUFFERS_MB` (1024; it was 512). Run 69's gameplay has ten
+/// title buffers of 16 MiB or more, 494 MB, and 1,650 MB of the card's
+/// budget free. From 1 MiB up the shader writes of the smaller buffers are
+/// found by the card's hashes too, and with that the first room's walls
+/// were drawn in every run.
+///
+/// Under the least size a copy stays in the PC's memory, and every load,
+/// store and atomic a shader does on it crosses the bus. Those copies are
+/// most of them: some 3,700 of 3,800 and 30 MB in all in the source's first
+/// rooms, where the passes that were slow by the thread were small
+/// dispatches on such buffers (one tile-reset pass: 737,000 one-dword
+/// requests on a 288-byte and a 900 KiB buffer in 1.4 to 2 ms). With
+/// `VICTORY_CARD_BUFFERS_MIN_KB=64` (every title buffer: a copy is rounded
+/// up to 64 KiB) and `VICTORY_CARD_BUFFERS_MB=1280` the title's lists took
+/// 49.8 ms of card time a frame where they took 68.0, single passes 1.6 ms
+/// where they took 6.7, on an RTX 4070 (fxceless/victory-fork c36971b,
+/// runs 274 and 275). What it costs: 64 KiB of the card's memory a copy
+/// and as much again for one shaders write, and the passes that send and
+/// hash before each submission go through more copies (11.6 to 23.0 ms of
+/// card time there; [`Shadow::card_hashed`]). Not measured here yet, so
+/// not the default. Where the copies went is said with the memory lines
+/// ([`placed_line`]).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
+        let number = |name: &str, default: u64| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        (
+            (number("VICTORY_CARD_BUFFERS_MIN_KB", 1024) << 10).max(PIECE as u64),
+            number("VICTORY_CARD_BUFFERS_MB", 1024) << 20,
+        )
     })
+}
+
+/// Title buffers' host copies made since the start, by where they went and
+/// by size: in the card's memory; in the PC's memory of 64 KiB (the least a
+/// copy is), up to 256 KiB, up to 1 MiB, larger; each as (copies, bytes).
+static PLACED: [[AtomicU64; 2]; 5] = [const { [const { AtomicU64::new(0) }; 2] }; 5];
+
+fn placed_count(size: u64, on_card: bool) {
+    let class = match (on_card, size) {
+        (true, _) => 0,
+        (false, ..=0x1_0000) => 1,
+        (false, ..=0x4_0000) => 2,
+        (false, ..=0x10_0000) => 3,
+        _ => 4,
+    };
+    PLACED[class][0].fetch_add(1, Ordering::Relaxed);
+    PLACED[class][1].fetch_add(size, Ordering::Relaxed);
+}
+
+/// Where title buffers' host copies went, since the start: a line with the
+/// frame-rate line when a copy was made since the last one.
+pub(crate) fn placed_line() {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let v: Vec<(u64, u64)> = PLACED.iter().map(|c| (c[0].load(Ordering::Relaxed), c[1].load(Ordering::Relaxed))).collect();
+    let made: u64 = v.iter().map(|c| c.0).sum();
+    if SAID.swap(made, Ordering::Relaxed) == made {
+        return;
+    }
+    let mb = |b: u64| b as f64 / (1 << 20) as f64;
+    tracing::info!(
+        "title buffers' host copies made so far, by where shaders read them: {} in the card's memory {:.0} MB; in the PC's \
+         memory (read over the bus): {} of 64 KiB {:.0} MB, {} up to 256 KiB {:.0} MB, {} up to 1 MiB {:.0} MB, {} larger {:.0} MB \
+         (the least size for the card: {} KiB, VICTORY_CARD_BUFFERS_MIN_KB)",
+        v[0].0,
+        mb(v[0].1),
+        v[1].0,
+        mb(v[1].1),
+        v[2].0,
+        mb(v[2].1),
+        v[3].0,
+        mb(v[3].1),
+        v[4].0,
+        mb(v[4].1),
+        card_limits().0 >> 10,
+    );
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -1604,7 +1668,7 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
-/// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
+/// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_KB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1615,7 +1679,7 @@ pub(crate) fn back_line(frames: f64) {
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of 1 MiB or more (copies of the least size VICTORY_CARD_BUFFERS_MIN_KB or more are in the card's memory)",
         mb(c[2]),
         c[5],
         mb(c[0]),
@@ -3834,6 +3898,26 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
+    /// The bytes from the copy's start that the card's hashes cover, for a
+    /// copy of `size` bytes in the card's memory: the copy's whole buffer;
+    /// with `VICTORY_CARD_HASH_LEN=1` the title buffer's own bytes, rounded
+    /// up to the hash's 16-byte step. A copy's buffer is the title buffer
+    /// rounded up to 64 KiB, so a title buffer of 288 bytes was hashed over
+    /// 4,096 steps where 18 hold everything that can go back to the title
+    /// (what is fetched is cut to the title buffer, [`Shadow::card_piece`]).
+    /// With every title buffer on the card (`VICTORY_CARD_BUFFERS_MIN_KB=64`)
+    /// the source's send-and-hash lists took 19.7 ms of card time a frame
+    /// where they had taken 10.9 (fxceless/victory-fork c36971b). Every hash
+    /// of a copy, sent and compared, takes the same length. Not run in a
+    /// game yet, so not the default.
+    pub(crate) fn card_hashed(&self, size: u64) -> u64 {
+        static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*OWN.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1")) {
+            return size;
+        }
+        self.len.next_multiple_of(16).clamp(16, size.max(16))
+    }
+
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -4526,6 +4610,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+            placed_count(size, false);
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
@@ -4536,11 +4621,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let (buffer, card) = match card_for(size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
+                // The small ones are counted only (`placed_line`): with
+                // `VICTORY_CARD_BUFFERS_MIN_KB=64` they are thousands.
+                if size >= 1 << 20 {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                }
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
@@ -4553,6 +4642,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
             None => (buffer, None),
         };
+        placed_count(size, card.is_some());
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {

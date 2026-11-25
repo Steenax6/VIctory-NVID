@@ -141,6 +141,17 @@ those passes are slow as translated is open, and it is where the next gain
 would be; 30 frames a second would need the title's commands, twice a
 frame's time there now, to halve.
 
+To measure, not yet the default: `VICTORY_CARD_BUFFERS_MIN_KB=64` (with
+`VICTORY_CARD_BUFFERS_MB=1280`) puts the host copy of every title buffer in
+the card's memory; by default only those of 1 MiB and more are there
+(`=1024`), and a shader's every load and store on the others crosses the
+bus. On an RTX 4070 (fxceless/victory-fork c36971b) the title's lists went
+from 68.0 to 49.8 ms of card time a frame, single passes from 6.7 to 1.6
+ms; our passes that send and hash before each submission went from 11.6
+to 23.0 ms, and `VICTORY_CARD_HASH_LEN=1` (hash a copy's own bytes, not its
+whole 64 KiB) is meant to take that back. A line with the frame-rate line
+says how many copies went where, by size.
+
 `VICTORY_PIPELINE_WORKERS=<n>` sets how many threads build pipelines that
 are not cached yet (default: half the logical processors, at most 8). On a
 Ryzen 7 9800X3D (16 threads) with an RTX 4070 Ti, 14 cut the intro's time

@@ -4543,6 +4543,7 @@ impl Host {
             let Some(before) = before else {
                 continue;
             };
+            let size = shadow.card_hashed(size);
             let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                 vec![shadow.card_run(0, usize::MAX)]
             } else {
@@ -4742,6 +4743,7 @@ impl Host {
                         let Some(before) = before else {
                             continue;
                         };
+                        let size = shadow.card_hashed(size);
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
@@ -4871,7 +4873,8 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
+                        let hashed = r.shadow.card_hashed(size) as u32;
+                        let constants = [r.span.first, r.span.skew, hashed, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
@@ -8339,6 +8342,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::shadow::back_line(frames);
+        crate::shadow::placed_line();
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
@@ -9299,9 +9303,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 /// the switches under test in the environment (they are read once per
 /// process); it does nothing unless the host device is the software
 /// adapter (`VICTORY_D3D12_WARP=1` in a diagnostics build) and the copy is
-/// in the card's memory (`VICTORY_CARD_BUFFERS_MIN_MB=1`):
+/// in the card's memory (`VICTORY_CARD_BUFFERS_MIN_KB=1024`):
 ///
-/// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 [VICTORY_QUEUE2=n]
+/// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_KB=1024 [VICTORY_QUEUE2=n]
 ///  [VICTORY_RELAY=2 | VICTORY_LATE_WAIT=3] cargo test -p victory-gpu
 ///  --features diagnostics queue2_tests`
 ///
@@ -9361,7 +9365,7 @@ void main() {
         crate::shadow::register(0x51_5151, title as u64, LEN as u64);
         let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
         if !shadow.carded() {
-            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_KB=1024)");
             return;
         }
         let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
@@ -9484,7 +9488,7 @@ void main() {
     /// bytes. With the fix B's landing fetches the piece all the same
     /// (`BESIDE`).
     ///
-    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_QUEUE2=1
+    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_KB=1024 VICTORY_QUEUE2=1
     ///  VICTORY_RELAY=1 cargo test -p victory-gpu --features diagnostics
     ///  fetched_again -- --nocapture` (alone: it lands its two flights
     /// itself; `VICTORY_QUEUE2_REFETCH=0` shows the fault).
@@ -9523,7 +9527,7 @@ void main() {
         crate::shadow::register(0x52_5252, title as u64, LEN as u64);
         let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
         if !shadow.carded() {
-            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_KB=1024)");
             return;
         }
         let code = compile(TWICE, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
