@@ -126,6 +126,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address
+    /// ([`stores_by_address`]); true when its code is not known.
+    pub(crate) stores_by_address: bool,
     /// A compute program's thread-group size (`numthreads`) on the
     /// console, `[0; 3]` for other stages: what a dispatch that counts
     /// threads (`crate::list::dispatch_groups`) divides by.
@@ -188,6 +191,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let main = programs.into_iter().find(|p| {
         matches!(
             p.stage,
@@ -203,6 +207,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         host,
         used,
         stores,
+        stores_by_address,
         threads,
     })
 }
@@ -351,6 +356,35 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Smem
             | Encoding::Flat
             | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to title memory by address
+/// (`crate::memory`): a scalar-memory, flat or global store or atomic, or
+/// code that is not all known (as [`stores`]). Only such stores reach the numbered copies
+/// through raw addresses; a program that only loads by address (the
+/// programs that walk the structures) and stores through its views
+/// declares those views' ranges, not every numbered copy. Declared, each
+/// copy costs a compare after the submission (1,023 copies, 4.3 GB, and
+/// seconds a frame in the source's builder runs) and, with the builder's
+/// quarantine, carried what the builder wrote back to the title
+/// (fxceless/victory-fork #294 part 2 and #916, AllStars101-sudo/
+/// victory-lap aca8308ab3, ka1qux/BRVIctory-ka1qux `writes_guest_memory`).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
@@ -857,5 +891,37 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// A program that only loads by address and stores through a buffer
+    /// view does not store by address; one with a global store does.
+    #[cfg(windows)]
+    #[test]
+    fn only_global_stores_and_atomics_store_by_address() {
+        use victory_shader::native::{HwStage, NativeProgram, StageIo};
+        let program = |words: &[u32]| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::default(),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        const END: u32 = 0xBF81_0000; // s_endpgm
+        // global_load_dword v3, v[0:1], off
+        let load = [0xDC30_8000, 0x037D_0000];
+        // global_store_dword v[0:1], v2, off
+        let store = [0xDC70_8000, 0x007D_0200];
+        // buffer_store_dword v2, off, s[0:3], 0
+        let view_store = [0xE070_0000, 0x8000_0200];
+        let walker = program(&[load[0], load[1], view_store[0], view_store[1], END]);
+        assert!(stores(&walker));
+        assert!(!stores_by_address(&walker));
+        let builder = program(&[load[0], load[1], store[0], store[1], END]);
+        assert!(stores(&builder));
+        assert!(stores_by_address(&builder));
+        // Code that does not decode may do anything.
+        assert!(stores_by_address(&program(&[0xFFFF_FFFF])));
     }
 }

@@ -40,7 +40,7 @@
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
 //! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
 //! most). Every list with such a shader brings all numbered copies up to
-//! date and, if its shader can store, declares all of them written
+//! date and, if its shader stores by address, declares all of them written
 //! (the bytes are compared afterwards, as for any unordered access view),
 //! each copy once per list: a dirty-page mask written by the shader would
 //! bound both.

@@ -1104,9 +1104,12 @@ impl State {
                 list.quarantine();
             }
             let writes = (t.stores || !write_skip()) && !quarantined;
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by. Its
+            // numbered copies are declared written only for a shader that
+            // stores by address.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let by_address = writes && (t.stores_by_address || !write_skip());
+                let Some(ready) = self.memory_ready(list, compute, by_address) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
