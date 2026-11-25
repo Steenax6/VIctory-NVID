@@ -528,6 +528,11 @@ pub(crate) fn group_pieces() -> u32 {
     })
 }
 
+/// Since the last frame line: direct dispatches that count threads
+/// ([`crate::list::USE_THREAD_DIMENSIONS`]), and those of them whose last
+/// group is partial (run whole, see [`State::dispatch`]).
+pub(crate) static THREAD_DISPATCHES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Since the last frame line: indirect dispatch executions recorded in
 /// pieces, the `ExecuteIndirect` calls they took, and direct dispatches
 /// (compute and mesh) run in pieces.
@@ -2266,8 +2271,10 @@ impl State {
         }
     }
 
-    /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    /// Runs a console dispatch of `dims` with its `DispatchX` flags (0 for
+    /// a plain `Dispatch`) on the host: groups, or with
+    /// [`crate::list::USE_THREAD_DIMENSIONS`] threads.
+    pub(crate) fn dispatch(&mut self, list: &HostList, dims: [u32; 3], flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -2282,7 +2289,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
-                self.list_dropped_roots([x, y, z]);
+                self.list_dropped_roots(dims);
             }
             return;
         }
@@ -2295,13 +2302,45 @@ impl State {
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
-                self.list_dropped_roots([x, y, z]);
+                self.list_dropped_roots(dims);
             }
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
+        }
+        let group = p.stages[0].translated().threads;
+        let Some(([x, y, z], partial)) = crate::list::dispatch_groups(dims, group, flags) else {
+            return;
+        };
+        if flags & crate::list::USE_THREAD_DIMENSIONS != 0 {
+            THREAD_DISPATCHES[0].fetch_add(1, Ordering::Relaxed);
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            FIRST.call_once(|| {
+                tracing::info!(
+                    threads = ?dims,
+                    ?group,
+                    groups = ?[x, y, z],
+                    flags = format_args!("{flags:#x}"),
+                    "a dispatch counts threads: it runs the groups that hold them"
+                );
+            });
+        }
+        // shortcut: the console starts only the threads up to the count in
+        // a partial last group; the host runs that group whole, so its
+        // threads past the count run too (at most a group less one more
+        // than asked, not 64 times as many). Cutting them needs the
+        // count in the translated program (victory_shader), which has no
+        // place for it yet.
+        if partial {
+            THREAD_DISPATCHES[1].fetch_add(1, Ordering::Relaxed);
+            once!(
+                pipeline = %p.name,
+                threads = ?dims,
+                ?group,
+                "a dispatch that counts threads ends in a partial group: the host runs that group whole (counted in the frame line)"
+            );
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2313,7 +2352,14 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| {
+            let threads = if flags & crate::list::USE_THREAD_DIMENSIONS != 0 {
+                format!(" ({}x{}x{} threads)", dims[0], dims[1], dims[2])
+            } else {
+                String::new()
+            };
+            self.op_text(format!("dispatch {x}x{y}x{z}{threads}"), true)
+        });
         // SAFETY (each piece): an open list with everything set.
         Self::run_pieces(list, true, Self::group_base_slot(p), x, |n| unsafe { list.list.Dispatch(n, y, z) });
         DISPATCHED.fetch_add(1, Ordering::Relaxed);

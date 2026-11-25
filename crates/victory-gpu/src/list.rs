@@ -1338,16 +1338,56 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with the console's
+/// `COMPUTE_DISPATCH_INITIATOR` flags. Bit 5 ([`USE_THREAD_DIMENSIONS`])
+/// says `x`, `y` and `z` count threads, not groups ([`dispatch_groups`]);
+/// the ray-tracing structure builder dispatches this way (0x20, 0x8020 for
+/// its 32-lane programs). The other bits ask nothing of the host.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_x(this, x, y, z, flags);
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
+}
+
+/// `COMPUTE_DISPATCH_INITIATOR` bit 5, `USE_THREAD_DIMENSIONS`: a
+/// dispatch's three numbers are thread counts, and the console runs as
+/// many groups as hold them, the last along an axis cut to the count.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const USE_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// The groups a console dispatch of `dims` with `flags` runs, for a
+/// program of `group` threads a group (`numthreads`), and whether its last
+/// group along some axis is partial (the console starts only the threads
+/// up to the count there). None: a dispatch that counts threads and has
+/// none along an axis, which runs nothing.
+///
+/// Taking the thread counts for group counts ran the structure builder up
+/// to 64 times over: its box stages write 8 KiB a group, and in the first
+/// frame of a run that failed they ran 272,948 and 47,026 groups where
+/// 5,983 and 4,217 hold the threads, 2.2 GiB of empty nodes written past
+/// their structures into the title's own objects (fxceless/victory-fork
+/// #646 and #994, as DexNom bc3cd4b and uiliannn/VItoriaBr 633ba6e found
+/// too).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn dispatch_groups(dims: [u32; 3], group: [u32; 3], flags: u32) -> Option<([u32; 3], bool)> {
+    if flags & USE_THREAD_DIMENSIONS == 0 {
+        return Some((dims, false));
+    }
+    if dims.contains(&0) {
+        return None;
+    }
+    let mut groups = [0; 3];
+    let mut partial = false;
+    for i in 0..3 {
+        let g = group[i].max(1);
+        groups[i] = dims[i].div_ceil(g);
+        partial |= !dims[i].is_multiple_of(g);
+    }
+    Some((groups, partial))
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
@@ -1603,8 +1643,11 @@ mod state {
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        dispatch_x(this, x, y, z, 0);
+    }
+    pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, [x, y, z], flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -2233,5 +2276,27 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// Group counts pass as they are; thread counts (bit 5, also with the
+    /// 32-lane bit 0x8000) become the groups that hold them, and a count
+    /// that is not a multiple of the group says its last group is partial
+    /// (after fxceless/victory-fork#646's test).
+    #[test]
+    fn a_dispatch_that_counts_threads_runs_the_groups_that_hold_them() {
+        assert_eq!(dispatch_groups([48, 1, 1], [64, 1, 1], 0), Some(([48, 1, 1], false)));
+        assert_eq!(dispatch_groups([48, 1, 1], [64, 1, 1], 0x8000), Some(([48, 1, 1], false)));
+        assert_eq!(dispatch_groups([0, 1, 1], [64, 1, 1], 0), Some(([0, 1, 1], false)));
+        assert_eq!(dispatch_groups([48, 1, 1], [64, 1, 1], 0x20), Some(([1, 1, 1], true)));
+        assert_eq!(dispatch_groups([1, 1, 1], [32, 1, 1], 0x8020), Some(([1, 1, 1], true)));
+        assert_eq!(dispatch_groups([65, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], true)));
+        assert_eq!(dispatch_groups([128, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], false)));
+        assert_eq!(dispatch_groups([10, 16, 5], [8, 8, 4], 0x20), Some(([2, 2, 2], true)));
+        assert_eq!(dispatch_groups([16, 16, 4], [8, 8, 4], 0x20), Some(([2, 2, 1], false)));
+        // The builder's box stage, run 64 times over before.
+        assert_eq!(dispatch_groups([382_912, 1, 1], [64, 1, 1], 0x20), Some(([5_983, 1, 1], false)));
+        // A program whose group size is not known divides by 1.
+        assert_eq!(dispatch_groups([7, 1, 1], [0; 3], 0x20), Some(([7, 1, 1], false)));
+        assert_eq!(dispatch_groups([0, 1, 1], [64, 1, 1], 0x20), None);
     }
 }
