@@ -47,6 +47,12 @@ keyboard acts as one while the game window has focus.
 `VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
 time on the test machines. Set them in PowerShell before running the script.
 
+`VICTORY_PIPELINE_WORKERS=<n>` sets how many threads build pipelines that
+are not cached yet (default: half the logical processors, at most 8). On a
+Ryzen 7 9800X3D (16 threads) with an RTX 4070 Ti, 14 cut the intro's time
+below 1 fps on an empty cache from 55 s to 6-12 s; 16 was no better than the
+default.
+
 ## Debugging switches
 
 | Switch | Effect |

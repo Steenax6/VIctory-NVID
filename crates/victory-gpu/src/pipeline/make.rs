@@ -292,12 +292,28 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Workers for `logical` logical processors: half of them, 2 to 8, unless
+/// `setting` (`VICTORY_PIPELINE_WORKERS`) names a count; at most `logical`.
+/// On 16 threads (empty cache, the intro): 8 made 7.5 pipelines/s while
+/// some were waiting and the title spent 55 s below 1 fps; 14 made 17-41/s
+/// and 6-12 s; 16 made 8.8/s and 66 s.
+fn worker_count(setting: Option<&str>, logical: usize) -> usize {
+    let default = (logical / 2).clamp(2, 8);
+    setting
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map_or(default, |n| n.min(logical.max(1)))
+}
+
+/// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let setting = std::env::var("VICTORY_PIPELINE_WORKERS").ok();
+        let workers = worker_count(setting.as_deref(), logical);
+        tracing::info!(workers, logical, "host pipeline workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -375,6 +391,18 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    #[test]
+    fn worker_count_is_half_the_processors_unless_set() {
+        assert_eq!(worker_count(None, 16), 8);
+        assert_eq!(worker_count(None, 32), 8);
+        assert_eq!(worker_count(None, 2), 2);
+        assert_eq!(worker_count(Some("14"), 16), 14);
+        assert_eq!(worker_count(Some(" 12 "), 16), 12);
+        assert_eq!(worker_count(Some("64"), 16), 16);
+        assert_eq!(worker_count(Some("0"), 16), 8);
+        assert_eq!(worker_count(Some("many"), 16), 8);
     }
 
     #[test]
