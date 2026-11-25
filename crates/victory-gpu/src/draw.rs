@@ -1099,7 +1099,7 @@ impl State {
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
-                once!("a draw whose descriptor table found no free slots is dropped");
+                once!("a draw whose descriptor table found no host slots (none free, or past the host heap) is dropped");
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -2736,9 +2736,12 @@ impl State {
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // title's slots there have no host slot of their own. Such a table
+        // that cannot be made afresh drops the draw (`bind`): its title
+        // offset would have the card read past the host heap.
+        let mut past = Vec::new();
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if past.contains(&u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -2753,6 +2756,7 @@ impl State {
             };
             if index >= host.count() {
                 fresh.push(u.slot);
+                past.push(u.slot);
             }
         }
         fresh.sort_unstable();
@@ -2764,7 +2768,15 @@ impl State {
         }
         let mut made = Vec::new();
         for slot in fresh {
+            // A table not made afresh keeps the title's offset; one past the
+            // host heap must not.
+            let not_made = |made: &mut Vec<(u8, u32)>| {
+                if past.contains(&slot) {
+                    made.push((slot, u32::MAX));
+                }
+            };
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                not_made(&mut made);
                 continue;
             };
             let entries: Vec<&UsedResource> = used
@@ -2773,12 +2785,15 @@ impl State {
                 .filter(|u| u.slot == slot)
                 .collect();
             let Some(heap) = self.heap_of(table) else {
+                not_made(&mut made);
                 continue;
             };
             if heap.samplers() || (table - heap.start) % 32 != 0 {
+                not_made(&mut made);
                 continue;
             }
             let Some(host) = heap.host() else {
+                not_made(&mut made);
                 continue;
             };
             let mut selected: Vec<u32> = indexed
@@ -2809,6 +2824,7 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                not_made(&mut made);
                 continue;
             }
             // The table and what its entries hold (record words).
