@@ -215,7 +215,8 @@ const FATAL: [i32; 6] = [
 /// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
 /// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
 /// frequency, and gets the time-stamp counter for both: a core that never
-/// changes frequency.
+/// changes frequency. `rdpid` (`f3 0f c7 /7`, see [`rdpid`]), which Intel CPUs
+/// before Ice Lake lack, reads IA32_TSC_AUX the way `rdtscp` does.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
@@ -257,6 +258,14 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += pass.len as u64;
                     return true;
                 }
+                if let Some((reg, len)) = rdpid(&bytes[..n]) {
+                    // The same IA32_TSC_AUX that `rdtscp` returns in `ecx`.
+                    let mut aux = 0;
+                    std::arch::x86_64::__rdtscp(&mut aux);
+                    *gpr(context, reg) = u64::from(aux);
+                    context.Rip += len as u64;
+                    return true;
+                }
                 if let Some(len) = clwb_len(&bytes[..n]) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
@@ -272,6 +281,24 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         context.Rip += 3;
     }
     true
+}
+
+/// `rdpid r64` (`f3 [rex] 0f c7 /7`, a register operand), which Intel CPUs
+/// before Ice Lake lack: the destination register and the length, or `None`
+/// for any other instruction. REX.W changes nothing in 64-bit mode.
+fn rdpid(code: &[u8]) -> Option<(u8, usize)> {
+    if *code.first()? != 0xf3 {
+        return None;
+    }
+    let (rex, at) = match *code.get(1)? {
+        r @ 0x40..=0x4f => (r, 2),
+        _ => (0, 1),
+    };
+    if code.get(at..at + 2)? != [0x0f, 0xc7] {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
+    (modrm >> 6 == 3 && (modrm >> 3) & 7 == 7).then_some((modrm & 7 | (rex & 1) << 3, at + 3))
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
@@ -1659,6 +1686,74 @@ mod tests {
             let count = context.Rdx << 32 | context.Rax;
             assert!(context.Rax >> 32 == 0 && context.Rdx >> 32 == 0);
             assert_eq!(count != 0, known, "ecx {ecx:#x}");
+        }
+    }
+
+    #[test]
+    fn rdpid_decoding() {
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0xf8]), Some((0, 4))); // rdpid rax
+        assert_eq!(rdpid(&[0xf3, 0x41, 0x0f, 0xc7, 0xff]), Some((15, 5))); // rdpid r15
+        assert_eq!(rdpid(&[0xf3, 0x48, 0x0f, 0xc7, 0xf9]), Some((1, 5))); // rdpid rcx, REX.W
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0xf8, 0xcc]), Some((0, 4))); // longer slice
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0x38]), None); // memory form
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0x78, 0x10]), None); // memory form, disp8
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0xf0]), None); // reg 6
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0xc8]), None); // reg 1
+        assert_eq!(rdpid(&[0x0f, 0xc7, 0xf8]), None); // no f3
+        assert_eq!(rdpid(&[0x66, 0x0f, 0xc7, 0xf8]), None); // 66, not f3
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7]), None); // ModRM missing
+        assert_eq!(rdpid(&[0xf3, 0x41, 0x0f, 0xc7]), None);
+        assert_eq!(rdpid(&[0xf3, 0x41, 0x0f]), None);
+        assert_eq!(rdpid(&[0xf3]), None);
+        assert_eq!(rdpid(&[]), None);
+    }
+
+    #[test]
+    fn emulated_rdpid_stores_tsc_aux_and_keeps_flags() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcessorNumber, GetCurrentThread, SetThreadAffinityMask,
+        };
+        // Keep the thread on one processor, so IA32_TSC_AUX does not change
+        // between the reads (a few tries cover a failed pin or a migration).
+        // SAFETY: plain calls on the current thread; the old mask is restored.
+        let old = unsafe {
+            let cpu = GetCurrentProcessorNumber();
+            if cpu < usize::BITS {
+                SetThreadAffinityMask(GetCurrentThread(), 1 << cpu)
+            } else {
+                0
+            }
+        };
+        let value = |code: &[u8], reg: u8| {
+            // SAFETY: an all-zero context is valid.
+            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+            *gpr(&mut context, reg) = !0;
+            context.EFlags = 0x202 | CMP_FLAGS;
+            let (mut before, mut after) = (0, 0);
+            // SAFETY: rdtscp exists on every CPU this runs on.
+            unsafe { std::arch::x86_64::__rdtscp(&mut before) };
+            assert!(emulate_in(code, 0, &mut context));
+            // SAFETY: as above.
+            unsafe { std::arch::x86_64::__rdtscp(&mut after) };
+            assert_eq!(context.Rip, code.len() as u64);
+            assert_eq!(context.EFlags, 0x202 | CMP_FLAGS);
+            (before, after, *gpr(&mut context, reg))
+        };
+        for (code, reg) in [
+            (&[0xf3, 0x0f, 0xc7, 0xf8][..], 0),
+            (&[0xf3, 0x41, 0x0f, 0xc7, 0xff][..], 15),
+            (&[0xf3, 0x48, 0x0f, 0xc7, 0xf9][..], 1),
+        ] {
+            let ok = (0..100).any(|_| {
+                let (before, after, got) = value(code, reg);
+                assert_eq!(got >> 32, 0, "upper half not cleared");
+                before == after && got == u64::from(before)
+            });
+            assert!(ok, "register {reg} never got the processor id");
+        }
+        if old != 0 {
+            // SAFETY: restores the mask the call above returned.
+            unsafe { SetThreadAffinityMask(GetCurrentThread(), old) };
         }
     }
 
