@@ -502,15 +502,26 @@ fn tabled_out() -> bool {
 
 /// `VICTORY_TABLED_SKIP_FRAMES=<n>`: a slot is left to its draws only if a
 /// draw read it through a table within the last `n` frames (0: such slots
-/// are mirrored again, as with `VICTORY_HEAP_SYNC_TABLES=1`). Unset: the
+/// are mirrored again, as with `VICTORY_HEAP_SYNC_TABLES=1`). `off`: the
 /// window is [`TABLED_FRAMES`] and the read bit is not asked for.
+///
+/// ztrx: unset is 2, not `off`. With the window of [`TABLED_FRAMES`] the
+/// title died at world entry, reproducibly (a write to 0 at
+/// `victory-image+0x23cf683`, pull request #827 upstream), and 2 gave clean
+/// runs through the world there.
 fn skip_frames() -> Option<u64> {
     static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("VICTORY_TABLED_SKIP_FRAMES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
+    *N.get_or_init(|| tabled_skip(std::env::var("VICTORY_TABLED_SKIP_FRAMES").ok().as_deref()))
+}
+
+/// [`skip_frames`] for the variable's value.
+fn tabled_skip(value: Option<&str>) -> Option<u64> {
+    const DEFAULT: u64 = 2;
+    match value.map(str::trim) {
+        Some("off") => None,
+        Some(v) => Some(v.parse().unwrap_or(DEFAULT)),
+        None => Some(DEFAULT),
+    }
 }
 
 /// What the queue of textures picked by index knows of a title slot.
@@ -3069,6 +3080,15 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_table_skip_window_is_two_frames_unless_set() {
+        assert_eq!(tabled_skip(None), Some(2));
+        assert_eq!(tabled_skip(Some("5")), Some(5));
+        assert_eq!(tabled_skip(Some(" 0 ")), Some(0));
+        assert_eq!(tabled_skip(Some("off")), None);
+        assert_eq!(tabled_skip(Some("many")), Some(2));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

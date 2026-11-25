@@ -771,10 +771,6 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
 /// After the layer wrote `[at, at + len)` of title memory through the
 /// kernel: the dirty bits the kernel holds for those pages are the layer's
 /// own writes, and a refresh that took them for the title's copies the same
@@ -812,6 +808,10 @@ pub(crate) fn forgot(at: usize, len: usize) {
     }
 }
 
+/// Before our own write into title memory `[at, at + len)` through the
+/// kernel (which does not fault into our handler): opens its guarded blocks.
+/// The runtime calls it (as `kernel_will_write`) before the title's kernel
+/// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));

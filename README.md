@@ -49,14 +49,38 @@ you.
 
 ## Faster settings (optional, off by default)
 
-`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
-time on the test machines. Set them in PowerShell before running the script.
+What this section listed before (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
+card copies of title buffers from 1 MB to 1024 MB) is the default since
+upstream `c96b4f2` (about 230 ms a frame where it was about 400 there).
+
+Newer switches from upstream (`f85101b`), off by default. Together they took
+the first room from about 3.5-4 to 6-7 frames a second on an RTX 4070:
+`VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`, `VICTORY_INDIRECT_WINDOW=1`,
+`VICTORY_TEXTURE_NO_WAIT=1`. Do not combine `VICTORY_INDIRECT_WINDOW=1` with
+`VICTORY_CARD_FETCH_INFLIGHT=1` (a device loss upstream). Set them in
+PowerShell before running the script.
 
 `VICTORY_PIPELINE_WORKERS=<n>` sets how many threads build pipelines that
 are not cached yet (default: half the logical processors, at most 8). On a
 Ryzen 7 9800X3D (16 threads) with an RTX 4070 Ti, 14 cut the intro's time
 below 1 fps on an empty cache from 55 s to 6-12 s; 16 was no better than the
 default.
+
+## Shader warm-up (optional)
+
+A build that changes the shader translator starts with an empty shader
+cache, and the first run is slow while the shaders translate. They can be
+translated beforehand, on the processor only (4.5 to 6.5 minutes upstream):
+
+```powershell
+$env:VICTORY_CACHE_DIR = "$env:LOCALAPPDATA\ztrx\cache"; $env:VICTORY_HOST_WAVE = 32; $env:VICTORY_VIEW_LIMIT = 999999
+target\release\victory.exe translate "<your game folder>\shaders.rpf" --warm all --jobs 14
+```
+
+The cache folder is the one `scripts\play.ps1` uses (`-Cache`). The two
+numbers must match the card: a run's log has `host wave lanes ... max=32`
+and `host view heap capped at 1000000` (the limit is that number minus 1);
+these are an NVIDIA card's.
 
 ## Debugging switches
 
@@ -65,7 +89,8 @@ default.
 | `VICTORY_CAPTURE=<dir>` + `VICTORY_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
+| `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built (objects can go missing meanwhile) |
+| `VICTORY_TABLED_SKIP_FRAMES=off` | upstream's 240-frame window for table-read descriptor slots; ztrx uses 2 frames, since the window crashed at world entry (upstream pull request #827) |
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
 

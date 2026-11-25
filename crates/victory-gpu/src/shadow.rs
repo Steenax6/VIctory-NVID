@@ -1664,18 +1664,6 @@ mod wide_tests {
     }
 }
 
-/// What [`Shadow::copy_back`] does with a piece that differs from the
-/// snapshot: `host` is the copy's bytes there, `old` the snapshot's. From
-/// the first byte that differs to the last, title memory is read into
-/// `title` (scratch, sized to that stretch) by `read` (the stretch's offset
-/// in the piece, where to), the GPU's bytes are put in and `host` takes the
-/// result. The stretch's offset in the piece and its length if that changed
-/// title memory; none if nothing differs or title memory is not there.
-/// `runs` takes the runs of the stretch (offsets into `title`, lengths)
-/// whose bytes are the GPU's and differ from the title's as read: only
-/// those are to be written, so a title write that lands between the read
-/// and the write elsewhere in the stretch stays (upstream VIctory #2009).
-/// `mask` is scratch.
 /// How far apart two pieces that differ may be and still be written with
 /// one stretch (`coalesce_pieces`): a 64 KiB piece here is one kernel read
 /// and one kernel write of title memory.
@@ -1713,6 +1701,18 @@ fn coalesce_pieces(mut spans: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, us
     out
 }
 
+/// What [`Shadow::copy_back`] does with a piece that differs from the
+/// snapshot: `host` is the copy's bytes there, `old` the snapshot's. From
+/// the first byte that differs to the last, title memory is read into
+/// `title` (scratch, sized to that stretch) by `read` (the stretch's offset
+/// in the piece, where to), the GPU's bytes are put in and `host` takes the
+/// result. The stretch's offset in the piece and its length if that changed
+/// title memory; none if nothing differs or title memory is not there.
+/// `runs` takes the runs of the stretch (offsets into `title`, lengths)
+/// whose bytes are the GPU's and differ from the title's as read: only
+/// those are to be written, so a title write that lands between the read
+/// and the write elsewhere in the stretch stays (upstream VIctory #2009).
+/// `mask` is scratch.
 fn back_piece(
     host: &mut [u8],
     old: &[u8],
