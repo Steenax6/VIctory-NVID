@@ -1328,6 +1328,118 @@ impl Staging {
         }
         // Every staged level written: what a spare buffer held is gone.
         self.stale.store(false, std::sync::atomic::Ordering::Relaxed);
+        if !self.on_demand {
+            self.fill_missing_levels();
+        }
+    }
+
+    /// A texture still streaming in has its smaller levels first (they lie
+    /// at the start of its memory, or their pages come first): the larger
+    /// ones read as zeros until their pages arrive. Sampled, the zeros came
+    /// out black, and only triangle edges (whose wide derivatives pick a
+    /// smaller level) showed the texture: a wire net over black clothes and
+    /// props (AntoninMichelq/VIctory-forkAMD 440e19e5ee). A level that is all
+    /// zeros above one that is not takes the nearest smaller level that is
+    /// not, each element repeated; the next detiling, once its pages are
+    /// there, writes its own texels. Not for a texture made level by level
+    /// (`crate::tiles`): its levels without the title's bytes are not shown.
+    /// `VICTORY_TEXTURE_FILL_LEVELS=0` leaves the zeros.
+    fn fill_missing_levels(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mips = self.mips as usize;
+        if mips < 2
+            || self.first != 0
+            || !self.footprints.len().is_multiple_of(mips)
+            || !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL_LEVELS").is_none_or(|v| v != "0"))
+        {
+            return;
+        }
+        let n = self.layout.desc.element_bytes as usize;
+        for slice in 0..self.footprints.len() / mips {
+            // Of each level: offset, row pitch, width and rows in elements.
+            let levels: Option<Vec<(usize, usize, usize, usize)>> = (0..mips)
+                .map(|k| {
+                    let i = slice * mips + k;
+                    let f = self.footprints[i].Footprint;
+                    let m = self.layout.mips.get(k)?;
+                    (f.Depth == 1 && m.depth <= 1).then_some((
+                        self.footprints[i].Offset as usize,
+                        f.RowPitch as usize,
+                        m.width as usize,
+                        (self.rows[i] as usize).min(m.height as usize),
+                    ))
+                })
+                .collect();
+            let Some(levels) = levels else {
+                return;
+            };
+            // SAFETY: the mapped staging buffer of `bytes` bytes, which
+            // nothing else touches while it is detiled.
+            let data = unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes as usize) };
+            let filled = fill_zero_levels(data, &levels, n);
+            if filled > 0 {
+                FILLED_LEVELS.fetch_add(filled, Relaxed);
+            }
+        }
+    }
+}
+
+/// [`Staging::fill_missing_levels`] on one layer's levels in `data`, most
+/// detailed first: each as its offset, row pitch, width and rows in
+/// elements of `n` bytes. Returns the levels filled.
+fn fill_zero_levels(data: &mut [u8], levels: &[(usize, usize, usize, usize)], n: usize) -> u64 {
+    let fits = levels.iter().all(|&(offset, pitch, w, h)| {
+        h == 0 || (pitch >= w * n && offset + (h - 1) * pitch + w * n <= data.len())
+    });
+    if !fits {
+        return 0;
+    }
+    let row = |k: usize, y: usize| {
+        let (offset, pitch, w, _) = levels[k];
+        offset + y * pitch..offset + y * pitch + w * n
+    };
+    let zero: Vec<bool> =
+        (0..levels.len()).map(|k| (0..levels[k].3).all(|y| data[row(k, y)].iter().all(|&b| b == 0))).collect();
+    let mut filled = 0;
+    for k in 0..levels.len() {
+        if !zero[k] {
+            continue;
+        }
+        let Some(d) = (k + 1..levels.len()).find(|&j| !zero[j]).map(|j| j - k) else {
+            break;
+        };
+        let (_, _, w, h) = levels[k];
+        let (_, _, sw, sh) = levels[k + d];
+        if sw == 0 || sh == 0 {
+            continue;
+        }
+        for y in 0..h {
+            let from = data[row(k + d, (y >> d).min(sh - 1))].to_vec();
+            let to = &mut data[row(k, y)];
+            for x in 0..w {
+                let sx = (x >> d).min(sw - 1);
+                to[x * n..][..n].copy_from_slice(&from[sx * n..][..n]);
+            }
+        }
+        filled += 1;
+    }
+    filled
+}
+
+/// Levels of streaming textures filled from a smaller one since the start
+/// (`Staging::fill_missing_levels`).
+pub(crate) static FILLED_LEVELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The line on levels filled from a smaller one ([`FILLED_LEVELS`]), every
+/// few seconds; nothing while there are none.
+pub(crate) fn filled_line() {
+    let filled = FILLED_LEVELS.load(std::sync::atomic::Ordering::Relaxed);
+    if filled > 0 {
+        tracing::info!(
+            "levels of streaming textures that were all zeros, shown from the nearest smaller level until their pages \
+             come, since the start: {filled} (VICTORY_TEXTURE_FILL_LEVELS=0 leaves the zeros)"
+        );
     }
 }
 
@@ -1735,6 +1847,43 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::fill_zero_levels;
+
+    /// A 4x4, 2x2, 1x1 chain of 1-byte elements, rows 8 bytes apart.
+    const LEVELS: [(usize, usize, usize, usize); 3] = [(0, 8, 4, 4), (32, 8, 2, 2), (48, 8, 1, 1)];
+
+    #[test]
+    fn zero_levels_take_the_nearest_smaller_level_that_is_not() {
+        let mut data = vec![0u8; 56];
+        // Levels 1 and 2 are there, level 0 is not.
+        data[32..34].copy_from_slice(&[1, 2]);
+        data[40..42].copy_from_slice(&[3, 4]);
+        data[48] = 9;
+        assert_eq!(fill_zero_levels(&mut data, &LEVELS, 1), 1);
+        let level0: Vec<u8> = (0..4).flat_map(|y| data[y * 8..y * 8 + 4].to_vec()).collect();
+        assert_eq!(level0, [1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4]);
+        // Padding between rows is not written.
+        assert!(data[4..8].iter().all(|&b| b == 0));
+        // Only the last level there: both larger ones from it.
+        let mut data = vec![0u8; 56];
+        data[48] = 7;
+        assert_eq!(fill_zero_levels(&mut data, &LEVELS, 1), 2);
+        assert!((0..4).all(|y| data[y * 8..y * 8 + 4].iter().all(|&b| b == 7)));
+        assert_eq!(&data[32..34], &[7, 7]);
+        // Nothing there, or everything: nothing changes.
+        let mut data = vec![0u8; 56];
+        assert_eq!(fill_zero_levels(&mut data, &LEVELS, 1), 0);
+        assert!(data.iter().all(|&b| b == 0));
+        let mut data = vec![5u8; 56];
+        assert_eq!(fill_zero_levels(&mut data, &LEVELS, 1), 0);
+        // Levels that do not fit the buffer: left alone.
+        let mut short = vec![0u8; 40];
+        assert_eq!(fill_zero_levels(&mut short, &LEVELS, 1), 0);
+    }
 }
 
 #[cfg(test)]
