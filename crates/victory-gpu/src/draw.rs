@@ -886,11 +886,12 @@ impl State {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
         }
-        // The title address of the buffer view at that dword of the table.
+        // The title address of the buffer view (or acceleration structure)
+        // at that dword of the table.
         let address = match self.roots_ref(compute).get(usize::from(slot)) {
-            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
+            Some(&Root::Table(table)) => {
+                crate::descriptor::view(table + u64::from(dword) * 4).map_or(0, |view| view_address(&view))
+            }
             _ => 0,
         };
         if address == 0 {
@@ -3800,6 +3801,25 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
+/// The title address a program takes out of a view's descriptor (its
+/// dwords 0 and 1, `victory_shader::emit::USER_VIEW_ADDRESS`). A ray
+/// tracing acceleration structure's shader view has no resource: its
+/// description holds the structure's address (`Location`, dwords 4 and 5),
+/// where the program that walks it starts; that view gave 0, so the
+/// world's ray-traced pass walked from address 0 instead of the structure
+/// (Marvisak/VIctory#2098). Any other view: the first byte of the memory
+/// it reads, or 0.
+fn view_address(view: &View) -> u64 {
+    match view {
+        View::Shader(_, Some(desc))
+            if desc[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 =>
+        {
+            u64::from(desc[4]) | u64::from(desc[5]) << 32
+        }
+        _ => crate::descriptor::host::buffer_range(view).map_or(0, |(address, _)| address),
+    }
+}
+
 pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     #[cfg(feature = "diagnostics")]
     crate::capture::op(std::ptr::from_ref(list) as usize, || {
@@ -3810,5 +3830,33 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An acceleration structure's view address is the location in its
+    /// description (words as the title writes them: format 0, dimension
+    /// 11, the default component mapping, the location from dword 4); a
+    /// placed buffer view keeps its memory's address (after
+    /// Marvisak/VIctory#2098's test).
+    #[test]
+    fn an_acceleration_structures_view_address_is_its_location() {
+        let mut words = [0u32; 10];
+        (words[1], words[2], words[4], words[5]) = (11, 0x1688, 0x5f1c_0000, 0xd);
+        assert_eq!(view_address(&View::Shader(0, Some(words))), 0xd_5f1c_0000);
+        // A placed buffer view: dimension 1, 64 elements from element 0,
+        // its memory at 0x1_2345_6700 (description dwords 10 and 11).
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2], desc[6], desc[10], desc[11]) = (1, 0x1688, 64, 0x2345_6700, 1);
+        assert_eq!(view_address(&View::Placed(false, resource, desc)), 0x1_2345_6700);
+        // A texture view of no buffer: 0.
+        let mut texture = [0u32; 10];
+        texture[1] = 4;
+        assert_eq!(view_address(&View::Shader(0, Some(texture))), 0);
     }
 }
