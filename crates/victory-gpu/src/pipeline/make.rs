@@ -324,6 +324,15 @@ fn worker_count(setting: Option<&str>, logical: usize) -> usize {
         .map_or(default, |n| n.min(logical.max(1)))
 }
 
+/// The stack of a pipeline worker. The driver compiles a pipeline's shaders
+/// on the thread that makes it, and NVIDIA's compiler (nvgpucomp64) recursed
+/// past the default 2 MiB on the world's largest mesh programs: the stack
+/// overflow ends the process, or the worker dies and the pipeline the title
+/// waits for never appears (fxceless/victory-fork #28, which measured
+/// 512 MiB enough; PainDe0Mie 59cb20ded3 and Marvisak/VIctory #1129 take
+/// 64 MiB). Only reserved: pages are committed as the stack grows.
+const WORKER_STACK: usize = 512 << 20;
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -336,6 +345,7 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                .stack_size(WORKER_STACK)
                 .spawn(|| {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
