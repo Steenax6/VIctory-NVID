@@ -41,6 +41,8 @@ pub mod object;
 mod own_time;
 pub mod pipeline;
 #[cfg(windows)]
+mod placed;
+#[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;

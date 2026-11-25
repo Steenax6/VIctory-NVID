@@ -248,6 +248,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::placed::let_go_idle();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -8279,6 +8280,17 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             crate::tiles::status();
+            {
+                let [ns, made] = [0, 1].map(|i| crate::resource::MAKING[i].swap(0, Ordering::Relaxed) as f64);
+                let [heaps, placed, committed] = crate::placed::stats();
+                tracing::info!(
+                    "host textures of the title's placed textures since the last such line: {made:.0} made, {:.1} us each; \
+                     out of heaps (VICTORY_PLACED_TEX=0: an allocation each), since the start: {heaps} heaps made, \
+                     {placed} textures placed, {committed} given an allocation instead; {} MB free inside the heaps",
+                    ns / 1e3 / made.max(1.0),
+                    crate::placed::free_bytes() >> 20
+                );
+            }
             {
                 let [hb, hc, tb, tc] =
                     [0, 1, 2, 3].map(|i| COPY_MOVED[i].swap(0, Ordering::Relaxed) as f64 / logged_frames);

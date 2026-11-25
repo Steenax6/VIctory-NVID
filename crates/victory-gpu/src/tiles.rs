@@ -513,25 +513,44 @@ impl Tiled {
     }
 
     /// What the views show ([`ViewLevels`]); `None` while no level is both
-    /// held and given (the views are then as the title made them, and read
-    /// zeros).
+    /// held and given and none is left out (the views are then as the
+    /// title made them, and read zeros). With levels left out the views
+    /// stop above them from the making on, before any level has tiles (a
+    /// level without tiles reads zeros either way): the first upload then
+    /// changes no view, and the texture's slots are not made again while
+    /// the card may be reading them (`descriptor/host.rs`
+    /// `texture_views_remade` rewrites slots that lists in flight use).
     pub(crate) fn view_levels(&self) -> Option<ViewLevels> {
-        let first_tiled = self.first_shown()?;
-        let first_held = self.title_first.load(Ordering::Relaxed).min(first_tiled);
+        let dropped = self.dropped();
+        let first_tiled = match self.first_shown() {
+            Some(first) => first,
+            None if dropped > 0 => dropped,
+            None => return None,
+        };
+        // (Before the first upload says, the title is taken to hold every
+        // level: its view as it made it.)
+        let first_held = match self.title_first.load(Ordering::Relaxed) {
+            u32::MAX => 0,
+            first => first.min(first_tiled),
+        };
         Some(ViewLevels {
             first_held,
             first_tiled,
-            dropped: self.dropped(),
+            dropped,
         })
     }
 
-    /// Notes the first level the title or the card holds; whether that
-    /// changes a view ([`shape_view`] goes by it only with levels left out,
-    /// and only once a level is shown).
-    fn note_first(&self) -> bool {
+    /// [`Tiled::view_levels`] as far as [`shape_view`] goes by it: without
+    /// levels left out the first level held does not count.
+    fn view_shape(&self) -> Option<ViewLevels> {
+        self.view_levels().map(|v| if v.dropped == 0 { ViewLevels { first_held: 0, ..v } } else { v })
+    }
+
+    /// Notes the first level the title or the card holds.
+    fn note_first(&self) {
         let named = self.title_held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
         let first = if named == 0 { u32::MAX } else { named.trailing_zeros() };
-        self.title_first.swap(first, Ordering::Relaxed) != first && self.dropped() > 0 && self.first_shown().is_some()
+        self.title_first.store(first, Ordering::Relaxed);
     }
 
     /// At the submission of a list that uploads every level of `texture`
@@ -572,14 +591,16 @@ impl Tiled {
         let title = held & self.every_level();
         let held = title & copied & !self.dropped_mask();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let before = self.view_shape();
         self.held.store(held, Ordering::Relaxed);
         self.title_held.store(title, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
-        let first_changed = self.note_first();
+        self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        self.note_first();
+        let changed = self.view_shape() != before;
         let missing = self.without_locked(&given, named) != 0;
         // What it will take is counted by its tiles from the first upload
         // that gave every level it names (one kept waiting for room still
@@ -588,7 +609,7 @@ impl Tiled {
         if !missing {
             STATS[11].fetch_sub(self.planned.swap(0, Ordering::Relaxed), Ordering::Relaxed);
         }
-        (changed || first_changed, missing)
+        (changed, missing)
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -616,7 +637,8 @@ impl Tiled {
         let levels = levels & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let prev = self.card.load(Ordering::Relaxed);
-        let changed = self.give_locked(
+        let before = self.view_shape();
+        self.give_locked(
             &mut given,
             queue,
             device,
@@ -635,8 +657,8 @@ impl Tiled {
         if without != 0 {
             self.unclaim(without);
         }
-        let first_changed = self.note_first();
-        changed || first_changed
+        self.note_first();
+        self.view_shape() != before
     }
 
     /// The bits of the levels that get their tiles with level `level`:
@@ -738,46 +760,41 @@ impl Tiled {
         if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
             wanted.push((first_packed, self.packed, None));
         }
+        // The levels' tiles, then one mapping call per heap they come from
+        // (mostly one): a call for each level made some ten calls into the
+        // kernel for every texture made. Per heap: its regions (a level's
+        // first tile and its tiles) and their runs of the heap, in order.
+        struct Batch {
+            heap: ID3D12Heap,
+            at: Vec<D3D12_TILED_RESOURCE_COORDINATE>,
+            sizes: Vec<D3D12_TILE_REGION_SIZE>,
+            starts: Vec<u32>,
+            counts: Vec<u32>,
+        }
+        let mut batches: std::collections::BTreeMap<usize, Batch> = std::collections::BTreeMap::new();
         for (subresource, tiles, level) in wanted {
             let Some((heap, index, runs)) = take(device, tiles) else {
                 continue;
             };
-            let at = D3D12_TILED_RESOURCE_COORDINATE {
+            let batch = batches.entry(index).or_insert_with(|| Batch {
+                heap,
+                at: Vec::new(),
+                sizes: Vec::new(),
+                starts: Vec::new(),
+                counts: Vec::new(),
+            });
+            batch.at.push(D3D12_TILED_RESOURCE_COORDINATE {
                 X: 0,
                 Y: 0,
                 Z: 0,
                 Subresource: subresource,
-            };
-            let size = D3D12_TILE_REGION_SIZE {
+            });
+            batch.sizes.push(D3D12_TILE_REGION_SIZE {
                 NumTiles: tiles,
                 ..Default::default()
-            };
-            // One region, the subresource's tiles in order, on as many
-            // ranges of the heap as the runs taken.
-            let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; runs.len()];
-            let starts: Vec<u32> = runs.iter().map(|run| run.0).collect();
-            let counts: Vec<u32> = runs.iter().map(|run| run.1).collect();
-            let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture and a live heap of ours; one
-            // region of `tiles` tiles from the subresource's first tile;
-            // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    &heap,
-                    runs.len() as u32,
-                    Some(flags.as_ptr()),
-                    Some(starts.as_ptr()),
-                    Some(counts.as_ptr()),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
-            }
-            STATS[6].fetch_add(1, Ordering::Relaxed);
-            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            });
+            batch.starts.extend(runs.iter().map(|run| run.0));
+            batch.counts.extend(runs.iter().map(|run| run.1));
             match level {
                 Some(level) => given.levels[level] = true,
                 None => given.packed = true,
@@ -787,6 +804,31 @@ impl Tiled {
             }
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
+        }
+        for batch in batches.values() {
+            let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; batch.starts.len()];
+            let began = std::time::Instant::now();
+            // SAFETY: a live reserved texture and a live heap of ours;
+            // `at.len()` regions, each a level's tiles in order from its
+            // first; `starts.len()` ranges of the heap whose counts add up
+            // to the regions' tiles, region by region, in arrays that live
+            // through the call.
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture,
+                    batch.at.len() as u32,
+                    Some(batch.at.as_ptr()),
+                    Some(batch.sizes.as_ptr()),
+                    &batch.heap,
+                    batch.starts.len() as u32,
+                    Some(flags.as_ptr()),
+                    Some(batch.starts.as_ptr()),
+                    Some(batch.counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let with_tiles = |level: u32| {
             if level < first_packed {
@@ -827,6 +869,57 @@ impl Tiled {
     /// A bit for every level of the texture.
     pub(crate) fn every_level(&self) -> u32 {
         if self.levels >= 32 { u32::MAX } else { (1 << self.levels) - 1 }
+    }
+
+    /// Takes every tile from `texture` (this one's texture), on the queue,
+    /// before its tiles go back to the pool and the texture is kept for
+    /// another of its description (`resource.rs` `keep_reserved`): one
+    /// `UpdateTileMappings` that maps the whole texture to nothing. The
+    /// card runs it after everything sent before it and before anything
+    /// sent after it; to be called only once nothing on the card uses the
+    /// texture (its host copy is dropped after the landing). False without
+    /// a host (the texture is then not kept).
+    pub(crate) fn unmap_all(&self, texture: &ID3D12Resource) -> bool {
+        match host() {
+            Some(host) => {
+                self.unmap_all_on(host.queue(), texture);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`Tiled::unmap_all`] on a queue.
+    pub(crate) fn unmap_all_on(&self, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) {
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        if given.runs.is_empty() {
+            return;
+        }
+        let flags = [D3D12_TILE_RANGE_FLAG_NULL];
+        let began = std::time::Instant::now();
+        // SAFETY: a live reserved texture; one region that is the whole
+        // texture (no coordinates, no sizes) and one range of no heap that
+        // covers it.
+        unsafe {
+            queue.UpdateTileMappings(
+                texture,
+                1,
+                None,
+                None,
+                None::<&ID3D12Heap>,
+                1,
+                Some(flags.as_ptr()),
+                None,
+                None,
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+        STATS[6].fetch_add(1, Ordering::Relaxed);
+        STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // From here on the texture names no tile: what it was given goes
+        // back to the pool when this is dropped.
+        given.levels.iter_mut().for_each(|has| *has = false);
+        given.packed = false;
     }
 
     /// The bytes of the tiles it has now.
@@ -1079,6 +1172,19 @@ impl DropPolicy {
 pub(crate) fn status() {
     static BEFORE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    // What making a host copy or an upload costs in calls into the kernel:
+    // what is reused and what is made.
+    let [taken, made, not_kept, zeroed, spare] = crate::texture::staging_pool_stats();
+    let [r_taken, r_made, r_kept, r_released, r_spare] = crate::resource::reserved_reuse_stats();
+    tracing::info!(
+        "staging buffers since the start: {taken} reused, {made} made (VICTORY_STAGING_POOL_MB), {not_kept} spare ones \
+         released for want of room in the pool, {zeroed} reused ones zeroed at their first check, {} MB spare now, {} made \
+         without the levels their texture leaves out; textures without memory of their own since the start: {r_taken} \
+         reused, {r_made} made (VICTORY_RESERVED_REUSE), {r_kept} kept when let go, {r_released} released for want of \
+         places, {r_spare} spare now",
+        spare >> 20,
+        crate::texture::STAGED_LEFT_OUT.load(Ordering::Relaxed),
+    );
     if s[4] == 0 {
         return;
     }
@@ -1956,9 +2062,21 @@ void read() {
         assert_eq!(copied, tiled.every_level() & !1, "the upload leaves level 0 alone");
         // Each level's bytes are sixteen times its number plus one.
         let upload = rig.filled(&layout, |level| (level as u8 + 1) * 16);
+        // The views stop above the level left out from the making on: the
+        // first upload changes none (no slot is made again for it).
+        let before = tiled.view_levels();
+        assert_eq!(
+            before,
+            Some(ViewLevels {
+                first_held: 0,
+                first_tiled: 1,
+                dropped: 1
+            })
+        );
         let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, tiled.every_level(), copied, true);
         rig.check("the upload's tiles");
-        assert!(changed && !waiting, "changed {changed}, waiting {waiting}");
+        assert!(!changed && !waiting, "changed {changed}, waiting {waiting}");
+        assert_eq!(tiled.view_levels(), before);
         assert!(!tiled.has_tiles(0) && tiled.has_tiles(1));
         let without_top = tiled.given_bytes();
         rig.round_trip(&texture, &layout, Some(&upload));
@@ -2024,6 +2142,78 @@ void read() {
         Some(())
     }
 
+    /// (ix) A texture kept for reuse (`resource.rs` `keep_reserved`): every
+    /// tile is taken from it by one call, after which every level reads
+    /// zeros; made again level by level (a new [`Tiled`] on the same
+    /// texture), it reads what is written into the levels given and zeros
+    /// in the others. And a staging laid out from its first level kept on
+    /// (`texture.rs` `staging` for a texture that leaves levels out) lands
+    /// in the right levels.
+    fn a_texture_kept_for_reuse(rig: &mut Rig) {
+        rig.step = "step 9, a texture kept for reuse, and a staging without its left-out level";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let layout = rig.footprints(&desc);
+        let (texture, tiled) = rig.reserved(&desc);
+        rig.give(&tiled, &texture, tiled.every_level());
+        let upload = rig.filled(&layout, |level| level as u8 + 1);
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        assert!(read.iter().enumerate().all(|(level, bytes)| all(bytes, level as u8 + 1)));
+        tiled.unmap_all_on(&rig.queue, &texture);
+        rig.check("every tile taken by one call");
+        assert!(tiled.without(tiled.every_level()) == tiled.every_level(), "no level has tiles");
+        let read = rig.round_trip(&texture, &layout, None);
+        for (level, bytes) in read.iter().enumerate() {
+            assert!(all(bytes, 0), "after the tiles were taken level {level} reads {bytes:?}");
+        }
+        drop(tiled);
+        // The same texture, made again: one level left out, the staging laid
+        // out from level 1.
+        let again = Tiled::make(&rig.device, &texture, u32::from(LEVELS)).expect("cut again");
+        again.leave_out(1);
+        let copied = again.copied_now();
+        let (changed, waiting) = again.uploaded_on(&rig.queue, &rig.device, &texture, again.every_level(), copied, true);
+        rig.check("the reused texture's tiles");
+        assert!(!changed && !waiting);
+        assert!(again.has_tiles(1) && !again.has_tiles(0));
+        let first = 1u32;
+        let count = u32::from(LEVELS) - first;
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+        let mut rows = vec![0u32; count as usize];
+        let mut total = 0u64;
+        // SAFETY: outputs for `count` subresources from `first` on.
+        unsafe {
+            rig.device.GetCopyableFootprints(
+                &desc,
+                first,
+                count,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut total),
+            );
+        }
+        assert!(total * 2 < layout.total, "without level 0 the staging is far smaller ({total} of {})", layout.total);
+        let compact = Laid {
+            footprints: footprints.clone(),
+            rows,
+            wide: vec![0; count as usize],
+            total,
+        };
+        let staged = rig.filled(&compact, |i| 0x40 + i as u8 + first as u8);
+        rig.run(|list| {
+            for (i, f) in footprints.iter().enumerate() {
+                // SAFETY: an open list; live resources.
+                unsafe { list.CopyTextureRegion(&sub(&texture, first + i as u32), 0, 0, 0, &placed(&staged, *f), None) };
+            }
+        });
+        let read = rig.round_trip(&texture, &layout, None);
+        assert!(all(&read[0], 0), "the level left out reads {:?}", read[0]);
+        for (level, bytes) in read.iter().enumerate().skip(1) {
+            assert!(all(bytes, 0x40 + level as u8), "level {level} reads {bytes:?}");
+        }
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -2043,6 +2233,7 @@ void read() {
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
         }
+        a_texture_kept_for_reuse(&mut rig);
         if a_texture_without_its_top_level(&mut rig).is_none() {
             eprintln!("the test of a texture without its top level could not make its shader or objects; skipped");
         }
