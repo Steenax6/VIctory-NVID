@@ -159,17 +159,33 @@ impl Memory {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
-                // for: a structure is more than 64 KiB.
-                // shortcut: a page of a title buffer inside this one that
-                // has a copy of its own is given this copy too.
+                // for: a structure is more than 64 KiB. Not a page that
+                // lies whole in another title buffer with a copy of its
+                // own (one inside this one, or any inside a window outside
+                // buffers): the programs that bind a view of that buffer
+                // read and write the buffer's copy, so through this one a
+                // stage read stale bytes and its stores never reached them
+                // (alexanderskyequinn/victory-chapter-ii 8e68eb4ac: every
+                // one of 600 logged reload dispatches read its vertices
+                // so). Such a page is left empty: a shader that touches it
+                // notes it, and the next frame gives it the buffer's copy.
+                // shortcut: a page of a buffer whose copy is made later, or
+                // that is registered later, keeps this copy.
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     // SAFETY: inside the directory's mapping.
                     let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+                    let elsewhere = || {
+                        crate::shadow::existing(at, PAGE).is_some_and(|b| {
+                            // SAFETY: a live buffer.
+                            let flags = unsafe { b.buffer.GetDesc() }.Flags;
+                            !Arc::ptr_eq(&b, &shadow) && flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
+                        })
+                    };
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
-                        if other.read() == 0 {
+                        if other.read() == 0 && !elsewhere() {
                             other.add(1).write_volatile((at - first) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
