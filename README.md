@@ -60,6 +60,13 @@ pressed briefly every 2 s from the moment the game adds its user until it
 moves on (at most 30 s). The first-start menus come later and are left to
 you.
 
+`VICTORY_NO_WATCHDOG=1` (off by default, not yet tried here) keeps the
+title from ending itself when its main thread has stood for about 30 s (a
+long pipeline wait is enough): other forks' runs ended at `+0x23cf683` six
+to eight minutes into the world. It patches two places of the 1.0.2.1
+executable, and only when the build's hash and the bytes are the expected
+ones; the log line `title watchdog hooks` says how many applied (2).
+
 ## Faster settings
 
 `scripts\play.ps1` turns five opt-in switches on unless you set them
