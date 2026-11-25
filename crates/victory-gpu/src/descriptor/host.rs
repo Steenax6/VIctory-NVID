@@ -3209,18 +3209,10 @@ pub(crate) fn other_channels(view: u32, own: u32) -> Option<(u32, [u32; 4])> {
     const RGBA: [u32; 3] = [27, 28, 29];
     const BGRA: [u32; 3] = [90, 87, 91];
     const SRGB: [u32; 3] = [29, 91, 93];
-    // A typeless texture's view in the UNORM or sRGB format of its family
-    // (as the title's view is one or the other), a typed texture's in its
-    // own format.
-    let host = |family: [u32; 3]| {
-        if own != family[0] {
-            own
-        } else if SRGB.contains(&view) {
-            family[2]
-        } else {
-            family[1]
-        }
-    };
+    // In the UNORM or sRGB format of the texture's family, as the title's
+    // view is one or the other (`fits` keeps it on a typed texture where
+    // the host casts, else takes the texture's).
+    let host = |family: [u32; 3]| if SRGB.contains(&view) { family[2] } else { family[1] };
     match view {
         A8_UNORM if matches!(own, R8_TYPELESS | R8_UNORM) => Some((R8_UNORM, [4, 4, 4, 0])),
         R8_UNORM if own == A8_UNORM => Some((A8_UNORM, [3, 4, 4, 5])),
@@ -3287,15 +3279,18 @@ fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_
         }
     }
 }
+
+/// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
-/// view; the host refuses (and removes the device for) views without the
-/// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format. A shader view in a format with the
+/// view and reads the bytes as the view's format says; the host refuses
+/// (and removes the device for) views without the resource's permission,
+/// of typed depth, and in another family than the resource's. A view of a
+/// typed texture in another format of its family keeps that format where
+/// the host casts between the two ([`casts`]: an sRGB view of a UNORM
+/// texture converts, a UINT view of a UNORM texture reads integers), else
+/// takes the texture's format. A shader view in a format with the
 /// texture's bytes in other channels is one of the texture's family by
 /// now ([`read_through`]).
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -3346,10 +3341,63 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && !(casts(texture, own, view, unordered))
     {
         *format = d.Format;
     }
     true
+}
+
+/// Whether the host makes a view in format `view` of a typed texture in
+/// format `own` of the same family (D3D12's relaxed format casting, where
+/// the host has it: `CastingFullyTypedFormatSupported`). Never between a
+/// float and another kind, nor between SNORM and UNORM; not for depth
+/// formats; no unordered access in B8G8R8A8 or B8G8R8X8 (optional on
+/// the host). (fxceless PR #644 kept sRGB and linear RGBA8 views so; the
+/// casting rules allow every such pair.)
+fn casts(texture: &ID3D12Resource, own: u32, view: u32, unordered: bool) -> bool {
+    const FLOAT: [u32; 9] = [2, 6, 10, 16, 34, 41, 54, 95, 96];
+    const SNORM: [u32; 8] = [13, 31, 37, 51, 58, 63, 81, 84];
+    const UNORM: [u32; 22] = [11, 24, 28, 29, 35, 49, 56, 61, 71, 72, 74, 75, 77, 78, 80, 83, 87, 88, 91, 93, 98, 99];
+    const DEPTH: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
+    if own == view {
+        return true;
+    }
+    let float = |f: u32| FLOAT.contains(&f);
+    let normalized = |a: u32, b: u32| SNORM.contains(&a) && UNORM.contains(&b);
+    let pair = float(own) == float(view)
+        && !normalized(own, view)
+        && !normalized(view, own)
+        && !DEPTH.contains(&own)
+        && !DEPTH.contains(&view)
+        && !(unordered && (87..=93).contains(&view));
+    pair && typed_casting(texture)
+}
+
+/// Whether the host has relaxed format casting (asked of the device of
+/// the first texture viewed; logged once).
+fn typed_casting(texture: &ID3D12Resource) -> bool {
+    static CASTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CASTING.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a live resource's device; the query writes `options` of
+        // the size passed.
+        let asked = unsafe {
+            texture.GetDevice(&mut device).is_ok()
+                && device.is_some_and(|d| {
+                    d.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+                })
+        };
+        let supported = asked && options.CastingFullyTypedFormatSupported.as_bool();
+        tracing::info!(supported, "views of typed textures in other formats of their family (relaxed format casting)");
+        supported
+    })
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -4245,7 +4293,7 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
         // Typeless textures: in the UNORM or sRGB format the view names.
         assert_eq!(other_channels(91, 27), Some((29, [2, 1, 0, 3])));
         assert_eq!(other_channels(88, 90), Some((87, [0, 1, 2, 5])));
-        assert_eq!(other_channels(28, 91), Some((91, [2, 1, 0, 3])));
+        assert_eq!(other_channels(28, 91), Some((87, [2, 1, 0, 3])));
         // Views of their own family are left to `fits`.
         assert_eq!(other_channels(A8_UNORM, A8_UNORM), None);
         assert_eq!(other_channels(R8_UNORM, R8_TYPELESS), None);
@@ -4274,6 +4322,38 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
         let wide = bytes.map(|b| [f32::from(b) / 255.0; 4]);
         let got = read(&device, R8_UNORM, &bytes, view(A8_UNORM, all));
         assert!(near(got, wide), "A8 view with (a, a, a, a): {got:?}");
+    }
+
+    /// An sRGB view of a UNORM texture converts, a UNORM view of an sRGB
+    /// texture does not (where the host casts); an SNORM view of a UNORM
+    /// texture, which no host casts to, reads as the texture.
+    #[test]
+    fn warp_views_in_another_format_of_the_family_read_as_that_format() {
+        let Some(device) = warp() else {
+            return;
+        };
+        let bytes = [0x80; 16];
+        let linear = [[128.0 / 255.0; 4]; 4];
+        let mut srgb = [[0.215_860_5; 4]; 4];
+        for texel in &mut srgb {
+            texel[3] = 128.0 / 255.0;
+        }
+        let close = |got: [[f32; 4]; 4], want: [[f32; 4]; 4]| {
+            got.iter().flatten().zip(want.iter().flatten()).all(|(g, w)| (g - w).abs() < 0.002)
+        };
+        // SAFETY: a plain query into our own structure.
+        let casting = unsafe {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, (&raw mut options).cast(), size_of_val(&options) as u32)
+                .is_ok()
+                && options.CastingFullyTypedFormatSupported.as_bool()
+        };
+        let got = read(&device, 28, &bytes, view(29, DEFAULT));        assert!(close(got, if casting { srgb } else { linear }), "sRGB of UNORM: {got:?}");
+        let got = read(&device, 29, &bytes, view(28, DEFAULT));
+        assert!(close(got, if casting { linear } else { srgb }), "UNORM of sRGB: {got:?}");
+        let got = read(&device, 28, &bytes, view(31, DEFAULT));
+        assert!(close(got, linear), "SNORM of UNORM: {got:?}");
     }
 
     #[test]
