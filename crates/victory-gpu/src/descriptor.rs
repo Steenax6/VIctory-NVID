@@ -545,22 +545,30 @@ impl RtvRecord {
     #[cfg(windows)]
     fn host_desc<T>(&self, dimension: u32) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
-        let mut words = if self.described != 0 {
-            self.desc
+        let words = self.host_words(dimension, || crate::resource::view_format(self.resource))?;
+        // SAFETY: both host view descriptions are 24 bytes in this layout.
+        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+
+    /// [`RtvRecord::host_desc`]'s words; `own` is the format a view of the
+    /// resource must name if its host copy is typeless (none if typed). A
+    /// description in the unknown format ("the resource's") names the
+    /// title's to a typeless host copy, which has none of its own to give
+    /// (Marvisak PR #2279).
+    #[cfg(windows)]
+    fn host_words(&self, dimension: u32, own: impl FnOnce() -> Option<u32>) -> Option<[u32; 6]> {
+        let mut words = if self.described == 0 {
+            [own()?, dimension, 0, 0, 0, 0]
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            let mut words = self.desc;
+            if words[0] == 0 {
+                words[0] = own().unwrap_or(0);
+            }
+            words
         };
         // A target or depth view: of a target, in its stand-in format.
         words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
-        // SAFETY: both host view descriptions are 24 bytes in this layout.
-        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+        Some(words)
     }
 }
 
@@ -1419,6 +1427,31 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// A render or depth view description in the unknown format on a
+    /// texture the host made typeless (a depth texture shaders read) names
+    /// the title's format; on a typed one it stays unknown.
+    #[cfg(windows)]
+    #[test]
+    fn an_unknown_format_in_a_view_description_is_the_resources() {
+        let record = |format| RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: std::ptr::null(),
+            desc: [format, 3, 1, 0, 0, 0],
+        };
+        let d32 = 40;
+        assert_eq!(record(0).host_words(3, || Some(d32)).unwrap()[..3], [d32, 3, 1], "typeless host copy");
+        assert_eq!(record(0).host_words(3, || None).unwrap()[0], 0, "typed host copy");
+        assert_eq!(record(45).host_words(3, || Some(d32)).unwrap()[0], 45, "a format named is kept");
+        assert_eq!(record(0).host_words(3, || Some(118)).unwrap()[0], 45, "as the host has it");
+        let undescribed = RtvRecord {
+            described: 0,
+            ..record(0)
+        };
+        assert_eq!(undescribed.host_words(4, || Some(d32)).unwrap(), [d32, 4, 0, 0, 0, 0]);
+        assert!(undescribed.host_words(4, || None).is_none(), "the texture's own view");
     }
 
     #[cfg(windows)]

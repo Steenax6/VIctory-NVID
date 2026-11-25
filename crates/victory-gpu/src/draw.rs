@@ -727,9 +727,13 @@ impl State {
             let desc = record.desc();
             if let Some(slot) = self.target_formats.get_mut(rtvs.len()) {
                 // The view's format, else the texture's own (a view without
-                // a description).
+                // a description, or in the unknown format).
                 // SAFETY: a live resource.
-                *slot = desc.as_ref().map_or_else(|| unsafe { texture.GetDesc() }.Format, |d| d.Format);
+                *slot = desc
+                    .as_ref()
+                    .map(|d| d.Format)
+                    .filter(|f| *f != DXGI_FORMAT::default())
+                    .unwrap_or_else(|| unsafe { texture.GetDesc() }.Format);
             }
             rtvs.push(host.rtv(Some(texture), desc.as_ref()));
         }
