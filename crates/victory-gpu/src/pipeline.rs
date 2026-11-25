@@ -248,6 +248,29 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     off: false,
 });
 
+/// Whether one of `shaders` walks the ray-tracing structures: its native
+/// code has a node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`).
+#[cfg(windows)]
+fn walks_structures(shaders: &[Arc<Shader>]) -> bool {
+    use victory_shader::{Container, FourCC};
+    shaders.iter().any(|shader| {
+        let Ok(c) = Container::parse(&shader.container) else {
+            return false;
+        };
+        c.part(FourCC::DXIL)
+            .and_then(|part| victory_shader::native_programs(part.data).ok())
+            .is_some_and(|programs| programs.iter().any(walks))
+    })
+}
+
+/// Whether a console program has a ray-tracing node test.
+#[cfg(windows)]
+fn walks(program: &victory_shader::NativeProgram) -> bool {
+    victory_shader::gfx10::decode(&program.code)
+        .is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -302,12 +325,38 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// `VICTORY_BVH_BUILDER=1`: the structure builder may run ([`Builder`]).
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// The builder has run whole once ([`builder_runs`] said yes): its
+/// structures exist from then on.
+#[cfg(windows)]
+static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the title's pipeline `this` walks the ray-tracing structures
+/// (`image_bvh*_intersect_ray`) and is held back: with the builder on, until
+/// the builder has run whole once. Before that the structures are memory
+/// nothing has built, and the walk runs on whatever lies there, in a loop
+/// the title bounds at 65,535 steps a wave: on an RTX 5090 that outlasted
+/// the driver's timeout at world entry, every run (Marvisak/VIctory#2311).
+/// With the builder off (the default) walkers run as before.
+#[cfg(windows)]
+pub(crate) fn walker_held(this: This) -> bool {
+    !this.is_null()
+        && pipeline(this).walks
+        && builder_allowed()
+        && !BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -332,6 +381,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -408,6 +458,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// It walks the builder's structures ([`walker_held`]); only looked
+    /// for with the builder on.
+    #[cfg(windows)]
+    walks: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -573,6 +627,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        walks: builder_allowed() && walks_structures(&shaders),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

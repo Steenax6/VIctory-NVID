@@ -944,6 +944,9 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
+        if self.walker_held() {
+            return false;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -2279,6 +2282,26 @@ impl State {
         }
     }
 
+    /// Whether the bound pipeline walks the ray-tracing structures and
+    /// waits for the builder to have run (`crate::pipeline::walker_held`):
+    /// its draw or dispatch is dropped, and counted.
+    fn walker_held(&self) -> bool {
+        if !crate::pipeline::walker_held(self.pipeline as This) {
+            return false;
+        }
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                "a program that walks the ray-tracing structures waits until the builder has run once (VICTORY_BVH_BUILDER=1): \
+                 its draws and dispatches are dropped until then"
+            );
+        });
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::note_why("a program that walks the ray-tracing structures, before the builder has run".to_owned());
+        true
+    }
+
     /// Runs a console dispatch of `dims` with its `DispatchX` flags (0 for
     /// a plain `Dispatch`) on the host: groups, or with
     /// [`crate::list::USE_THREAD_DIMENSIONS`] threads.
@@ -2299,6 +2322,9 @@ impl State {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 self.list_dropped_roots(dims);
             }
+            return;
+        }
+        if self.walker_held() {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -3202,6 +3228,9 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        if self.walker_held() {
             return false;
         }
         const DRAW: u32 = 0;
