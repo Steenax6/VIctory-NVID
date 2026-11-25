@@ -427,6 +427,26 @@ pub(crate) fn other_targets(
     Some(targets)
 }
 
+/// The host pipeline a draw of title pipeline `this` (host pipeline `own`)
+/// draws with into views of `bound` ([`other_targets`]): `own` if the
+/// pipeline names the formats bound, else the pipeline made again for them
+/// ([`make::for_targets`]), and `own` while that is being made or if the
+/// host refuses it.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for_targets<'a>(
+    this: This,
+    own: &'a host::HostPipeline,
+    bound: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8],
+) -> &'a host::HostPipeline {
+    if own.compute {
+        return own;
+    }
+    let Some(targets) = other_targets(this, bound) else {
+        return own;
+    };
+    make::for_targets(&pipeline(this).host, targets).unwrap_or(own)
+}
+
 /// Draws whose pipeline names other render target formats than the views
 /// bound ([`other_targets`]), by pixel shader and formats: each distinct
 /// case is logged at its first draw and when its count reaches a power of

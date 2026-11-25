@@ -969,7 +969,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        let _ = crate::pipeline::other_targets(self.pipeline as This, &self.target_formats);
+        // Made again for the formats of the views bound if the pipeline
+        // names others: the console writes each target in its view's format.
+        let p = crate::pipeline::host_pipeline_for_targets(self.pipeline as This, p, &self.target_formats);
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
