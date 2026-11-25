@@ -148,6 +148,14 @@ pub(crate) fn levels_changed(start: u64) {
     RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
 }
 
+/// The starts [`levels_changed`] noted, taken (each once).
+pub(crate) fn take_levels_changed() -> Vec<u64> {
+    let mut starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
 /// Levels on demand (`crate::tiles`): where the placed textures start
 /// whose last upload left a held level without tiles (the card had no
 /// room, or no heap could be had), and when (`crate::host::moment`). A
@@ -1513,11 +1521,25 @@ impl HostHeap {
     const WAITING_A_PASS: usize = 128;
 
     pub(crate) fn texture_views_remade(&self) -> usize {
-        if self.sampler {
+        // With the views published at landings (`crate::tiles::publishing`)
+        // the slots are made again only at a moment with nothing in flight
+        // ([`remake_at_quiet_point`]), not here, while submissions run.
+        if crate::tiles::publishing() {
             return 0;
         }
         let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
-        if starts.is_empty() {
+        let flying = crate::host::submissions_in_flight() > 0;
+        let remade = self.texture_views_remade_at(&starts);
+        if flying {
+            crate::tiles::ORDER[5].fetch_add(remade as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        remade
+    }
+
+    /// [`HostHeap::texture_views_remade`] for the placed textures that
+    /// start at `starts`.
+    pub(crate) fn texture_views_remade_at(&self, starts: &[u64]) -> usize {
+        if self.sampler || starts.is_empty() {
             return 0;
         }
         let slots: Vec<u32> = {

@@ -800,6 +800,19 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+        // The list reads the texture all the same (through a table copied
+        // as it is recorded): it holds it until it is reset, as it does a
+        // texture it uploads (through its transition). Without, nothing but
+        // the idle time kept the sweep from letting the host copy go while
+        // the list was recorded and not yet sent (`VICTORY_ASYNC_SUBMIT`
+        // sends later); a texture released before the list that reads it is
+        // sent is a page fault when it runs. `VICTORY_TEXTURE_HOLD_READS=0`:
+        // not held, as before.
+        static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HOLD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOLD_READS").is_none_or(|v| v != "0")) {
+            crate::tiles::ORDER[6].fetch_add(1, Relaxed);
+            list.keep(texture);
+        }
         list.defer_texture(staging);
         return;
     }

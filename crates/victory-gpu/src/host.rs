@@ -76,6 +76,12 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Submissions started and not yet finished (landed) now: 0 when nothing
+/// the host sent can be running on the card.
+pub(crate) fn submissions_in_flight() -> u64 {
+    STARTED.load(Ordering::Acquire).saturating_sub(FINISHED.load(Ordering::Acquire))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
