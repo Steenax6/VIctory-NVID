@@ -3946,9 +3946,11 @@ fn join_copies() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
 }
 
-/// Since the last frame-rate line: title buffer copies recorded, and those
-/// that continue the one before ([`join_copies`]).
-static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Since the last frame-rate line: title buffer copies recorded, those
+/// that continue the one before ([`join_copies`]), those into bytes a copy
+/// of the same recording wrote before, and those out of bytes its shaders
+/// may write before them ([`HostList::defer_copy`]).
+static COPIES_JOINED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the last frame-rate line, what [`copy_mapped`] moved: bytes and
 /// calls into host copies of ours ([0], [1]), and into title memory ([2],
@@ -7144,6 +7146,25 @@ impl HostList {
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
+        // Counted: copies the list's order would have made differ from
+        // copies at submission. Into bytes a copy recorded before wrote
+        // (with draws between, all of them read the last copy's bytes);
+        // out of bytes the recording's shaders may write before it (the
+        // copy takes the bytes from before they ran).
+        let (dst_end, src_end) = (dst as usize + len, src as usize + len);
+        let over = |a: usize, b: usize, from: usize, to: usize| a < to && from < b;
+        if deferred
+            .copies
+            .iter()
+            .rev()
+            .take(64)
+            .any(|s| matches!(*s, Step::Copy(d, _, n) if over(d, d + n, dst as usize, dst_end)))
+        {
+            COPIES_JOINED[2].fetch_add(1, Ordering::Relaxed);
+        }
+        if deferred.hoist.written.iter().any(|&(a, b)| over(a, b, src as usize, src_end)) {
+            COPIES_JOINED[3].fetch_add(1, Ordering::Relaxed);
+        }
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
         // step.
@@ -8399,11 +8420,14 @@ impl Meter {
             }
         }
         {
-            let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [copies, joined, again, written] =
+                [0, 1, 2, 3].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if copies > 0.0 {
                 tracing::info!(
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
-                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
+                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {}); done at submission out of their \
+                     list's order: {again:.1} into bytes a copy of the same list wrote before, {written:.1} out of bytes \
+                     the list's shaders may write before them",
                     if join_copies() { "on" } else { "off" }
                 );
             }
