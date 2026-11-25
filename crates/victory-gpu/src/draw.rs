@@ -106,6 +106,22 @@ const BAKE_PIXEL_SHADERS: [&str; 4] =
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Whether the constant buffers of fresh tables that lie in a copy in the
+/// card's memory (256-byte aligned there) are read from that copy, as the
+/// constants in memory shaders were seen to write are
+/// (`crate::host::fill_hot`), and not filled into upload memory: the copy
+/// takes the title's bytes before the submission's lists run, so the draw
+/// sees them and what earlier lists wrote, and it reads the card's memory.
+/// A fill reads title memory on the CPU at the submission, behind every
+/// flight that may write it (on an RTX 4070, Series S profile: 10.7 ->
+/// 11.1 frames a second and no fill waiting for the card, realblastex/
+/// flamingo run 41; theinkbit/victory-lot9-next ffd04e130). On;
+/// `VICTORY_CARD_CONSTANTS=0` fills them, as before.
+fn card_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_CONSTANTS").is_none_or(|v| v != "0"))
+}
+
 /// Whether a buffer range a shader names through an unordered access view
 /// is given to shaders as written (snapshot before the submission, compare
 /// and write back after) only if that shader's code can store to buffers.
@@ -2931,12 +2947,19 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        // Constants in memory shaders were seen to write:
-                        // read from the buffer's host copy, where the card
-                        // finds what the lists before this one wrote
-                        // (`crate::host::fill_hot`).
-                        if crate::host::fill_hot(address as usize, size as usize)
-                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                        // Constants in memory shaders were seen to write,
+                        // or in a copy in the card's memory: read from the
+                        // buffer's host copy, where the card finds what the
+                        // lists before this one wrote (`crate::host::fill_hot`,
+                        // [`card_constants`]).
+                        let found = if crate::host::fill_hot(address as usize, size as usize) {
+                            crate::shadow::find(address, u64::from(size))
+                        } else if card_constants() {
+                            crate::shadow::existing(address, u64::from(size)).filter(|s| s.carded())
+                        } else {
+                            None
+                        };
+                        if let Some(shadow) = found
                             && shadow.gpu(address).is_multiple_of(256)
                         {
                             shadow.refresh(list, address, u64::from(size));

@@ -4477,6 +4477,16 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// The copy of the innermost title buffer holding `[address, address +
+/// len)` if it has one already: nothing is made (a window outside buffers
+/// is not looked for).
+pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+    let key = buffer_for(&map, address, end)?;
+    map.get(&key).and_then(|e| e.shadow.clone())
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the
