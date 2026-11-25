@@ -178,6 +178,7 @@ these are an NVIDIA card's.
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
 | `VICTORY_TITLE_ASSERTS=<n>` | continue past up to `n` `int3` asserts in the game's code, where the first one ends the process; the check counts as passed, so what follows is undefined and the run is not one to trust |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
+| `VICTORY_TITLE_DEBUGINFO=<seconds>` | the title writes the debug info block its crash handler attaches (frame, streaming requests, tile heap, entity pools, camera, mission) every that many seconds into the log, as `title debug info:` lines; its builder is known for the 1.0.2.1 executable, `VICTORY_TITLE_DEBUGINFO_RVA=<hex>` names it for another (diagnostics build; fxceless/victory-fork pull request #643) |
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built (objects can go missing meanwhile) |
 | `VICTORY_TABLED_SKIP_FRAMES=off` | upstream's 240-frame window for table-read descriptor slots; steenax uses 2 frames, since the window crashed at world entry (upstream pull request #827) |
 | `VICTORY_BACK_RUN_GAP=0` | every run of a copy-back is a write of its own; by default runs under 64 bytes apart are one write (upstream pull request #857) |
