@@ -52,8 +52,40 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
 (`-Cache`, `-Data`; by default under `%LOCALAPPDATA%\steenax`) and presses no buttons for you. Controller: XInput pads
-(a DualShock/DualSense through DS4Windows works). With no pad connected the
-keyboard acts as one while the game window has focus (Enter is A).
+(a DualShock/DualSense through DS4Windows works); the keyboard and mouse
+play as a pad while the game window has focus (Enter is A; see "Keyboard and
+mouse"). A tap
+shorter than a frame is not lost: a button or key pressed between two of the
+game's reads stays pressed for its next read, and the release follows in the
+read after (`VICTORY_INPUT_LATCH=0` turns this off).
+
+### Keyboard and mouse
+
+The game reads pads only, so the keyboard and mouse act as a pad: on the
+first connected pad (both work at once; each stick follows whichever moved
+it last), or on a stand-in pad when none is. Click into the game window to
+capture the mouse: the cursor is hidden and held in the window, and its
+motion is the right stick, turned into a rate at each of the game's reads
+so the same hand movement turns the same angle at any frame rate. Esc frees
+the cursor (and opens the menu) and captures it again; Alt-Tab, losing
+focus or sizing the window frees it. Starting the game or switching to it
+does not capture it.
+
+| Keys | Pad |
+|------|-----|
+| W A S D / I J K L, mouse | left stick / right stick |
+| arrows | D-pad |
+| Enter, Backspace, X, Y | A, B, X, Y |
+| Q / E | LB / RB |
+| Z / C, right / left mouse button | LT / RT |
+| F / H, middle mouse button | stick clicks (LS / RS, RS) |
+| Esc, Tab | Menu, View |
+
+Rebind everything in `[controls]` of `victory.toml` (see
+`victory.example.toml`): sensitivity, inversion, the game's stick dead zone
+(0.3 by default, measured), letters by their place on a US keyboard
+(`keys_by_position`), walk speed, mouse buttons and wheel, and a second
+layout a key can switch to.
 
 `VICTORY_AUTO_START=1` answers the start screen's "press A" for you: A is
 pressed briefly every 2 s from the moment the game adds its user until it
@@ -236,7 +268,9 @@ these are an NVIDIA card's.
 | Switch | Effect |
 |---|---|
 | `VICTORY_CAPTURE=<dir>` + `VICTORY_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
-| `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
+| `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build); the key bindings make them pad input |
+| `VICTORY_KBM=30:W*2,31:MouseX=400*0.5,33:MouseLeft` | play keys, mouse motion (counts over the hold) and wheel steps into the keyboard and mouse pad (diagnostics build) |
+| `VICTORY_LOG=victory_hle::modules::gameinput=debug` | log each pad state the game reads |
 | `VICTORY_TITLE_ASSERTS=<n>` | continue past up to `n` `int3` asserts in the game's code, where the first one ends the process; the check counts as passed, so what follows is undefined and the run is not one to trust |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
 | `VICTORY_TITLE_DEBUGINFO=<seconds>` | the title writes the debug info block its crash handler attaches (frame, streaming requests, tile heap, entity pools, camera, mission) every that many seconds into the log, as `title debug info:` lines; its builder is known for the 1.0.2.1 executable, `VICTORY_TITLE_DEBUGINFO_RVA=<hex>` names it for another (diagnostics build; fxceless/victory-fork pull request #643) |
