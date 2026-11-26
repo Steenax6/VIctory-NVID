@@ -793,6 +793,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        crate::resubmit::submitted(this, lists);
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -886,6 +887,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    crate::resubmit::signalled(this, fence, value);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(crate::fence::FenceRef::new(fence), value)) {

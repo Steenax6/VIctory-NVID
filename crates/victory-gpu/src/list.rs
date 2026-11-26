@@ -618,7 +618,12 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
-    object::release_boxed::<List>(this)
+    let left = object::release_boxed::<List>(this);
+    #[cfg(windows)]
+    if left == 0 {
+        crate::resubmit::forget(this);
+    }
+    left
 }
 extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
@@ -635,6 +640,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    // What is recorded next is not the recording submitted before.
+    #[cfg(windows)]
+    crate::resubmit::forget(this);
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
         .lock()
