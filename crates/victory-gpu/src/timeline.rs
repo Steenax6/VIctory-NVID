@@ -40,6 +40,101 @@ mod on {
         EVENTS.lock().unwrap_or_else(|e| e.into_inner()).push((at, thread, what, a, b));
     }
 
+    /// Whether events are kept now.
+    #[inline]
+    pub(crate) fn on() -> bool {
+        STATE.load(Relaxed) == 1
+    }
+
+    /// Runs `take` (the taking of a lock, or another wait) and, while events
+    /// are kept, says so if it took 0.2 ms or more: the event `name` with
+    /// the microseconds it took.
+    #[inline]
+    pub(crate) fn waited<T>(name: &'static str, take: impl FnOnce() -> T) -> T {
+        if !on() {
+            return take();
+        }
+        let started = Instant::now();
+        let taken = take();
+        let us = started.elapsed().as_micros() as u64;
+        if us >= 200 {
+            ev(name, us, 0);
+        }
+        taken
+    }
+
+    /// The steps of one piece of work, each said when it ends with the
+    /// microseconds since the one before ([`Steps::mark`]).
+    pub(crate) struct Steps(Option<Instant>);
+
+    impl Steps {
+        #[inline]
+        pub(crate) fn begin() -> Steps {
+            Steps(on().then(Instant::now))
+        }
+
+        /// The microseconds since the last mark (0 while no events are
+        /// kept), and the clock starts again.
+        #[inline]
+        pub(crate) fn lap(&mut self) -> u64 {
+            match &mut self.0 {
+                Some(last) => {
+                    let now = Instant::now();
+                    let us = (now - *last).as_micros() as u64;
+                    *last = now;
+                    us
+                }
+                None => 0,
+            }
+        }
+
+        /// The event `what` with the microseconds since the last mark and
+        /// `b`.
+        #[inline]
+        pub(crate) fn mark(&mut self, what: &'static str, b: u64) {
+            if self.0.is_some() {
+                let us = self.lap();
+                ev(what, us, b);
+            }
+        }
+    }
+
+    thread_local! {
+        /// Sums a thread keeps for its next [`took`]: microseconds by slot.
+        static SUMS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    }
+
+    /// Adds the time since `started` to this thread's sum `slot`, while
+    /// events are kept (`started` from [`clock`]).
+    #[inline]
+    pub(crate) fn sum(slot: usize, started: Option<Instant>) {
+        if let Some(started) = started {
+            let us = started.elapsed().as_micros() as u64;
+            SUMS.with(|s| {
+                let mut sums = s.get();
+                sums[slot] += us;
+                s.set(sums);
+            });
+        }
+    }
+
+    /// The clock for [`sum`]: read only while events are kept.
+    #[inline]
+    pub(crate) fn clock() -> Option<Instant> {
+        on().then(Instant::now)
+    }
+
+    /// This thread's sum `slot`, taken.
+    #[inline]
+    pub(crate) fn took(slot: usize) -> u64 {
+        SUMS.with(|s| {
+            let mut sums = s.get();
+            let us = std::mem::take(&mut sums[slot]);
+            s.set(sums);
+            us
+        })
+    }
+
     /// At every present call, before anything else of it.
     pub(crate) fn present(frame: u64) {
         match STATE.load(Relaxed) {
@@ -91,7 +186,7 @@ mod on {
 #[cfg(feature = "diagnostics")]
 pub use on::ev;
 #[cfg(feature = "diagnostics")]
-pub(crate) use on::present;
+pub(crate) use on::{Steps, clock, on, present, sum, took, waited};
 
 /// Ends a span begun with [`span`]: its end event when dropped.
 pub(crate) struct Span(&'static str, u64);
@@ -116,3 +211,49 @@ pub fn ev(_what: &'static str, _a: u64, _b: u64) {}
 #[cfg(not(feature = "diagnostics"))]
 #[inline(always)]
 pub(crate) fn present(_frame: u64) {}
+
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+pub(crate) fn on() -> bool {
+    false
+}
+
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+pub(crate) fn waited<T>(_name: &'static str, take: impl FnOnce() -> T) -> T {
+    take()
+}
+
+/// Without diagnostics: nothing is timed.
+#[cfg(not(feature = "diagnostics"))]
+pub(crate) struct Steps;
+
+#[cfg(not(feature = "diagnostics"))]
+impl Steps {
+    #[inline(always)]
+    pub(crate) fn begin() -> Steps {
+        Steps
+    }
+    #[inline(always)]
+    pub(crate) fn lap(&mut self) -> u64 {
+        0
+    }
+    #[inline(always)]
+    pub(crate) fn mark(&mut self, _what: &'static str, _b: u64) {}
+}
+
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+pub(crate) fn clock() -> Option<std::time::Instant> {
+    None
+}
+
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+pub(crate) fn sum(_slot: usize, _started: Option<std::time::Instant>) {}
+
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+pub(crate) fn took(_slot: usize) -> u64 {
+    0
+}

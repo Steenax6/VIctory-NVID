@@ -56,6 +56,8 @@ mod placed;
 mod primitive;
 #[cfg(windows)]
 mod rawrange;
+#[cfg(windows)]
+mod read_census;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
