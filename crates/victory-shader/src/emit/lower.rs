@@ -278,6 +278,10 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// A program whose host waves are the console's but whose group a host wave may hold as a
+    /// tile (see [`may_tile`]): the LDS dword of `wave_base`'s counter, by which its threads
+    /// are relabelled.
+    relabel: Option<u32>,
     wave_base: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
@@ -1080,6 +1084,17 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Whether a host may fill its waves with tiles of a group of this shape rather than with runs
+/// of flat thread ids: a group of several rows whose rows are 32 threads wide or more, or not a
+/// power of two wide. (Measured with a program that stores at its own relabelled id, upstream:
+/// groups of 32x2, 32x8, 64x4, 32x32 and 32x2x2 stored half their ids on an RTX 3070 Ti and an
+/// RDNA2 GPU, rows 24, 12 and 10 wide likewise on an RTX 5070 Ti; 8x4, 8x8, 16x2, 16x16, 4x4x4
+/// and one-row groups stored all of them.)
+fn may_tile(threads: [u32; 3]) -> bool {
+    let [x, y, z] = threads;
+    y * z > 1 && (x >= 32 || !x.is_power_of_two())
+}
+
 /// Where a program's constant table starts in its code: where its
 /// instructions end, unless a load at a fixed offset reads below that (then
 /// at `lowest`, the lowest offset any load or descriptor names). The
@@ -1131,6 +1146,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // a program in host waves of the console's size whose group a host wave may tile
+        let mut relabel: Option<u32> = None;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
         if let StageIo::Cs(cs) = x.native.io
             && paired
@@ -1278,6 +1295,17 @@ impl<'a> Lower<'a> {
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            // The console's waves hold runs of flat thread ids; a host may fill its waves with
+            // tiles of the group instead, and then the relabelling by the wave's first flat id
+            // gives two waves the same ids: the threads are handed out by a counter instead
+            // (in whole waves, so not for a group with a part-filled wave, which might take
+            // the first run).
+            // shortcut: such a group keeps the relabelling by flat id.
+            if halves.is_none() && console_lanes && !one_wave && group % wave == 0 && may_tile(cs.threads) {
+                let slot = if s.lds_dwords < 8192 { s.lds_dwords } else { 0 };
+                s.lds_dwords = s.lds_dwords.max(slot + 1);
+                relabel = Some(slot);
             }
         }
         // The title's barriers a thread of the group may never reach, which
@@ -1435,6 +1463,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            relabel,
             wave_base: None,
             flat: None,
             sums64: HashMap::new(),
@@ -3727,7 +3756,7 @@ impl<'a> Lower<'a> {
     /// lane adds 32 (64) and the wave takes what it found. Branch-free, in the entry block,
     /// which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = self.halves.or(self.relabel)?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -3740,7 +3769,13 @@ impl<'a> Lower<'a> {
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        let step = self.s.m.i32(if self.twin.is_some() { 64 } else { 32 });
+        let step = match (self.twin.is_some(), self.relabel) {
+            (true, _) => 64,
+            // (a host wave of the console's size)
+            (false, Some(_)) => self.s.wave_size.unwrap_or(32),
+            (false, None) => 32,
+        };
+        let step = self.s.m.i32(step);
         let add = self.s.m.select(e, first, step, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
@@ -4227,7 +4262,7 @@ impl<'a> Lower<'a> {
         };
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() || self.twin.is_some() {
+        if self.halves.is_some() || self.relabel.is_some() || self.twin.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -11084,6 +11119,17 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// The group shapes whose waves a host may fill with tiles, by upstream's measurements.
+    #[test]
+    fn groups_a_host_wave_may_tile_are_relabelled_by_counter() {
+        for tiles in [[32, 2, 1], [32, 8, 1], [64, 4, 1], [32, 32, 1], [32, 2, 2], [24, 4, 1], [12, 8, 1], [10, 10, 1]] {
+            assert!(super::may_tile(tiles), "{tiles:?}");
+        }
+        for runs in [[8, 4, 1], [4, 4, 1], [8, 8, 1], [16, 2, 1], [16, 16, 1], [4, 4, 4], [2, 2, 16], [64, 1, 1], [256, 1, 1]] {
+            assert!(!super::may_tile(runs), "{runs:?}");
+        }
+    }
 
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.
