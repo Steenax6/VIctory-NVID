@@ -485,10 +485,22 @@ fn threads() -> usize {
     std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize).clamp(1, 16)
 }
 
+/// The translating threads' priority (`VICTORY_THIN_PRIORITY`, a Windows
+/// thread priority from -2 to 2; 0, normal, unless told).
+fn priority() -> i32 {
+    std::env::var("VICTORY_THIN_PRIORITY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0i32).clamp(-2, 2)
+}
+
 fn start() {
     let threads = threads();
+    let priority = priority();
     for i in 0..threads {
         let worker = move || {
+            if priority != 0 {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                // SAFETY: this thread's own priority.
+                unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+            }
             TRANSLATES.set(true);
             crate::queue::no_drain_here();
             loop {
@@ -512,7 +524,7 @@ fn start() {
         }
     }
     BURIES.store(true, Release);
-    tracing::info!(threads, "list calls are written down and translated by threads of ours (VICTORY_THIN=1)");
+    tracing::info!(threads, priority, "list calls are written down and translated by threads of ours (VICTORY_THIN=1)");
 }
 
 /// Closes the recordings of submitted `lists` and gives them, in order (a

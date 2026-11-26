@@ -462,7 +462,8 @@ present, and a submission of ours that is waited for, first wait until every
 submitted recording is translated.
 
 - `VICTORY_THIN_THREADS=<n>` (6 unless told, 1 to 16): the translating
-  threads, at normal priority.
+  threads. `VICTORY_THIN_PRIORITY=<-2..2>` (0, normal, unless told): their
+  Windows thread priority.
 - `VICTORY_THIN_CHECK=1` (diagnostics build): for every draw and dispatch the
   first 256 bytes of each bound descriptor table and root view are hashed at
   the call and again at translation; the line "thin check" counts the draws
