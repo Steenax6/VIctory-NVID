@@ -3626,6 +3626,35 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         },
                     };
                     crate::tiles::shape_view(desc.get_or_insert(whole), levels, u32::from(own.MipLevels));
+                } else if let Some(first) = crate::texture::levels_shown_from(resource) {
+                    // Uploaded whole while it streams in: shown from its first
+                    // level whose pages are there, its larger ones zeros
+                    // until then (`crate::texture` `note_levels_there`). A
+                    // view the title gave is clamped (2D and 2D arrays; a
+                    // clamp of its own is kept if higher); the default view
+                    // of a one-layer 2D texture too. Cubes, volumes and the
+                    // default view of an array are not: they show the zeros.
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() };
+                    if desc.is_none() && own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && own.DepthOrArraySize == 1
+                    {
+                        desc = Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: own.Format,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: 5768,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MostDetailedMip: 0,
+                                    MipLevels: u32::MAX,
+                                    PlaneSlice: 0,
+                                    ResourceMinLODClamp: 0.0,
+                                },
+                            },
+                        });
+                    }
+                    if let Some(desc) = desc.as_mut() {
+                        crate::tiles::clamp_from(desc, first, u32::from(own.MipLevels));
+                    }
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

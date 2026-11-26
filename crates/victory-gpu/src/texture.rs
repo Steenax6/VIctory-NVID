@@ -96,6 +96,9 @@ pub(crate) struct Staging {
     /// holds zeros): a refresh that could not read memory leaves a texture
     /// that held bytes as it was, but must not leave this one empty.
     filled: std::sync::atomic::AtomicBool,
+    /// The first level its views show while its most detailed levels' pages
+    /// are not there; 0: all ([`Staging::note_levels_there`]).
+    shown_from: std::sync::atomic::AtomicU32,
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -605,6 +608,16 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Its views' clamp goes with it: a texture made there next starts
+        // from none (`Staging::note_levels_there`).
+        if self.shown_from.load(Relaxed) != 0 {
+            let mut map = SHOWN_FROM.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(map) = map.as_mut() {
+                map.remove(&(self.memory as u64));
+                SHOWN_ANY.store(!map.is_empty(), Relaxed);
+            }
+            crate::descriptor::host::levels_changed(self.memory as u64);
+        }
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
@@ -1332,7 +1345,9 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
-        if !committed(self.memory, size) {
+        let mapped = committed(self.memory, size);
+        self.note_levels_there(mapped);
+        if !mapped {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
@@ -1480,124 +1495,111 @@ impl Staging {
         // Every staged level written: what a spare buffer held is gone.
         self.stale.store(false, std::sync::atomic::Ordering::Relaxed);
         self.filled.store(true, std::sync::atomic::Ordering::Relaxed);
-        if !self.on_demand {
-            self.fill_missing_levels();
-        }
     }
 
-    /// A texture still streaming in has its smaller levels first (they lie
-    /// at the start of its memory, or their pages come first): the larger
-    /// ones read as zeros until their pages arrive. Sampled, the zeros came
-    /// out black, and only triangle edges (whose wide derivatives pick a
-    /// smaller level) showed the texture: a wire net over black clothes and
-    /// props (AntoninMichelq/VIctory-forkAMD 440e19e5ee). A level that is all
-    /// zeros above one that is not takes the nearest smaller level that is
-    /// not, each element repeated; the next detiling, once its pages are
-    /// there, writes its own texels. Not for a texture made level by level
-    /// (`crate::tiles`): its levels without the title's bytes are not shown.
-    /// `VICTORY_TEXTURE_FILL_LEVELS=0` leaves the zeros.
-    fn fill_missing_levels(&self) {
+    /// A texture uploaded whole while it streams in has its small levels
+    /// first; the large ones are pages not there yet and read as zeros.
+    /// Sampled, the zeros came out black, and only triangle edges (whose
+    /// wide derivatives pick a smaller level) showed the texture: a wire net
+    /// over black clothes and props (AntoninMichelq/VIctory-forkAMD
+    /// 440e19e5ee). Which levels have their pages is known without looking
+    /// at a byte: the first level from which every level is all mapped, in
+    /// every layer. Views of the texture are clamped there
+    /// ([`levels_shown_from`]), as the views of textures made level by level
+    /// are, and the clamp goes when the pages come; nothing is filled on the
+    /// processor. Not for a texture made level by level (`crate::tiles`
+    /// clamps its own views).
+    fn note_levels_there(&self, mapped: bool) {
         use std::sync::atomic::Ordering::Relaxed;
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let mips = self.mips as usize;
-        if mips < 2
-            || self.first != 0
-            || !self.footprints.len().is_multiple_of(mips)
-            || !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL_LEVELS").is_none_or(|v| v != "0"))
-        {
+        if self.on_demand || self.mips < 2 {
             return;
         }
-        let n = self.layout.desc.element_bytes as usize;
-        for slice in 0..self.footprints.len() / mips {
-            // Of each level: offset, row pitch, width and rows in elements.
-            let levels: Option<Vec<(usize, usize, usize, usize)>> = (0..mips)
-                .map(|k| {
-                    let i = slice * mips + k;
-                    let f = self.footprints[i].Footprint;
-                    let m = self.layout.mips.get(k)?;
-                    (f.Depth == 1 && m.depth <= 1).then_some((
-                        self.footprints[i].Offset as usize,
-                        f.RowPitch as usize,
-                        m.width as usize,
-                        (self.rows[i] as usize).min(m.height as usize),
-                    ))
-                })
-                .collect();
-            let Some(levels) = levels else {
-                return;
+        let first = if mapped { 0 } else { self.first_level_there() };
+        if self.shown_from.swap(first, Relaxed) == first {
+            return;
+        }
+        let start = self.memory as u64;
+        {
+            let mut map = SHOWN_FROM.lock().unwrap_or_else(|e| e.into_inner());
+            let map = map.get_or_insert_with(HashMap::new);
+            if first == 0 {
+                map.remove(&start);
+            } else {
+                map.insert(start, first);
+            }
+            SHOWN_ANY.store(!map.is_empty(), Relaxed);
+        }
+        // The texture's slots are made again at the next texture pass.
+        crate::descriptor::host::levels_changed(start);
+    }
+
+    /// The first level from which every level of every layer has all its
+    /// pages ([`Staging::note_levels_there`]); the level count if even the
+    /// last has not.
+    fn first_level_there(&self) -> u32 {
+        let layout = &self.layout;
+        let n = u64::from(layout.desc.element_bytes);
+        let slices = layout.slices.max(1);
+        let there = |mip: u32| {
+            let Some(m) = layout.mips.get(mip as usize) else {
+                return false;
             };
-            // SAFETY: the mapped staging buffer of `bytes` bytes, which
-            // nothing else touches while it is detiled.
-            let data = unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes as usize) };
-            let filled = fill_zero_levels(data, &levels, n);
-            if filled > 0 {
-                FILLED_LEVELS.fetch_add(filled, Relaxed);
-            }
-        }
-    }
-}
-
-/// [`Staging::fill_missing_levels`] on one layer's levels in `data`, most
-/// detailed first: each as its offset, row pitch, width and rows in
-/// elements of `n` bytes. Returns the levels filled.
-fn fill_zero_levels(data: &mut [u8], levels: &[(usize, usize, usize, usize)], n: usize) -> u64 {
-    let fits = levels.iter().all(|&(offset, pitch, w, h)| {
-        h == 0 || (pitch >= w * n && offset + (h - 1) * pitch + w * n <= data.len())
-    });
-    if !fits {
-        return 0;
-    }
-    let row = |k: usize, y: usize| {
-        let (offset, pitch, w, _) = levels[k];
-        offset + y * pitch..offset + y * pitch + w * n
-    };
-    let zero: Vec<bool> =
-        (0..levels.len()).map(|k| (0..levels[k].3).all(|y| data[row(k, y)].iter().all(|&b| b == 0))).collect();
-    let mut filled = 0;
-    for k in 0..levels.len() {
-        if !zero[k] {
-            continue;
-        }
-        let Some(d) = (k + 1..levels.len()).find(|&j| !zero[j]).map(|j| j - k) else {
-            break;
+            (0..slices).all(|slice| {
+                let (Ok(first), Ok(last)) = (
+                    layout.offset(mip, 0, 0, slice),
+                    layout.offset(mip, m.width.saturating_sub(1), m.height.saturating_sub(1), slice),
+                ) else {
+                    return false;
+                };
+                let (from, to) = (first.min(last), first.max(last) + n);
+                committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
+            })
         };
-        let (_, _, w, h) = levels[k];
-        let (_, _, sw, sh) = levels[k + d];
-        if sw == 0 || sh == 0 {
-            continue;
+        let mut first = self.mips;
+        while first > 0 && there(first - 1) {
+            first -= 1;
         }
-        for y in 0..h {
-            let from = data[row(k + d, (y >> d).min(sh - 1))].to_vec();
-            let to = &mut data[row(k, y)];
-            for x in 0..w {
-                let sx = (x >> d).min(sw - 1);
-                to[x * n..][..n].copy_from_slice(&from[sx * n..][..n]);
-            }
-        }
-        filled += 1;
+        first
     }
-    filled
 }
 
-/// Levels of streaming textures filled from a smaller one since the start
-/// (`Staging::fill_missing_levels`).
-pub(crate) static FILLED_LEVELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Where a texture uploaded whole while it streams in has its first level
+/// with every page there, by where its title memory starts, for those that
+/// do not have all ([`Staging::note_levels_there`]).
+static SHOWN_FROM: Mutex<Option<HashMap<u64, u32>>> = Mutex::new(None);
+/// Whether [`SHOWN_FROM`] holds any: views are made by the thousand a frame
+/// and look at it without its lock while it is empty.
+static SHOWN_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The level views of title texture `resource` are clamped to (above 0)
+/// while its most detailed levels' pages are not there
+/// ([`Staging::note_levels_there`]).
+pub(crate) fn levels_shown_from(resource: This) -> Option<u32> {
+    if !SHOWN_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let (memory, _) = crate::resource::texture_memory(resource)?;
+    let map = SHOWN_FROM.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?.get(&(memory as u64)).copied()
+}
 
 /// Textures found changed with no write their guard saw, hashed at every
 /// check since (`Last::behind_guard`), since the start.
 static BEHIND_GUARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The line on levels filled from a smaller one ([`FILLED_LEVELS`]) and on
-/// textures written behind their guards ([`BEHIND_GUARD`]), every few
-/// seconds; nothing while there are none.
+/// The line on textures shown from a smaller level while their large
+/// levels' pages are not there ([`SHOWN_FROM`]) and on textures written
+/// behind their guards ([`BEHIND_GUARD`]), every few seconds; nothing while
+/// there are none.
 pub(crate) fn filled_line() {
     use std::sync::atomic::Ordering::Relaxed;
-    let (filled, behind) = (FILLED_LEVELS.load(Relaxed), BEHIND_GUARD.load(Relaxed));
-    if filled + behind > 0 {
+    let clamped = SHOWN_FROM.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashMap::len);
+    let behind = BEHIND_GUARD.load(Relaxed);
+    if clamped as u64 + behind > 0 {
         tracing::info!(
-            "since the start: {filled} levels of streaming textures that were all zeros shown from the nearest smaller \
-             level until their pages come (VICTORY_TEXTURE_FILL_LEVELS=0 leaves the zeros); {behind} textures found \
-             written through another view, behind their guards, hashed at every check since"
+            "textures streaming in, shown from their first level whose pages are all there (their views clamped), now: \
+             {clamped}; since the start: {behind} textures found written through another view, behind their guards, \
+             hashed at every check since"
         );
     }
 }
@@ -2036,6 +2038,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let s = Arc::new(Staging {
         remapped,
         filled: std::sync::atomic::AtomicBool::new(false),
+        shown_from: std::sync::atomic::AtomicU32::new(0),
         buffer,
         #[cfg(feature = "diagnostics")]
         size: total,
@@ -2095,6 +2098,40 @@ mod remap_tests {
             assert!(!staging.remapped.load(Relaxed), "the check took the flag");
         }
         // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A texture uploaded whole while its most detailed level's pages are
+    /// not there is shown from the first level that has them, and from all
+    /// once they come.
+    #[test]
+    fn a_texture_streaming_in_is_shown_from_the_levels_that_are_there() {
+        use windows_sys::Win32::System::Memory::*;
+        const RUN: usize = 0x1_0000;
+        // A linear 256x256 RGBA8 texture of nine levels: the console puts
+        // the small levels first (level 8 at 0, level 1 ends at 98,044) and
+        // level 0 behind them, up to 360,192; only the first two runs are
+        // there.
+        // SAFETY: a private reservation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 6 * RUN, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: the first two runs of the reservation above.
+        assert!(!unsafe { VirtualAlloc(base, 2 * RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let description = [3, 0, 0, 0, 256, 0, 256, 0x9_0001, 28, 1, 0, 1, 0, 0];
+        let made = crate::resource::texture_at(base as u64, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            Some((resource, super::staging(resource, host_texture)?))
+        });
+        if let Some((resource, staging)) = made {
+            staging.refresh();
+            assert_eq!(super::levels_shown_from(resource), Some(1), "level 0's pages are not there");
+            // SAFETY: the whole reservation above.
+            assert!(!unsafe { VirtualAlloc(base, 6 * RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+            super::remapped(base as usize, 6 * RUN);
+            staging.refresh();
+            assert_eq!(super::levels_shown_from(resource), None, "all there: no clamp");
+        }
+        // SAFETY: the reservation above, released once.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
@@ -2240,43 +2277,6 @@ mod digest_tests {
         timed("digest", &|| {
             std::hint::black_box(digest(&bytes));
         });
-    }
-}
-
-#[cfg(test)]
-mod fill_tests {
-    use super::fill_zero_levels;
-
-    /// A 4x4, 2x2, 1x1 chain of 1-byte elements, rows 8 bytes apart.
-    const LEVELS: [(usize, usize, usize, usize); 3] = [(0, 8, 4, 4), (32, 8, 2, 2), (48, 8, 1, 1)];
-
-    #[test]
-    fn zero_levels_take_the_nearest_smaller_level_that_is_not() {
-        let mut data = vec![0u8; 56];
-        // Levels 1 and 2 are there, level 0 is not.
-        data[32..34].copy_from_slice(&[1, 2]);
-        data[40..42].copy_from_slice(&[3, 4]);
-        data[48] = 9;
-        assert_eq!(fill_zero_levels(&mut data, &LEVELS, 1), 1);
-        let level0: Vec<u8> = (0..4).flat_map(|y| data[y * 8..y * 8 + 4].to_vec()).collect();
-        assert_eq!(level0, [1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4]);
-        // Padding between rows is not written.
-        assert!(data[4..8].iter().all(|&b| b == 0));
-        // Only the last level there: both larger ones from it.
-        let mut data = vec![0u8; 56];
-        data[48] = 7;
-        assert_eq!(fill_zero_levels(&mut data, &LEVELS, 1), 2);
-        assert!((0..4).all(|y| data[y * 8..y * 8 + 4].iter().all(|&b| b == 7)));
-        assert_eq!(&data[32..34], &[7, 7]);
-        // Nothing there, or everything: nothing changes.
-        let mut data = vec![0u8; 56];
-        assert_eq!(fill_zero_levels(&mut data, &LEVELS, 1), 0);
-        assert!(data.iter().all(|&b| b == 0));
-        let mut data = vec![5u8; 56];
-        assert_eq!(fill_zero_levels(&mut data, &LEVELS, 1), 0);
-        // Levels that do not fit the buffer: left alone.
-        let mut short = vec![0u8; 40];
-        assert_eq!(fill_zero_levels(&mut short, &LEVELS, 1), 0);
     }
 }
 
