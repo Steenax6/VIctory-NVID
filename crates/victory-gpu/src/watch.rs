@@ -72,10 +72,225 @@ pub(crate) struct Written {
 /// [`Written::mask`] of a page written anywhere, or not known where.
 pub(crate) const FULL: u16 = u16::MAX;
 
+/// A page nothing was noted of: askings are numbered from 1.
+const UNNOTED: Written = Written { at: 0, before: 0, mask: 0 };
+/// Pages in a chunk of [`Pages`] (64 MiB of address space), and the pages
+/// it holds in chunks: the title's addresses (40 bits).
+const CHUNK_PAGES: usize = 1 << 10;
+const NEAR_PAGES: usize = (1 << 40) / PAGE;
+
+/// What the journal knows of each 64 KiB page ([`Written`]), by page
+/// number: a table in chunks, made where a page is first noted, for the
+/// title's addresses, and a map for whatever lies above them.
+///
+/// It was a map for all of it. A refresh asks for the entries of its whole
+/// range (2,784 pages for the title's 174 MB buffer, fifteen times a
+/// frame), and walking the map's nodes for them was 4 ms a frame of the
+/// submitting thread (profile of 2026-11-26: `entries` 3.97 ms); a chunk is
+/// walked as an array.
+struct Pages {
+    chunks: Vec<Option<Box<[Written]>>>,
+    far: BTreeMap<usize, Written>,
+}
+
+impl Pages {
+    const fn new() -> Pages {
+        Pages { chunks: Vec::new(), far: BTreeMap::new() }
+    }
+
+    /// What is noted of `page`, if anything is.
+    fn get_mut(&mut self, page: usize) -> Option<&mut Written> {
+        if page >= NEAR_PAGES {
+            return self.far.get_mut(&page);
+        }
+        self.chunks
+            .get_mut(page / CHUNK_PAGES)?
+            .as_mut()?
+            .get_mut(page % CHUNK_PAGES)
+            .filter(|w| w.at != 0)
+    }
+
+    /// Notes `w` (an asking's number is never 0) of `page`.
+    fn insert(&mut self, page: usize, w: Written) {
+        if page >= NEAR_PAGES {
+            self.far.insert(page, w);
+            return;
+        }
+        let chunk = page / CHUNK_PAGES;
+        if self.chunks.len() <= chunk {
+            self.chunks.resize_with(chunk + 1, || None);
+        }
+        let entries = self.chunks[chunk].get_or_insert_with(|| vec![UNNOTED; CHUNK_PAGES].into_boxed_slice());
+        if let Some(entry) = entries.get_mut(page % CHUNK_PAGES) {
+            *entry = w;
+        }
+    }
+
+    /// Forgets what is noted of `page` (tests).
+    #[cfg(test)]
+    fn remove(&mut self, page: usize) {
+        if let Some(w) = self.get_mut(page) {
+            *w = UNNOTED;
+        }
+        self.far.remove(&page);
+    }
+
+    /// Calls `f` with every noted page of `[first, last)` and what is
+    /// noted of it, in page order.
+    fn each(&self, first: usize, last: usize, mut f: impl FnMut(usize, &Written)) {
+        if first >= last {
+            return;
+        }
+        let near = last.min(NEAR_PAGES);
+        let mut page = first;
+        while page < near {
+            let chunk = page / CHUNK_PAGES;
+            if chunk >= self.chunks.len() {
+                break;
+            }
+            let end = ((chunk + 1) * CHUNK_PAGES).min(near);
+            if let Some(entries) = &self.chunks[chunk] {
+                let from = page % CHUNK_PAGES;
+                for (i, w) in entries.iter().enumerate().take(from + (end - page)).skip(from) {
+                    if w.at != 0 {
+                        f(chunk * CHUNK_PAGES + i, w);
+                    }
+                }
+            }
+            page = end;
+        }
+        if last > NEAR_PAGES {
+            for (&page, w) in self.far.range(first.max(NEAR_PAGES)..last) {
+                f(page, w);
+            }
+        }
+    }
+}
+
+/// Whether a copy in view memory is brought up to date only when
+/// something happened in its memory since it last was
+/// (`VICTORY_REFRESH_EVENTS`): 0, unset: it asks the guards every time, as
+/// before; 1: it does not ask while nothing happened; 2: it asks as before,
+/// and every refresh that 1 would have left out and that found bytes to
+/// copy is counted and named (the check: 0 of them is what 1 needs).
+///
+/// A submission brings some 6,350 ranges of copies up to date a frame in
+/// the first room and about 5,900 of them find nothing written (the census
+/// of 2026-11-26). For a range in view memory each of those is a look at
+/// every guarded 64 KiB block of it under the guards' lock. What can make
+/// a block count as written is known where it happens: a write that
+/// faults, a write of ours that opens or marks it, the runtime mapping
+/// its memory anew, a page the journal notes. Each raises a count for its
+/// 4 MiB of title memory ([`event`]), and a copy remembers the counts of
+/// the range it last brought up to date: the same counts, nothing to ask.
+/// Private memory is not left out: only the kernel knows what was written
+/// there, and it must be asked.
+pub(crate) fn events_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_EVENTS").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// The title memory one count of [`EVENTS`] stands for.
+const EVENT_SPAN: usize = 4 << 20;
+/// What happened in each 4 MiB of title memory (the first 1 TiB each its
+/// own count, memory above shares them): raised, never lowered.
+static EVENTS: [std::sync::atomic::AtomicU32; 1 << 18] = [const { std::sync::atomic::AtomicU32::new(0) }; 1 << 18];
+
+/// Something at `at` came to count as written, or the guards over it
+/// changed.
+fn event(at: usize) {
+    EVENTS[(at / EVENT_SPAN) & (EVENTS.len() - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`event`] for all of `[at, at + len)`.
+fn event_range(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / EVENT_SPAN, at.saturating_add(len - 1) / EVENT_SPAN);
+    // (No more counts than there are.)
+    for span in (first..=last).take(EVENTS.len()) {
+        EVENTS[span & (EVENTS.len() - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The counts of `[start, end)` together: the same number as at an earlier
+/// call means nothing happened there between the two.
+pub(crate) fn events(start: usize, end: usize) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    let (first, last) = (start / EVENT_SPAN, (end - 1) / EVENT_SPAN);
+    (first..=last)
+        .take(EVENTS.len())
+        .map(|span| u64::from(EVENTS[span & (EVENTS.len() - 1)].load(std::sync::atomic::Ordering::Relaxed)))
+        .sum()
+}
+
+/// Since the last frame line, of the refreshes of ranges in view memory
+/// with [`events_mode`] on: those with nothing happened since the range
+/// was last brought up to date (left out, or with the check asked all the
+/// same) and nothing to copy; those of them that had bytes to copy all the
+/// same (the check's finds: an event that was not counted); those asked
+/// because something had happened; and those asked because the range was
+/// not inside the one last brought up to date.
+static EVENT_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A refresh of `[from, to)` of the copy `[start, start + len)` in view
+/// memory was looked at: `quiet` whether nothing had happened there since
+/// it was last brought up to date, `inside` whether it lay in the range
+/// that was, `copied` the bytes the asking found to copy (`None`: it was
+/// left out).
+pub(crate) fn event_checked(quiet: bool, inside: bool, copied: Option<usize>, copy: (u64, u64), from: usize, to: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let place = match (inside, quiet, copied) {
+        (false, _, _) => 3,
+        (true, false, _) => 2,
+        (true, true, Some(n)) if n > 0 => 1,
+        (true, true, _) => 0,
+    };
+    EVENT_CHECKS[place].fetch_add(1, Relaxed);
+    if place == 1 {
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SAID.fetch_add(1, Relaxed) < 32 {
+            tracing::warn!(
+                copy = format_args!("{:#x}+{:#x}", copy.0, copy.1),
+                range = format_args!("{from:#x}..{to:#x}"),
+                copied = copied.unwrap_or(0),
+                "a refresh found bytes to copy where no event was counted since the range was last brought up to date: with VICTORY_REFRESH_EVENTS=1 the copy would have kept the bytes from before"
+            );
+        }
+    }
+}
+
+/// With the frame line.
+pub(crate) fn events_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mode = events_mode();
+    if mode == 0 {
+        return;
+    }
+    let [quiet, wrong, happened, outside] = [0, 1, 2, 3].map(|i| EVENT_CHECKS[i].swap(0, Relaxed));
+    tracing::info!(
+        "refreshes by event, of ranges in view memory, per frame (VICTORY_REFRESH_EVENTS={mode}): {:.0} with nothing happened since \
+         the range was last brought up to date ({}); {:.0} asked because something had; {:.0} asked because the range was not \
+         inside that one; since the last line {wrong} that the check found with bytes to copy and no event (0 is what =1 needs)",
+        quiet as f64 / frames,
+        if mode == 1 { "left out" } else { "asked all the same: the check" },
+        happened as f64 / frames,
+        outside as f64 / frames,
+    );
+}
+
 /// Notes in `written` that asking `now` found `page` written in the kernel
 /// pages `mask`.
-fn note(written: &mut BTreeMap<usize, Written>, page: usize, now: u64, mask: u16) {
-    match written.get_mut(&page) {
+fn note(written: &mut Pages, page: usize, now: u64, mask: u16) {
+    event(page.wrapping_mul(PAGE));
+    match written.get_mut(page) {
         None => {
             written.insert(page, Written { at: now, before: 0, mask });
         }
@@ -93,7 +308,7 @@ struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
     /// Page number → the asking that last found it written (and where).
-    written: BTreeMap<usize, Written>,
+    written: Pages,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -112,7 +327,7 @@ struct Journal {
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Pages::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -137,7 +352,9 @@ fn note_found(j: &mut Journal, count: usize, now: u64) {
 
 /// The journal's entries for pages `[first, last)`.
 fn entries(j: &Journal, first: usize, last: usize) -> Vec<(usize, Written)> {
-    j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+    let mut out = Vec::new();
+    j.written.each(first, last, |page, w| out.push((page, *w)));
+    out
 }
 
 /// Whether ranges whose first block the guards hold are left out of the
@@ -406,7 +623,11 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, w)| (p, w.at)).collect()))
+        .then(|| {
+            let mut out = Vec::new();
+            j.written.each(first, last, |page, w| out.push((page, w.at)));
+            (j.ahead_asked, out)
+        })
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -471,7 +692,12 @@ pub(crate) fn writes_fine(start: usize, end: usize, guarded: bool) -> Option<(u6
         let epoch = once().then_some(Epoch { submission: j.once_id, standing: j.kept });
         let written = guard_fine(first * PAGE, last * PAGE, epoch);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        {
+            crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+            if written.is_some() {
+                crate::copystat::buffers::view(first * PAGE, last.saturating_sub(first).saturating_mul(PAGE));
+            }
+        }
         written?
     } else {
         Vec::new()
@@ -1244,6 +1470,7 @@ fn reopen_stray(g: &mut Guards, at: usize) -> bool {
         return false;
     }
     g.clean.remove(&block);
+    event(block.wrapping_mul(BLOCK));
     g.dirty.remove(&block);
     g.partly.remove(&block);
     true
@@ -1254,7 +1481,9 @@ fn reopen_stray(g: &mut Guards, at: usize) -> bool {
 fn settle(g: &mut Guards, failed: &Failed, epoch: Option<Epoch>) {
     for &block in &failed.runs {
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         count(2);
         if block < uncommitted_end(block) {
             g.absent.insert(block);
@@ -1267,11 +1496,14 @@ fn settle(g: &mut Guards, failed: &Failed, epoch: Option<Epoch>) {
     }
     for &block in &failed.aliases {
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
     }
     for &block in &failed.rearm {
         // As `rearm_tail`: no longer guarded (reported written already).
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
     }
 }
 
@@ -1780,6 +2012,7 @@ fn mark_block(g: &mut Guards, block: usize, mask: u16) -> bool {
 fn note_dirty(g: &mut Guards, block: usize, mask: u16) {
     if g.clean.contains(&block) {
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         if mask != FULL {
             g.dirty.insert(block, mask);
         } else {
@@ -1872,6 +2105,7 @@ fn rearm_tail(g: &mut Guards, block: usize) -> bool {
         return true;
     }
     g.protected.remove(&block);
+    event(block.wrapping_mul(BLOCK));
     false
 }
 
@@ -1885,7 +2119,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.dirty.remove(&block);
         g.partly.remove(&block);
         let mut old = 0;
@@ -1945,7 +2181,36 @@ pub fn writing(at: usize, len: usize) {
 /// (`cause`).
 pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    {
+        let mut g = guards();
+        // Every block is opened under the guards' lock, so what the count
+        // of opened blocks grows by here is this write's.
+        #[cfg(feature = "diagnostics")]
+        let before = GUARD_CALLS[6].load(std::sync::atomic::Ordering::Relaxed);
+        open(&mut g, at, at.saturating_add(len));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::buffers::opened(
+            cause as usize,
+            GUARD_CALLS[6].load(std::sync::atomic::Ordering::Relaxed).saturating_sub(before),
+        );
+    }
+    // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, len, cause);
+}
+
+/// After a write of the layer's own into title memory `[at, at + len)` that
+/// went through a view of its own of the same pages (`crate::beside`): the
+/// guarded blocks there, and at every other view of their pages, count as
+/// written and stay read-only ([`mark_only`]), so every host copy over
+/// them takes them again at its next check, as after [`writing_as`] opened
+/// them, without the two changes of protection. Called once the bytes are
+/// there: a check between the write and this takes them a second time, one
+/// before the write would have noted the block clean with the old bytes.
+pub(crate) fn written_beside(at: usize, len: usize, cause: crate::writes::Cause) {
+    {
+        let mut g = guards();
+        mark_with_views(&mut g, at, at.saturating_add(len));
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len, cause);
 }
@@ -1969,7 +2234,9 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     let last = end.div_ceil(BLOCK).min(first.saturating_add(1 << 16));
     let noted = asked != 0 && {
         let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-        j.written.range(first..last).any(|(_, w)| w.at > asked)
+        let mut after = false;
+        j.written.each(first, last, |_, w| after |= w.at > asked);
+        after
     };
     let (mut written, mut open) = (0, 0);
     {
@@ -2191,6 +2458,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // What a copy knew of this memory is no longer so.
+    event_range(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -2200,7 +2469,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -2774,9 +3045,8 @@ mod tests {
     /// where another test's was, whose writes it still holds.
     fn forget(start: usize, end: usize) {
         let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-        let pages: Vec<usize> = j.written.range(start / PAGE..end.div_ceil(PAGE)).map(|(&p, _)| p).collect();
-        for page in pages {
-            j.written.remove(&page);
+        for page in start / PAGE..end.div_ceil(PAGE) {
+            j.written.remove(page);
         }
     }
 
@@ -2854,14 +3124,64 @@ mod tests {
     /// longer says where.
     #[test]
     fn notes_join_and_never_go_back() {
-        let mut written = BTreeMap::new();
+        let mut written = Pages::new();
         note(&mut written, 9, 4, 1);
         note(&mut written, 9, 4, 2);
-        assert_eq!(written[&9], Written { at: 4, before: 0, mask: 3 });
+        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 4, before: 0, mask: 3 }));
         note(&mut written, 9, 6, 8);
-        assert_eq!(written[&9], Written { at: 6, before: 4, mask: 8 });
+        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 6, before: 4, mask: 8 }));
         note(&mut written, 9, 5, 1);
-        assert_eq!(written[&9], Written { at: 6, before: 4, mask: FULL });
+        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 6, before: 4, mask: FULL }));
+    }
+
+    /// The table answers as the map did: the noted pages of a range, in
+    /// order, across its chunks and above the addresses it has chunks for.
+    #[test]
+    fn the_pages_noted_in_a_range_come_in_order_wherever_they_lie() {
+        let mut written = Pages::new();
+        let mut map = BTreeMap::new();
+        let w = |at| Written { at, before: 0, mask: 1 };
+        let pages = [
+            0,
+            5,
+            CHUNK_PAGES - 1,
+            CHUNK_PAGES,
+            7 * CHUNK_PAGES + 3,
+            NEAR_PAGES - 1,
+            NEAR_PAGES,
+            NEAR_PAGES + 12,
+            usize::MAX / PAGE,
+        ];
+        for (i, &page) in pages.iter().enumerate() {
+            written.insert(page, w(i as u64 + 1));
+            map.insert(page, w(i as u64 + 1));
+        }
+        assert!(written.get_mut(1).is_none() && written.get_mut(NEAR_PAGES + 1).is_none());
+        let ranges = [
+            (0, 1),
+            (0, usize::MAX),
+            (1, 5),
+            (5, CHUNK_PAGES),
+            (CHUNK_PAGES - 1, CHUNK_PAGES + 1),
+            (CHUNK_PAGES + 1, 7 * CHUNK_PAGES + 3),
+            (6 * CHUNK_PAGES, NEAR_PAGES),
+            (NEAR_PAGES - 1, NEAR_PAGES + 13),
+            (NEAR_PAGES + 1, usize::MAX),
+            (9, 9),
+            (9, 3),
+        ];
+        for (first, last) in ranges {
+            let mut got = Vec::new();
+            written.each(first, last, |page, w| got.push((page, *w)));
+            let want: Vec<(usize, Written)> = if first < last { map.range(first..last).map(|(&p, &w)| (p, w)).collect() } else { Vec::new() };
+            assert_eq!(got, want, "{first:#x}..{last:#x}");
+        }
+        // A page forgotten is not noted; noting it again is.
+        written.remove(5);
+        written.remove(NEAR_PAGES);
+        assert!(written.get_mut(5).is_none() && written.get_mut(NEAR_PAGES).is_none());
+        note(&mut written, 5, 9, 2);
+        assert_eq!(written.get_mut(5).copied(), Some(Written { at: 9, before: 0, mask: 2 }));
     }
 
     /// A remapping forgets the unmapped runs it touches and no others.
@@ -3561,6 +3881,100 @@ mod tests {
         writing(other + BLOCK / 2, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(0), pages(1)]));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A write of the layer's own that went beside the guards, through a
+    /// view of its own of the pages (`crate::beside`, [`written_beside`]):
+    /// the next check of every guarded view of the pages reports them
+    /// written, the bytes are there, and no view was opened for it.
+    #[test]
+    fn a_write_beside_the_guards_is_reported_at_every_view_and_opens_none() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        crate::inplace::title_memory_section(section, SIZE as u64, true);
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        let protection = |at: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE, None), Some(vec![pages(two, 0), pages(two, 1)]));
+        assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(two, two + SIZE, None), Some(Vec::new()), "nothing written yet");
+        // The bytes first, then the guards are told.
+        let place = crate::beside::find(one + BLOCK + 16, 32).expect("a place in a view of our own");
+        assert_eq!(place.write(one + BLOCK + 16, &[7; 32]), 32);
+        written_beside(one + BLOCK + 16, 32, crate::writes::Cause::Back);
+        assert_eq!(protection(one + BLOCK), PAGE_READONLY, "the view written at stays guarded");
+        assert_eq!(protection(two + BLOCK), PAGE_READONLY, "and so does the other view of its pages");
+        // SAFETY: both views are readable.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts((one + BLOCK + 16) as *const u8, 32), [7; 32]);
+            assert_eq!(std::slice::from_raw_parts((two + BLOCK + 16) as *const u8, 32), [7; 32]);
+        }
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE, None), Some(vec![pages(two, 1)]), "the other view's copy takes them too");
+        assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE, None), Some(Vec::new()));
+        // A write of the title's afterwards faults and is seen, as ever.
+        // SAFETY: the first view, read-write once the handler has opened it.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 0)]));
+        crate::beside::section_made(section);
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// Whatever makes a guarded block count as written raises the count of
+    /// its memory ([`events`], what `VICTORY_REFRESH_EVENTS` goes by), at
+    /// the view written through and at every other view of the pages: a
+    /// write of the title's that faults, a write of ours beside the
+    /// guards, the memory mapped anew. (Counts are by 4 MiB and other
+    /// tests' memory may share them: only that they rise is asked.)
+    #[test]
+    fn what_makes_a_guarded_block_count_as_written_is_an_event() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        crate::inplace::title_memory_section(section, SIZE as u64, true);
+        let seen = |view: usize| events(view, view + SIZE);
+        let clean = || {
+            guard(one, one + SIZE, None);
+            guard(two, two + SIZE, None);
+            assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()));
+            assert_eq!(guard(two, two + SIZE, None), Some(Vec::new()));
+            (seen(one), seen(two))
+        };
+        // A write of the title's through one view.
+        let (a, b) = clean();
+        // SAFETY: the first view, read-write once the handler has opened it.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert!(seen(one) > a, "the view written through");
+        assert!(seen(two) > b, "the other view of its pages");
+        // A write of ours beside the guards.
+        let (a, b) = clean();
+        let place = crate::beside::find(two + BLOCK + 16, 32).expect("a place in a view of our own");
+        assert_eq!(place.write(two + BLOCK + 16, &[9; 32]), 32);
+        written_beside(two + BLOCK + 16, 32, crate::writes::Cause::Back);
+        assert!(seen(two) > b);
+        assert!(seen(one) > a);
+        // The memory mapped anew (here: told so).
+        let (a, _) = clean();
+        title_memory_remapped(one, SIZE);
+        crate::inplace::title_memory_view(one, SIZE, section, 0);
+        assert!(seen(one) > a);
+        // The counts of a range are those of every 4 MiB it touches.
+        let far = 0x7_e000_0000usize;
+        let before = (events(far, far + 1), events(far, far + 3 * EVENT_SPAN), events(far + EVENT_SPAN, far + 2 * EVENT_SPAN));
+        event_range(far + EVENT_SPAN - 1, 2);
+        assert_eq!(events(far, far + 1), before.0 + 1);
+        assert_eq!(events(far, far + 3 * EVENT_SPAN), before.1 + 2);
+        assert_eq!(events(far + EVENT_SPAN, far + 2 * EVENT_SPAN), before.2 + 1);
+        assert_eq!(events(far, far), 0);
+        crate::beside::section_made(section);
+        drop_views(section, &[one, two], SIZE);
     }
 
     /// Both views of the pages are checked, each for a copy of its own

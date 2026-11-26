@@ -1962,11 +1962,13 @@ fn room_percent() -> u64 {
 #[cfg(windows)]
 pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Without the filler words and with them: whichever `texture_at` keeps.
-    let mut key = *desc;
+    let mut kept = *desc;
+    kept[12] &= !PLACED_WRITE_FLAGS;
+    let mut key = kept;
     key[1] = 0;
     key[13] = 0;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
+    map.get(&(address, key)).or_else(|| map.get(&(address, kept))).map(|&r| r as This)
 }
 
 /// For the card accounting line: whether title texture `this` has a host
@@ -2667,6 +2669,14 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Whether the host takes a clear value on a texture of these (host) flags:
+/// render targets and depth buffers only.
+fn takes_clear_value(flags: u32) -> bool {
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    flags & (TARGET | DEPTH) != 0
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags; with `spill`, in the PC's
 /// memory the card reads over the bus ([`spill_on`]). Also whether it went
@@ -2738,7 +2748,10 @@ fn host_texture_as(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // The console allows one on any texture; the host only on render
+    // targets and depth buffers, and refuses the texture (E_INVALIDARG)
+    // otherwise: it is dropped there (Marvisak/VIctory pull request #3065).
+    let clear_value = (!clear.is_null() && takes_clear_value(d.flags)).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -3339,6 +3352,11 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The flags of a resource description that make a texture one the host
+/// writes (render target, depth, unordered access: [`fills`]).
+#[cfg(windows)]
+const PLACED_WRITE_FLAGS: u32 = 0x7;
+
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
 #[cfg(windows)]
@@ -3460,11 +3478,13 @@ pub(crate) fn placed_copies_at(address: u64) -> Vec<std::sync::Arc<HostTexture>>
 /// frame listing, which must not count as a use).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut key = *desc;
+    let mut kept = *desc;
+    kept[12] &= !PLACED_WRITE_FLAGS;
+    let mut key = kept;
     key[1] = 0;
     key[13] = 0;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
+    let found = map.get(&(address, key)).or_else(|| map.get(&(address, kept)))?;
     Some(*found as This)
 }
 
@@ -3479,8 +3499,16 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
-    let mut key = *desc;
+    // A texture a view is placed to sample is one the title fills: the
+    // target, depth and unordered access flags its resource description may
+    // still carry say what the title wrote it with, and would make the host
+    // copy one of the title textures the host writes ([`TARGETS_AT`]), which
+    // is then the very texture the views sample ([`alias_of`]) and not their
+    // twin (fxceless/victory-fork pull request #114, uiliannn/VItoriaBr
+    // pull request #72).
+    let mut raw = *desc;
+    raw[12] &= !PLACED_WRITE_FLAGS;
+    let mut key = raw;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
@@ -3530,6 +3558,171 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         .host
         .placed
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
+/// The textures [`uav_texture_at`] made, by address and description: like
+/// [`PLACED_TEXTURES`], never released, but not in it: those have a host
+/// copy filled from title memory, these only what shaders write.
+#[cfg(windows)]
+static PLACED_UAV_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Bytes of title memory the textures of [`PLACED_UAV_TEXTURES`] take where
+/// the title placed them (what their host copies take on the card is of that
+/// order), and how many there are.
+#[cfg(windows)]
+static PLACED_UAV_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// What the textures of [`PLACED_UAV_TEXTURES`] may take together: past it
+/// a placed unordered view is a null one again, as every one was.
+/// shortcut: nothing releases such a texture when the title reuses its
+/// memory, as it lets go the host copies of placed views it reads.
+#[cfg(windows)]
+const PLACED_UAV_LIMIT: u64 = 1 << 30;
+
+/// The format of the resource made for an unordered access view of a texture
+/// described as `own` (a title format) that names `view` (0: its own): the
+/// resource's own, or what the view names where that is the same texels in
+/// another type (the title packs light as R9G9B9E5 and writes it as R32_UINT,
+/// which the host cannot do to the one it is).
+#[cfg(windows)]
+fn uav_resource_format(own: u32, view: u32) -> u32 {
+    let wanted = if view == 0 { own } else { pc_format(view) };
+    if view == 0 || target_format(own) == target_format(wanted) {
+        return own;
+    }
+    if family(own) == family(wanted) {
+        family(wanted)
+    } else if element(own).is_some() && element(own) == element(wanted) {
+        wanted
+    } else {
+        own
+    }
+}
+
+/// The resource for an unordered access view of a texture the title placed
+/// at `address` with resource description `desc` and view format
+/// `view_format` (0: the resource's own): an unordered-access texture of the
+/// host at that address when its shape and format allow the view, else one
+/// made here on first use (starting in `UNORDERED_ACCESS`), which is then
+/// the texture [`alias_of`] finds for the views of the same memory that the
+/// title places to sample it. `None` for buffers and when the limit
+/// ([`PLACED_UAV_LIMIT`]) is reached.
+///
+/// Before, such a view was a null one (writes dropped), and what the title
+/// read of that memory through a view placed at it was black or stale:
+/// fxceless/victory-fork pull request #114 and uiliannn/VItoriaBr pull
+/// request #72, whose restore of the table's entry is taken here.
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -> Option<This> {
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let own = pc_format(d.format);
+    let wanted = if view_format == 0 { own } else { pc_format(view_format) };
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&other) = targets.get(&address) {
+            let o = resource(other as This);
+            let o_fmt = target_format(pc_format(o.desc.format));
+            let w_fmt = target_format(wanted);
+            let typeless = family(o_fmt) == o_fmt && family(o_fmt + 1) == o_fmt;
+            let srgb = SRGB.iter().any(|&(s, _)| s == o_fmt);
+            let compatible = o_fmt == w_fmt || ((typeless || srgb) && family(w_fmt) == family(o_fmt));
+            if o.desc.dimension == d.dimension
+                && o.desc.width == d.width
+                && o.desc.height == d.height
+                && o.desc.mip_levels == d.mip_levels
+                && o.desc.depth_or_array_size == d.depth_or_array_size
+                && o.desc.sample_count <= 1
+                && d.sample_count <= 1
+                && o.desc.flags & (DEPTH | UNORDERED) == UNORDERED
+                && compatible
+            {
+                return Some(other as This);
+            }
+        }
+    }
+    let mut r = *desc;
+    // The filler words are not part of what a texture is ([`texture_at`]).
+    (r[1], r[13]) = (0, 0);
+    r[12] = (r[12] & !DEPTH) | UNORDERED;
+    r[8] = uav_resource_format(own, view_format);
+    let mut map = PLACED_UAV_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&existing) = map.get(&(address, r)) {
+        // A temporary target at this address may have replaced this texture
+        // in the table and been released since: put it back if the entry is
+        // vacant.
+        TARGETS_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(address)
+            .or_insert(existing);
+        return Some(existing as This);
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let made_desc = unsafe { r.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let bytes = footprint(&made_desc).map_or(0, |f| f.size);
+    if PLACED_UAV_MADE[0].load(Relaxed).saturating_add(bytes) > PLACED_UAV_LIMIT {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                limit = PLACED_UAV_LIMIT,
+                "placed unordered texture views: no more textures made (a null view is given)"
+            )
+        });
+        return None;
+    }
+    let mut out = std::ptr::null();
+    let made = hand_out_resource(
+        made_desc,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        UNORDERED_ACCESS,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    if made != S_OK {
+        return None;
+    }
+    map.insert((address, r), out as usize);
+    PLACED_UAV_MADE[0].fetch_add(bytes, Relaxed);
+    let n = PLACED_UAV_MADE[1].fetch_add(1, Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        tracing::info!(
+            n,
+            address = format_args!("{address:#x}"),
+            dimension = made_desc.dimension,
+            width = made_desc.width,
+            height = made_desc.height,
+            layers = made_desc.depth_or_array_size,
+            levels = made_desc.mip_levels,
+            format = made_desc.format,
+            view_format,
+            bytes,
+            all_bytes = PLACED_UAV_MADE[0].load(Relaxed),
+            "a texture made for an unordered access view the title placed in memory"
+        );
+    }
     Some(out)
 }
 
@@ -3710,6 +3903,19 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    /// The console lets a title set a clear value on any texture; the host
+    /// refuses one (E_INVALIDARG) unless the texture is a render target or
+    /// a depth buffer (Marvisak/VIctory pull request #3065).
+    #[test]
+    fn only_targets_and_depth_buffers_keep_a_clear_value() {
+        assert!(!takes_clear_value(0));
+        assert!(!takes_clear_value(4), "unordered access alone");
+        assert!(!takes_clear_value(8));
+        assert!(takes_clear_value(1));
+        assert!(takes_clear_value(2));
+        assert!(takes_clear_value(1 | 4));
+    }
+
     /// The R8 family is R8 typeless (60) with UNORM, UINT, SNORM and SINT
     /// (61 to 64); A8_UNORM (65) is a family of its own (Marvisak 97c8783).
     #[test]
@@ -3786,6 +3992,46 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// The resource of an unordered access view the title places is the type
+    /// its shaders write: R32_UINT for the packed light, not R9G9B9E5.
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_unordered_view_names_the_type_shaders_write() {
+        assert_eq!(uav_resource_format(67, 0), 67, "the view names none");
+        assert_eq!(uav_resource_format(67, 42), 42, "the same texels as R32_UINT");
+        assert_eq!(uav_resource_format(28, 28), 28);
+        assert_eq!(uav_resource_format(27, 28), 27, "the family's typeless one");
+        assert_eq!(uav_resource_format(10, 42), 10, "texels of another size stay");
+    }
+
+    /// A placed unordered view gets a texture of the host's own, and a view
+    /// placed to sample the same memory takes its texels from it, though
+    /// its description still carries the flags the title wrote it with
+    /// (fxceless/victory-fork pull request #114, uiliannn/VItoriaBr #72).
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_unordered_view_is_what_the_sampling_view_aliases() {
+        use std::sync::atomic::Ordering::Relaxed;
+        static MEMORY: [u8; 4096] = [0; 4096];
+        let address = MEMORY.as_ptr() as u64;
+        let words = |format: u32, flags: u32| {
+            let desc = ResourceDesc { layout: 1, flags, ..texture(4, 4, format, 1) };
+            // SAFETY: 56 bytes in the description's layout.
+            unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() }
+        };
+        let uav = uav_texture_at(address, &words(67, 4), 42).unwrap();
+        assert_eq!(resource(uav).desc.format, 42);
+        assert_eq!(resource(uav).desc.flags & 7, 4);
+        assert!(!resource(uav).host.placed.load(Relaxed), "not one filled from title memory");
+        assert_eq!(uav_texture_at(address, &words(67, 4), 42), Some(uav), "made once");
+        assert_eq!(uav_texture_at(address, &words(67, 0), 42), Some(uav), "the flags the title left do not matter");
+        let view = texture_at(address, &words(67, 4)).unwrap();
+        assert_eq!(resource(view).desc.flags & 7, 0, "a sampled texture is one the title fills");
+        assert_eq!(texture_at(address, &words(67, 0)), Some(view), "the same one with the flags gone");
+        assert_eq!(placed_known(address, &words(67, 4)), Some(view));
+        assert_eq!(alias_of(view), Some(uav));
     }
 
     fn heap(size: u64) -> This {

@@ -111,6 +111,22 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Copies numbered, by what named them first ([`Named`]).
+    by: [u32; 5],
+    /// A page the current [`ready`] named found no number left.
+    short: bool,
+}
+
+/// What named a page whose copy got a number: a root view, a pair of root
+/// constants, a root constant in 256-byte units, a shader's fault note, a
+/// buffer the title changed ([`Memory::follow`]).
+#[derive(Clone, Copy)]
+enum Named {
+    View,
+    Pair,
+    Units,
+    Fault,
+    Follow,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -125,6 +141,10 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Every page the dispatch names has a copy, or is not the title's
+    /// memory. False once the numbers run out ([`COPIES`]): what it names
+    /// then reads zeros, which for the structure builder is a dropped stage.
+    pub(crate) whole: bool,
 }
 
 impl Memory {
@@ -150,12 +170,14 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            by: [0; 5],
+            short: false,
         })
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's.
-    fn map(&mut self, address: u64) {
+    fn map(&mut self, address: u64, named: Named) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
@@ -172,7 +194,7 @@ impl Memory {
         if self.refused.contains(&page) {
             return;
         }
-        if let Some((n, offset)) = self.place(page) {
+        if let Some((n, offset)) = self.place(page, named) {
             self.set(page, n, offset);
         }
     }
@@ -193,7 +215,7 @@ impl Memory {
     /// byte in it), numbering it if it has no number yet; None if the
     /// memory is not the title's, no buffer with unordered access holds the
     /// page whole, or no number is left.
-    fn place(&mut self, page: u64) -> Option<(u32, u32)> {
+    fn place(&mut self, page: u64, named: Named) -> Option<(u32, u32)> {
         let start = page * PAGE;
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
@@ -214,6 +236,7 @@ impl Memory {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
+                self.by[named as usize] += 1;
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB. Not a page that
@@ -252,9 +275,19 @@ impl Memory {
                 n
             }
             None => {
+                self.short = true;
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    let [views, pairs, units, faults, follows] = self.by;
+                    tracing::warn!(
+                        COPIES,
+                        views,
+                        pairs,
+                        units,
+                        faults,
+                        follows,
+                        "title memory by address: no number left for another copy; its pages read zeros (numbered so far, by what named them first)"
+                    )
                 });
                 return None;
             }
@@ -298,7 +331,7 @@ impl Memory {
                 continue;
             }
             self.refused.remove(&page);
-            let now = self.place(page).unwrap_or((0, 0));
+            let now = self.place(page, Named::Follow).unwrap_or((0, 0));
             if now != (n, offset) {
                 self.set(page, now.0, now.1);
                 moved += 1;
@@ -339,15 +372,15 @@ impl Memory {
             }
         }
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            self.map(u64::from(page) * PAGE, Named::Fault);
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    fn name(&mut self, address: u64, named: Named) {
+        self.map(address, named);
+        self.map((address & !(CELL - 1)) + CELL, named);
     }
 
     /// The copies (indices into `copies`) that [`Memory::name`] of
@@ -392,10 +425,11 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
+    m.short = false;
     // The copies this dispatch names (`crate::card_fine::named_writes`).
     let mut named: Vec<usize> = Vec::new();
     for &address in addresses {
-        m.name(address);
+        m.name(address, Named::View);
         m.named(address, &mut named);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
@@ -407,11 +441,11 @@ pub(crate) fn ready(
             && c >= 0x1_0000
         {
             let address = u64::from(c) | u64::from(high) << 32;
-            m.name(address);
+            m.name(address, Named::Pair);
             m.named(address, &mut named);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, Named::Units);
             m.named(u64::from(c) << 8, &mut named);
         }
     }
@@ -449,7 +483,7 @@ pub(crate) fn ready(
             break;
         }
         let (start, len) = shadow.span();
-        shadow.refresh(list, start, len);
+        shadow.refresh_as(list, start, len, crate::shadow::ASKED_BY_ADDRESS);
     }
     // With `VICTORY_NAMED_WRITES=1`, but for every few frames: only the
     // copies a dispatch names are declared written (`card_fine::named_writes`
@@ -485,5 +519,6 @@ pub(crate) fn ready(
         directory: m.directory.2,
         faults: m.faults.2,
         base,
+        whole: !m.short,
     })
 }

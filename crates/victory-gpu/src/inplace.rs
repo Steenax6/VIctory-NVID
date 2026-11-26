@@ -286,8 +286,26 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
-    v.sections.insert(section, (bytes, committed));
+    {
+        let mut v = views();
+        v.sections.insert(section, (bytes, committed));
+    }
+    // A view of our own of an earlier section with this handle is none of
+    // this one's.
+    crate::beside::section_made(section);
+}
+
+/// The bytes of the section the runtime made with this handle.
+pub(crate) fn section_bytes(section: usize) -> Option<u64> {
+    views().sections.get(&section).map(|&(bytes, _)| bytes)
+}
+
+/// The title view that holds address `at`: where it begins, its bytes, its
+/// section's handle and the offset of its first byte in the section.
+pub(crate) fn view_at(at: usize) -> Option<(usize, usize, usize, u64)> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+    (at - base < bytes).then_some((base, bytes, section, offset))
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -1192,6 +1210,8 @@ mod tests {
     /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
     fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
@@ -1215,6 +1235,8 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;
