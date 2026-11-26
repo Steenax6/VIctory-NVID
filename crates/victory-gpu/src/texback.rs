@@ -113,6 +113,31 @@ pub(crate) fn kinds() -> &'static [Kind] {
     })
 }
 
+/// The kinds named in the log so far: each the first time one of its
+/// textures is written, with its swizzle mode (an XOR mode needs the pipe
+/// and bank address patterns of `victory-formats`).
+fn said_kind(resource: This, layout: &victory_formats::texture::Layout) {
+    static SAID: Mutex<Vec<Kind>> = Mutex::new(Vec::new());
+    let Some(kind) = crate::resource::texture_kind(resource) else {
+        return;
+    };
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.contains(&kind) {
+        return;
+    }
+    said.push(kind);
+    let (w, h, f) = kind;
+    let swizzle = layout.desc.swizzle;
+    tracing::info!(
+        kind = %format_args!("{w}x{h}f{f}"),
+        swizzle = swizzle.0,
+        xor = swizzle.xor(),
+        levels = layout.desc.mips,
+        layers = layout.desc.depth,
+        "a texture of a kind copied back is written by shaders for the first time"
+    );
+}
+
 /// Whether title texture `resource` is of a kind copied back.
 pub(crate) fn wanted(resource: This) -> bool {
     let kinds = kinds();
@@ -226,6 +251,7 @@ impl Target {
         // Held by the target, apart from the title's resource.
         let copy = crate::resource::host_copy(resource)?;
         let (layout, at, size) = crate::resource::title_texture(resource)?;
+        said_kind(resource, &layout);
         if !layout.addressable() {
             UNADDRESSABLE.fetch_add(1, Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
