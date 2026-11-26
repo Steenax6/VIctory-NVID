@@ -950,7 +950,7 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
                     for index in chunk {
                         let range = heap
                             .handle(index)
-                            .and_then(|handle| host.mirror(index, handle, true))
+                            .and_then(|handle| host.mirror_passed(index, handle))
                             .and_then(|view| crate::descriptor::host::buffer_copy(&view))
                             .map(|(shadow, address, len)| (shadow, address, address + len));
                         out.push((index, range));
@@ -984,7 +984,7 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some(view) = host.mirror_passed(index, handle) else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).

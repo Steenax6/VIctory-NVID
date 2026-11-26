@@ -2422,15 +2422,25 @@ impl HostHeap {
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
+    #[cfg(test)]
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
-        self.note_buffer_in(index, view, seen, true).unwrap_or_default()
+        self.note_buffer_in(index, view, seen, true, true).unwrap_or_default()
     }
 
     /// [`HostHeap::note_buffer`]; with `may_stale` false (the caller holds
     /// only its own slot's lock), `Err` and nothing done if the write would
     /// make other slots' views stale: the caller then takes every slot's
-    /// lock and writes again.
-    fn note_buffer_in(&self, index: u32, view: Option<&View>, seen: bool, may_stale: bool) -> Result<Vec<u32>, NeedsAll> {
+    /// lock and writes again. `listed`: a change of the slot's buffer view
+    /// goes on the list of [`HostHeap::buffer_changes`] (not for the pass
+    /// that takes that list, [`HostHeap::mirror_passed`]).
+    fn note_buffer_in(
+        &self,
+        index: u32,
+        view: Option<&View>,
+        seen: bool,
+        may_stale: bool,
+        listed: bool,
+    ) -> Result<Vec<u32>, NeedsAll> {
         if self.sampler {
             return Ok(Vec::new());
         }
@@ -2517,7 +2527,7 @@ impl HostHeap {
         } else {
             buffers.remove(index)
         };
-        if was {
+        if was && listed {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3141,10 +3151,34 @@ impl HostHeap {
         self.mirror_key(index, handle, for_draw).0
     }
 
+    /// [`HostHeap::mirror`] for a draw, by the pass over picked buffer
+    /// views (`crate::draw`'s `picked_pass`) for a slot of its changed list
+    /// ([`HostHeap::buffer_changes`]): what it makes or takes away of the
+    /// slot is not put on that list again.
+    ///
+    /// The list is the pass's own: it holds the slots whose buffer view was
+    /// written or went since the pass last took it, so that the pass looks
+    /// at them. A slot the pass itself makes from the record it reads (the
+    /// title's write left it for later) was put back on the list by that
+    /// making, and the next pass looked at it once more and found it made
+    /// from the same record: some 48,000 slots a pass in the first room
+    /// were each looked at twice. What the pass found of the slot (its
+    /// copy and range) it keeps from this look; a later write of the
+    /// title's puts the slot on the list again, as ever.
+    pub(crate) fn mirror_passed(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_key_as(index, handle, true, true).0
+    }
+
     /// [`HostHeap::mirror`], with the words of the record it found at
     /// `handle` as one number (`super::key_at`; whatever was there if no
     /// view is returned).
     pub(crate) fn mirror_key(&self, index: u32, handle: u64, for_draw: bool) -> (Option<View>, u64) {
+        self.mirror_key_as(index, handle, for_draw, false)
+    }
+
+    /// [`HostHeap::mirror_key`]; `passed`: for the pass over picked buffer
+    /// views ([`HostHeap::mirror_passed`]).
+    fn mirror_key_as(&self, index: u32, handle: u64, for_draw: bool, passed: bool) -> (Option<View>, u64) {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3195,7 +3229,7 @@ impl HostHeap {
             // Generations start at 1, so a made slot's key is never 0.
             let key = u64::from(generation) << 32 | u64::from(i);
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-            match self.mirror_locked(index, handle, key, view, for_draw, slot.exclusive()) {
+            match self.mirror_locked(index, handle, key, view, (for_draw, passed), slot.exclusive()) {
                 Ok(view) => return (view, key),
                 Err(NeedsAll) => {
                     drop(slot);
@@ -3208,28 +3242,32 @@ impl HostHeap {
     /// [`HostHeap::mirror`] of the record `key` (whose view is `view`) at
     /// `handle`, under the lock of slot `index` (`all`: of every slot).
     /// `Err` with nothing done if the write makes other slots' views
-    /// stale and `all` is false.
+    /// stale and `all` is false. `(for_draw, passed)`: as
+    /// [`HostHeap::mirror_key_as`] takes them.
     fn mirror_locked(
         &self,
         index: u32,
         handle: u64,
         key: u64,
         view: Option<View>,
-        for_draw: bool,
+        (for_draw, passed): (bool, bool),
         all: bool,
     ) -> Result<Option<View>, NeedsAll> {
         let made = |i: u32| self.made_key(i).unwrap_or(0);
+        // (The pass over picked buffer views does not put the slot it looks
+        // at back on its own list: `mirror_passed`.)
+        let listed = !passed;
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made(index) != 0 {
                 self.set_made(index, 0);
                 // Out of the stride table before the slot is a null 2D view.
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer_in(index, None, false, true, listed);
                 self.make_null(index);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer_in(index, None, false, true, listed);
             }
             return Ok(None);
         };
@@ -3238,7 +3276,7 @@ impl HostHeap {
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held. (Only under every slot's
             // lock: without it, the write comes back first.)
-            for stale in self.note_buffer_in(index, Some(&view), for_draw, all)? {
+            for stale in self.note_buffer_in(index, Some(&view), for_draw, all, listed)? {
                 if stale != index {
                     self.unmake(stale);
                 }
@@ -7351,6 +7389,29 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let wider = placed_buffer(32);
         assert!(heap.note_buffer(1, Some(&wider), false).is_empty());
         assert_eq!(heap.stride(1), Some(SKIP));
+    }
+
+    /// The title's write of a buffer view puts its slot on the pass's list;
+    /// the pass making the slot does not put it back (`mirror_passed`), a
+    /// draw making it does, and the title's next write does again.
+    #[test]
+    fn the_pass_over_picked_views_does_not_list_the_slots_it_makes() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let mut records = [[0u32; 8]; 2];
+        let handles: Vec<u64> = records.iter_mut().map(|r| r.as_mut_ptr() as u64).collect();
+        for (slot, &handle) in handles.iter().enumerate() {
+            crate::descriptor::record(handle, placed_buffer(16));
+            heap.mirror(slot as u32, handle, false);
+        }
+        assert_eq!(heap.buffer_changes(), [0, 1]);
+        heap.mirror_passed(0, handles[0]);
+        heap.mirror(1, handles[1], true);
+        assert_eq!(heap.buffer_changes(), [1], "the pass's own making is not listed, a draw's is");
+        crate::descriptor::record(handles[0], placed_buffer(32));
+        heap.mirror(0, handles[0], false);
+        assert_eq!(heap.buffer_changes(), [0]);
     }
 
     /// Once `mirror` has written a slot, its entry says what the slot
