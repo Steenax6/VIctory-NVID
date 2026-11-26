@@ -2377,10 +2377,11 @@ impl HostHeap {
     /// such view whatever slot it is in.
     fn quick(&self, index: u32, view: &View) -> Option<Quick> {
         let buffer = match view {
-            View::Constant(..) | View::Placed(true, ..) => true,
+            View::Constant(..) => true,
             // A placed texture's view notes its memory, which may make
-            // other slots stale: not quick.
-            View::Placed(false, resource, _) => resource[0] == 1,
+            // other slots stale: not quick. Nor is an unordered one, which
+            // is made as the slot is written ([`View::is_buffer`]).
+            View::Placed(_, resource, _) => resource[0] == 1,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as crate::object::This).is_some()
             }
@@ -2717,15 +2718,24 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // SAFETY: a live buffer.
+        let size = unsafe { buffer.GetDesc() }.Width;
+        let (range, cut) = crate::rawrange::raw_range(size, offset, len);
+        if let Some(cut) = cut {
+            crate::rawrange::raw_range_count("SRV", cut, offset, len, size);
+        }
+        let Some(range) = range else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -2752,14 +2762,23 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // SAFETY: a live buffer.
+        let size = unsafe { buffer.GetDesc() }.Width;
+        let (range, cut) = crate::rawrange::raw_range(size, offset, len);
+        if let Some(cut) = cut {
+            crate::rawrange::raw_range_count("UAV", cut, offset, len, size);
+        }
+        let Some(range) = range else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -4412,10 +4431,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                // No texture could be made for it ([`placed_texture`]): a
+                // null view, whose writes are dropped.
+                // At address 0 the view is the title's null descriptor (no
+                // texture can be made there: `texture_at` and
+                // `uav_texture_at` refuse it): a null view is what it asks
+                // for, and nothing to say. The old "not mirrored" line was
+                // this, for a sampling view, not an unordered one.
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if address != 0 {
+                    once!(
+                        dimension = resource[0],
+                        unordered = *unordered,
+                        address = format_args!("{address:#x}"),
+                        resource = ?resource,
+                        view = ?desc,
+                        "a placed texture view has no host texture: a null view"
+                    );
+                }
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -4460,19 +4493,28 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in
+/// memory itself, as a view of the resource made for that memory (on first
+/// use): for a shader view one filled from that memory, for an unordered
+/// one the host's own, which the views placed to sample the memory take
+/// their texels from (`crate::resource::alias_of`).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let &View::Placed(unordered, ref resource, ref desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    if unordered {
+        let texture = crate::resource::uav_texture_at(address, resource, desc[0])?;
+        Some(View::Unordered(texture as usize, 0, words))
+    } else {
+        let texture = crate::resource::texture_at(address, resource)?;
+        Some(View::Shader(texture as usize, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
