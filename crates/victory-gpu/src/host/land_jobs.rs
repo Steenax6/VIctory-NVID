@@ -185,9 +185,13 @@ pub(super) fn line(frames: f64) {
     if jobs == 0 && !sample_on() {
         return;
     }
+    let [whole, whole_bytes, whole_stretches, scattered] = [0, 1, 2, 3].map(|i| crate::shadow::WHOLE_RUNS[i].load(Relaxed));
     tracing::info!(
-        "the landings' merges as jobs: {:.1} jobs a frame, at most {most} in one landing{}",
+        "the landings' merges as jobs: {:.1} jobs a frame, at most {most} in one landing; since the start {whole} runs that \
+         changed almost whole merged without reading title memory first ({:.1} MB, {whole_stretches} stretches of changed \
+         bytes written), {scattered} such runs changed in more stretches and read first{}",
         jobs as f64 / frames,
+        whole_bytes as f64 / 1e6,
         if sample_on() {
             format!(
                 "; the sample at the telling (VICTORY_LAND_SAMPLE=1) since the last line: {looked} stretches looked at, {differed} \

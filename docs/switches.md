@@ -186,7 +186,9 @@ the merge one run after the other are gone; `VICTORY_LAND_SAMPLE=1` is
 its check): what shaders wrote to copies in the card's memory is merged
 into title memory as jobs of 256 KiB of one copy each, on the wide threads
 and the landing thread, all done before the landing goes on; the copy's
-side lock is one per 64 KiB piece.
+side lock is one per 64 KiB piece. A run that changed almost whole with
+nothing of it waiting to go up, in eight stretches of changed bytes or
+fewer, is written by those stretches without reading title memory first.
 The timeline names each job (`job>`, `job<`). `=1` samples, at the
 telling, the last stretch of every eighth run: the bytes it landed in
 title memory and the copy's CPU side must be the same; the line "the

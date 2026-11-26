@@ -4969,7 +4969,8 @@ impl Shadow {
             let (found, stretches, write) = &mut *scratch;
             // A run that changed almost everywhere (a buffer rewritten whole)
             // is merged whole: no looking for stretches in it.
-            if crate::card_fine::wide_compare() && crate::card_fine::mostly_changed(gpu, held) {
+            let mostly = crate::card_fine::wide_compare() && crate::card_fine::mostly_changed(gpu, held);
+            if mostly {
                 found.clear();
                 found.push((0, gpu.len()));
             } else {
@@ -4992,7 +4993,32 @@ impl Shadow {
                     .collect()
             };
             stretches.clear();
-            if skip.is_empty() {
+            // Such a run with nothing of it waiting to go up is not read from
+            // title memory first: the bytes the card changed are written, and
+            // title memory is left as it is around them (the merge's result,
+            // byte for byte, without reading what it keeps).
+            // Where the changed bytes lie in more than a few stretches (bytes
+            // the card left as they were, between them), one read of the run
+            // and one write cost less than a write a stretch: merged as
+            // before.
+            let mut whole = mostly && skip.is_empty();
+            if whole {
+                crate::card_fine::changed_stretches(gpu, held, 0, found);
+                stretches.extend(found.iter().map(|&(a, n)| (at + a, at + a + n)));
+                if stretches.is_empty() {
+                    return 0;
+                }
+                if stretches.len() > WHOLE_MOST {
+                    stretches.clear();
+                    stretches.push((at, at + gpu.len()));
+                    whole = false;
+                    WHOLE_RUNS[3].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    WHOLE_RUNS[0].fetch_add(1, Ordering::Relaxed);
+                    WHOLE_RUNS[1].fetch_add(gpu.len() as u64, Ordering::Relaxed);
+                    WHOLE_RUNS[2].fetch_add(stretches.len() as u64, Ordering::Relaxed);
+                }
+            } else if skip.is_empty() {
                 stretches.extend(found.iter().map(|&(a, n)| (at + a, at + a + n)));
             } else {
                 for &(a, n) in found.iter() {
@@ -5011,6 +5037,19 @@ impl Shadow {
             for &(a, b) in stretches.iter() {
                 let (o, n) = (a - at, b - a);
                 let t = &mut title[put..put + n];
+                if whole {
+                    // Every byte of these stretches is one the card changed:
+                    // the merge puts the card's byte there.
+                    t.copy_from_slice(&gpu[o..o + n]);
+                    held[o..o + n].copy_from_slice(&gpu[o..o + n]);
+                    if merge_race_on() {
+                        races.push(Vec::new());
+                    }
+                    write.push(true);
+                    any = true;
+                    put += n;
+                    continue;
+                }
                 let mapped = crate::host::read_into((start + a) as *const u8, t);
                 if merge_race_on() {
                     races.push(if mapped { t.to_vec() } else { Vec::new() });
@@ -5332,6 +5371,16 @@ pub(crate) fn landed_line(frames: f64) {
 /// pattern. An equal byte inside a stretch is put back as the title holds
 /// it (as the old merge did for its whole span).
 const MERGE_JOIN: usize = 64;
+
+/// Since the start: runs merged whole without reading title memory first
+/// (`Shadow::card_merge_relay_fast`), their bytes, the stretches of
+/// changed bytes written of them; and the runs that changed almost whole
+/// in more than [`WHOLE_MOST`] stretches, merged as before.
+pub(crate) static WHOLE_RUNS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The most stretches of changed bytes a run that changed almost whole is
+/// written in without reading title memory first.
+const WHOLE_MOST: usize = 8;
 
 thread_local! {
     /// Whether [`Shadow::card_merge_relay_fast`] on this thread keeps the
