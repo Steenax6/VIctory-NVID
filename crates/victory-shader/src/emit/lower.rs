@@ -652,7 +652,34 @@ fn lane_scalars(p: &Program, res: &Resources) -> HashSet<Value> {
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
 fn meeting_mode() -> u32 {
+    MEETINGS.set(MEETINGS.get() + 1);
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
+}
+
+/// How many group barriers the lowerings on this thread have added since the last call (the
+/// meetings of a console wave's host waves, [`meeting_mode`]), which it forgets: what a
+/// translated program pays for running a console wave as two host waves that meet.
+pub(super) fn take_meetings() -> u32 {
+    MEETINGS.take()
+}
+
+/// Whether every `v_readfirstlane_b32` of `p` that each host wave on its own
+/// ([`with_local_waves`]) would read in its own first lane reads what that lane holds in every
+/// lane of the console wave: a scalar, a value [`lane_uniform`] finds the same in every lane,
+/// or one `plain` does not name (`super::idiom::plain_first_lane_reads`: the reserved base,
+/// which each host wave's first lane reserved for its own lanes). The allocation idiom
+/// ([`super::idiom::wave_local`]) takes any other value as it is, which is exact only when no
+/// such read is of a value that differs between lanes: the upper host wave would read its
+/// lane 32's where the console reads lane 0's.
+pub(super) fn first_lane_reads_alike(p: &Program, st: &Structured, plain: &[Value]) -> bool {
+    if plain.is_empty() {
+        return true;
+    }
+    let Some(all) = all_lane_blocks(st) else {
+        return false;
+    };
+    let same = lane_uniform(p, st, &all);
+    plain.iter().all(|v| same.contains(v))
 }
 
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
@@ -778,6 +805,8 @@ pub fn set_host_max_wave(lanes: u32) {
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// See [`take_meetings`].
+    static MEETINGS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].

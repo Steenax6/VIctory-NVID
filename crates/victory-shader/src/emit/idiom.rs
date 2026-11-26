@@ -39,6 +39,39 @@ enum Wave {
 // host wave's first lane), and a guarded write of a plain value over a wave-dependent one is
 // the only mix of old and new lanes that is looked at.
 pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'static str)> {
+    kinds(p, st).map(drop)
+}
+
+/// The VGPR values the `v_readfirstlane_b32`s of `p` outside whole-wave sections read that
+/// depend on nothing [`wave_local`] follows ([`Wave::Plain`]), where `p` is the idiom: under
+/// [`super::lower::with_local_waves`] each host wave reads its own first lane's, which is the
+/// console's only where the value is the same in every lane
+/// ([`super::lower::first_lane_reads_alike`]). A reserved base is not among them: each host
+/// wave's first lane reserved it for that wave's lanes.
+pub(super) fn plain_first_lane_reads(p: &Program, st: &Structured) -> Result<Vec<Value>, (usize, &'static str)> {
+    let kind = kinds(p, st)?;
+    let mut out = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        let sections = super::wave::sections(p, b);
+        for (i, inst) in block.insts.iter().enumerate() {
+            if inst.name() != "v_readfirstlane_b32" || sections.iter().any(|(s, sec)| i > *s && i < sec.end) {
+                continue;
+            }
+            let Fields::Valu(v) = &inst.fields else { continue };
+            if let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                && let Some(x) = inst.read(Reg::V(reg))
+                && !kind.contains_key(&x)
+            {
+                out.push(x);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`wave_local`]'s finding: what each wave-dependent value is (a value it does not hold is
+/// [`Wave::Plain`]).
+fn kinds(p: &Program, st: &Structured) -> Result<HashMap<Value, Wave>, (usize, &'static str)> {
     use super::wave::{Op, Shape};
     const FIRST: Why = "a wave's first-lane number used as data";
     const TOTAL: Why = "a count or sum over the wave used as data";
@@ -327,5 +360,6 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     if !settled {
         return Err((0, MIXED));
     }
-    pass(&mut kind, &mut firsts, true)
+    pass(&mut kind, &mut firsts, true)?;
+    Ok(kind)
 }

@@ -1514,3 +1514,91 @@ fn exchanges_in_a_loop_and_around_a_branch_take_their_pairs_in_turn() {
     }
     eprintln!("ran on the hardware device: exchanges in a loop and a branch, both forms, two console waves");
 }
+
+// ---- each host wave on its own before the forms that meet (`VICTORY_WAVE_LOCAL_FIRST`) ----
+
+/// The allocation idiom in every lane of one console wave: the first lane adds the wave's count
+/// to a counter, each lane takes base + the lanes below (v6) and stores it; with
+/// `plain_first_lane`, also a first-lane read of the thread's index (v0) stored, which the
+/// upper host wave on its own would read in its lane 32 where the console reads lane 0.
+fn allocation_everywhere(plain_first_lane: bool) -> NativeProgram {
+    let mut w = vec![
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBE84_147E, // s_ff1_i32_b64 s4, exec
+        0xD765_0004,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v4, -1, 0
+        0xD766_0004,
+        0x0002_08C1, // v_mbcnt_hi_u32_b32 v4, -1, v4: the lane
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0x7DA4_0804, // v_cmpx_eq_u32 exec, s4, v4: the first lane
+        0xBE82_1002, // s_bcnt1_i32_b64 s2, s[2:3]: the count
+        0x7E0A_0202, // v_mov_b32 v5, s2
+        0x7E16_0280, // v_mov_b32 v11, 0
+        0xE0C8_5000,
+        0x8002_050B, // buffer_atomic_add v5, v11, s[8:11], 0 offen glc
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xD765_0004,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v4, exec_lo, 0
+        0xD766_0004,
+        0x0002_087F, // v_mbcnt_hi_u32_b32 v4, exec_hi, v4: the lanes below
+        0x7E0A_0505, // v_readfirstlane_b32 s5, v5: the base
+        0x4A0C_0805, // v_add_nc_u32 v6, s5, v4
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 6 << 8, // buffer_store_dword v6, off, s[8:11], 0
+    ];
+    if plain_first_lane {
+        w.extend([
+            0x7E1C_0500, // v_readfirstlane_b32 s14, v0: the first lane's index
+            0x7E0E_020E, // v_mov_b32 v7, s14
+            0x38 << 26 | 0x1C << 18 | 4,
+            0x80 << 24 | 2 << 16 | 7 << 8, // buffer_store_dword v7, off, s[8:11], 0 offset:4
+        ]);
+    }
+    native(&w)
+}
+
+/// A console wave64 program whose only wave operations are the allocation idiom translated as
+/// two host waves that exchange meets at group barriers; each host wave on its own meets only
+/// where the host waves are numbered and is exact for it. With the switch on, [`super::emit_forms`] takes that form;
+/// with `VICTORY_WAVE_LOCAL_FIRST=0` the one that meets, as before. A first-lane read of a value
+/// that differs between lanes keeps the program in the form that meets.
+#[test]
+fn the_allocation_idiom_takes_each_host_wave_on_its_own_before_the_forms_that_meet() {
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    for plain_first_lane in [false, true] {
+        let native = allocation_everywhere(plain_first_lane);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        assert_eq!(super::idiom::wave_local(&p, &st), Ok(()), "the idiom");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        lower::take_meetings();
+        let meeting = super::emit_program(&c, &native, &p, &st, &io, &res);
+        let met = lower::take_meetings();
+        let alone = lower::with_local_waves(|| super::emit_program(&c, &native, &p, &st, &io, &res));
+        let alone_met = lower::take_meetings();
+        let chosen = |on: bool| {
+            let first = super::TEST_LOCAL_FIRST.replace(Some(on));
+            let r = super::emit_forms(&c, &native, &p, &st, &io, &res);
+            super::TEST_LOCAL_FIRST.set(first);
+            r.expect("emit_forms")
+        };
+        let (on, off) = (chosen(true), chosen(false));
+        lower::TEST_HOST_WAVE.set(was);
+        let (meeting, alone) = (meeting.expect("the form that meets"), alone.expect("each host wave alone"));
+        assert_eq!((meeting.1, alone.1, on.1, off.1), (Some(32), Some(32), Some(32), Some(32)));
+        assert!(met > 0, "the form that meets has group barriers");
+        assert!(alone_met < met, "each host wave on its own meets less: {alone_met} against {met}");
+        assert!(off.0.dxil == meeting.0.dxil, "VICTORY_WAVE_LOCAL_FIRST=0: the form that meets");
+        if plain_first_lane {
+            assert!(on.0.dxil == meeting.0.dxil, "a first lane's own value read: the form that meets");
+        } else {
+            assert!(on.0.dxil == alone.0.dxil, "switch on: each host wave on its own");
+        }
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut on.0.dxil.clone()).expect("DXIL validation failed");
+        }
+    }
+}
