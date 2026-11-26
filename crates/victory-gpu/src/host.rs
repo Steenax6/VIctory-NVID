@@ -4848,7 +4848,7 @@ impl Host {
         }
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
-        let mut order = relay().then(|| queue_order());
+        let mut order = relay().then(queue_order);
         let sent_as = match order.as_mut() {
             Some(order) => {
                 **order += 1;
