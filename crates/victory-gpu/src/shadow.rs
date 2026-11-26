@@ -54,6 +54,10 @@ pub(crate) struct Shadow {
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
     before: Mutex<Option<Vec<u8>>>,
+    /// For a copy in the card's memory, which has no snapshot: one lock a
+    /// 64 KiB piece (cut as [`pieces_of`] cuts them) over its CPU side,
+    /// made when first taken ([`Shadow::side_of`]).
+    side_pieces: std::sync::OnceLock<Box<[Mutex<()>]>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -3111,12 +3115,61 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// [`Shadow::side_of`]: the locks held.
+enum SideGuard<'a> {
+    /// A copy in the card's memory: its pieces' locks, in order (held,
+    /// never read).
+    Pieces { _held: Vec<std::sync::MutexGuard<'a, ()>> },
+    /// Any other copy: its snapshot, locked.
+    Snapshot(std::sync::MutexGuard<'a, Option<Vec<u8>>>),
+}
+
+impl SideGuard<'_> {
+    /// The snapshot of a copy that has one.
+    fn snapshot(&mut self) -> Option<&mut Vec<u8>> {
+        match self {
+            SideGuard::Snapshot(before) => before.as_mut(),
+            SideGuard::Pieces { .. } => None,
+        }
+    }
+}
+
 impl Shadow {
     /// The lock of the copy's reference (`before`: its snapshot, or what
     /// stands for the CPU's side of a copy in the card's memory), taken; a
     /// wait of 0.2 ms or more for it is an event of `crate::timeline`.
     fn side(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
         crate::timeline::waited("L:side", || self.before.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// What holds offsets `[from, to)` of the copy's CPU side still for a
+    /// merge (rule R2: no byte goes into it inside a range shaders write
+    /// but through the merge of a landing or [`Shadow::merge_under_writes`],
+    /// and the two never see each other half done): for a copy in the
+    /// card's memory the locks of the 64 KiB pieces that hold the offsets,
+    /// taken in the order of the pieces; for any other copy its snapshot's
+    /// lock ([`Shadow::side`]).
+    ///
+    /// One lock for the whole copy had every merge of a landing into the
+    /// heap's copy (174 MB) queue on it: the helper threads that merged
+    /// beside the landing's thread waited 15.4 ms a frame for it. Pieces of
+    /// one copy are its own bytes and title memory's; what a merge or a
+    /// putting in of title bytes reads and writes lies in the pieces it
+    /// holds. A wait of 0.2 ms or more is `L:side` of the timeline.
+    fn side_of(&self, from: usize, to: usize) -> SideGuard<'_> {
+        if self.card.is_none() {
+            return SideGuard::Snapshot(self.side());
+        }
+        let locks = self.side_pieces.get_or_init(|| {
+            let n = pieces_of(self.start as usize, 0, (self.len as usize).max(1)).end;
+            (0..n).map(|_| Mutex::new(())).collect()
+        });
+        let pieces = if from < to { self.pieces(from, to) } else { 0..0 };
+        SideGuard::Pieces {
+            _held: crate::timeline::waited("L:side", || {
+                pieces.filter_map(|p| locks.get(p)).map(|lock| lock.lock().unwrap_or_else(|e| e.into_inner())).collect()
+            }),
+        }
     }
 
     /// The host GPU address of a title address inside the buffer.
@@ -3239,6 +3292,7 @@ impl Shadow {
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
+            side_pieces: std::sync::OnceLock::new(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
@@ -3846,8 +3900,10 @@ impl Shadow {
                     // puts what the card wrote into title memory and into the
                     // reference under the same lock, and a page read before
                     // such a merge and compared after it would take the card's
-                    // bytes for the title's.
-                    let mut before = self.side();
+                    // bytes for the title's. (For a copy in the card's memory
+                    // the lock of the piece that holds the page.)
+                    let at = lo - start;
+                    let mut before = self.side_of(at, at + n);
                     // A page that is not there is left as it is, and looked at
                     // again next time.
                     if !crate::host::read_into(lo as *const u8, title) {
@@ -3855,7 +3911,6 @@ impl Shadow {
                         continue;
                     }
                     MERGED[0].fetch_add(1, Ordering::Relaxed);
-                    let at = lo - start;
                     if self.card.is_some() {
                         // SAFETY: inside the mapping of the copy's CPU side,
                         // which only the submitting thread writes.
@@ -3905,7 +3960,7 @@ impl Shadow {
                             }
                         }
                     } else {
-                        let Some(snapshot) = before.as_mut() else {
+                        let Some(snapshot) = before.snapshot() else {
                             #[cfg(feature = "diagnostics")]
                             crate::copystat::buffers::gave_up(crate::copystat::buffers::NO_SNAPSHOT, self.start, self.len, lo, 0, *runs_left);
                             return true;
@@ -4705,7 +4760,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.side();
+        let _side = self.side_of(at, at + gpu.len());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
@@ -4772,10 +4827,10 @@ impl Shadow {
         let mut same: Vec<(usize, u64, u32)> = Vec::new();
         let (mut outside, mut differed) = (0u64, 0u64);
         {
-            // The CPU side's lock, as the merge holds it: what else writes
-            // these bytes of it (title bytes put in under shader writes)
-            // holds it too, and no refresh writes a range not done with.
-            let _side = self.side();
+            // The CPU side's lock, as the merge holds it, for each kernel
+            // page looked at: what else writes these bytes of it (title
+            // bytes put in under shader writes) holds it too, and no
+            // refresh writes a range not done with.
             READ.with(|read| {
                 let mut read = read.borrow_mut();
                 read.resize(KERNEL_PAGE, 0);
@@ -4788,6 +4843,7 @@ impl Shadow {
                             holds = false;
                             break;
                         }
+                        let _side = self.side_of(lo - start, hi - start);
                         // SAFETY: `[lo, hi)` lies inside the copy (checked
                         // above), so inside the mapping of its CPU side.
                         let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start).cast_const(), KERNEL_PAGE) };
@@ -4905,7 +4961,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.side();
+        let _side = self.side_of(at, at + gpu.len());
         // SAFETY: as in `card_merge_relay`.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         MERGE_SCRATCH.with(|scratch| {
