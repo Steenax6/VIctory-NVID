@@ -8,6 +8,11 @@
 //! since the first of those presents, the thread, the event and two numbers
 //! of its own (see the callers). Without the variable an event costs one
 //! load of a flag.
+//!
+//! Waits for the pipeline's locks of 0.2 ms and more are events (`L:*`,
+//! [`waited`]); for the guards' lock so are its holds, by holder (`H:*` a
+//! hold of 0.2 ms and more, `HS:*` a thread's holds summed, [`held`]):
+//! a wait names the lock, and only the holds say who kept it.
 
 #[cfg(feature = "diagnostics")]
 mod on {
@@ -61,6 +66,45 @@ mod on {
             ev(name, us, 0);
         }
         taken
+    }
+
+    thread_local! {
+        /// What this thread held a lock for since it last said so, by
+        /// holder: nanoseconds and holds ([`held`]).
+        static HELD: std::cell::Cell<[(u64, u64); super::HOLDERS]> = const { std::cell::Cell::new([(0, 0); super::HOLDERS]) };
+    }
+
+    /// A lock taken at `started` (from [`clock`]; `None`: no events were
+    /// kept then) is let go now by its holder number `slot`. A hold of
+    /// 0.2 ms or more is the event `long` with its microseconds and `b`;
+    /// and every hold is summed for the thread, which says the event `sum`
+    /// (microseconds, holds) whenever that reaches a millisecond or 256
+    /// holds: many short holds keep others waiting as one long one does.
+    /// What a thread has summed and not said when the events end (under a
+    /// millisecond for each holder) is not in the file.
+    #[inline]
+    pub(crate) fn held(slot: usize, long: &'static str, sum: &'static str, started: Option<Instant>, b: u64) {
+        let Some(started) = started else {
+            return;
+        };
+        if !on() {
+            return;
+        }
+        let ns = started.elapsed().as_nanos() as u64;
+        if ns >= 200_000 {
+            ev(long, ns / 1000, b);
+        }
+        let said = HELD.with(|h| {
+            let mut held = h.get();
+            let of = held.get_mut(slot)?;
+            *of = (of.0 + ns, of.1 + 1);
+            let said = (of.0 >= 1_000_000 || of.1 >= 256).then(|| std::mem::take(of));
+            h.set(held);
+            said
+        });
+        if let Some((ns, holds)) = said {
+            ev(sum, ns / 1000, holds);
+        }
     }
 
     /// The steps of one piece of work, each said when it ends with the
@@ -183,10 +227,13 @@ mod on {
     }
 }
 
+/// The holders a lock's holds are summed for, by number ([`held`]).
+pub(crate) const HOLDERS: usize = 12;
+
 #[cfg(feature = "diagnostics")]
 pub use on::ev;
 #[cfg(feature = "diagnostics")]
-pub(crate) use on::{Steps, clock, on, present, sum, took, waited};
+pub(crate) use on::{Steps, clock, held, on, present, sum, took, waited};
 
 /// Ends a span begun with [`span`]: its end event when dropped.
 pub(crate) struct Span(&'static str, u64);
@@ -223,6 +270,10 @@ pub(crate) fn on() -> bool {
 pub(crate) fn waited<T>(_name: &'static str, take: impl FnOnce() -> T) -> T {
     take()
 }
+
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+pub(crate) fn held(_slot: usize, _long: &'static str, _sum: &'static str, _started: Option<std::time::Instant>, _b: u64) {}
 
 /// Without diagnostics: nothing is timed.
 #[cfg(not(feature = "diagnostics"))]

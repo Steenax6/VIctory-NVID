@@ -56,7 +56,7 @@ frame pressed for the game's next read.
 | `VICTORY_CARD_CONSTANTS` (2026-11-26; in every run since, not measured on its own) | constant buffers of fresh descriptor tables that lie in a host copy in the card's memory are bound there, not filled into upload memory behind the flights (theinkbit/victory-lot9-next ffd04e130) |
 | `VICTORY_HEAP_SYNC_FAST`, `VICTORY_DESCRIPTOR_STRIPES` | descriptor records the title copies into its heap are found by the write watch's 4 KiB pages and mirrored in runs; slots have striped locks, so recording threads no longer stand behind that pass |
 | `VICTORY_SHADOW_CACHE` | recording threads remember which host copy an address range has |
-| `VICTORY_USER_COPY`, `VICTORY_REFRESH_PARTS`, `VICTORY_REFRESH_4K`, `VICTORY_GUARD_4K`, `VICTORY_MARK_ONLY`, `VICTORY_VIEW_KNOWN`, `VICTORY_ABSENT_ONCE`, `VICTORY_ASK_SKIP_VIEWS`, `VICTORY_ALIAS_RUNS`, `VICTORY_SEND_CHANGED` | title memory is copied by the processor (a fault falls back to the kernel's copy), by 4 KiB pages and only where written; guards are not re-armed over other views; unmapped runs are remembered (`VICTORY_ABSENT_FRAMES`, 30); bytes the copy-back itself wrote are not sent up to the card again |
+| `VICTORY_USER_COPY`, `VICTORY_REFRESH_PARTS`, `VICTORY_REFRESH_4K`, `VICTORY_GUARD_4K`, `VICTORY_VIEW_KNOWN`, `VICTORY_ABSENT_ONCE`, `VICTORY_ASK_SKIP_VIEWS`, `VICTORY_SEND_CHANGED` | title memory is copied by the processor (a fault falls back to the kernel's copy), by 4 KiB pages and only where written; guards are not re-armed over other views; unmapped runs are remembered (`VICTORY_ABSENT_FRAMES`, 30); bytes the copy-back itself wrote are not sent up to the card again |
 | `VICTORY_TEXTURE_DROP_LEVELS` (`0`, `auto`, `force1`, `force2`), `VICTORY_TEXTURE_PROMOTE_MB`, `VICTORY_RESERVED_REUSE`, `VICTORY_STAGE_LEFT_OUT`, `VICTORY_TILED_IDLE_MS`, `VICTORY_STAGING_POOL_MB` | large block-compressed title textures (1024 a side and more) are made as reserved textures and, past a line of host-copy bytes, without their one or two most detailed levels; their views clamp the level of detail, so the sizes shaders read stay the title's. On a 12 GB card the title's textures did not all fit: some 22,000 waited for room in every run, and which were there differed from run to run (the first room came up lit in one run, dark in the next). Now none is held back there. Reserved textures and staging buffers are reused, not made and released |
 | `VICTORY_PLACED_TEX=1` (opt-in; `play.ps1` sets it) | the other host textures of placed textures come out of 16 MiB heaps instead of an allocation each (fxceless/victory-fork pull request #903 with smaller heaps, filled fullest first): making one takes 9 us; about 1 GB of the card stays free inside the heaps after the cutscene |
 | `VICTORY_GROUP_SPLIT`, `VICTORY_GROUP_PIECES=2` | a dispatch that asks for more than 65,535 thread groups in x runs in pieces, each told where its groups start (pull request #976), indirect records too: one of the title's indirect lighting passes asks for about 75,000 and lost its tail, a band of stale blocks along the bottom of the picture |
@@ -176,6 +176,22 @@ guards line's "equal to the CPU side, not sent up" should fall by about
 that. Each taking costs a kernel call of 30 to 70 microseconds on the
 landing thread.
 
+The same for view memory (2026-11-26; no switch of its own,
+`VICTORY_LAND_TAKEN=2` is its check too): there the kernel keeps no
+bits, the landing writes beside the guards and tells them, and the next
+refresh's check reported the blocks to the landing's own copy as to
+every other. The landing takes the guards' marks of its blocks right
+behind the telling (the journal's lock held; noted in the journal at
+once), and its copy compares and counts as above. Only blocks a check
+could note clean without a call are taken: one a store of the title's
+opened meanwhile, or a view of whose pages became writable, is its next
+check's. The line "landings' marks taken in view memory" counts the
+landings, blocks and kernel pages (some 360 blocks and 5.7 MB a frame in
+the first room); what the copies count taken is in the line above it,
+with the pages of private memory. For the check, "written again since"
+is asked of the guards where the kernel's bit is asked for private
+memory.
+
 To check both in a run: `VICTORY_REFRESH_EVENTS=2 VICTORY_LAND_TAKEN=2
 VICTORY_REFRESH_CHECK=1`; the lines "refreshes by event", "landings'
 written bits taken" and "refresh check, since the start" must count no
@@ -195,7 +211,13 @@ with what the guards hold of the block); of them, those that matched
 again once a write behind the guards was told there and those that
 matched again with none told; and blocks that differed for two seconds
 with nothing told. Only the last are copies that keep old bytes; each is
-named a second time.
+named a second time, with what the guards hold of every other view of
+the block's pages and whether that view is writable. Until 2026-11-26 a
+run of the prologue had some 1,600 of them, every one a block with a
+writable view of its pages elsewhere (the title's own, opened for a read
+or by a fault and never guarded again); a check that notes a block clean
+now makes every view of its pages read-only first, and the count is 0
+(`docs/architecture.md`, "S3 as built").
 
 A read of the kernel's into title memory (`ReadFile`) now says when it is
 done, and blocks a check guarded again while the kernel was writing count
@@ -626,7 +648,13 @@ two frames, on five threads that share three locks a slot).
   The longest send of a frame is the list that makes the heap's buffers
   ready: one flush of about 4,600 copies, almost all with nothing to
   copy, 7 to 13 ms; spread over threads they cost more than on one.
-- `VICTORY_HOT_BLOCKS=1`, `VICTORY_NAMED_WRITES=1`: not yet tried in a run.
+- `VICTORY_NAMED_WRITES=1`: not yet tried in a run. (`VICTORY_HOT_BLOCKS`,
+  blocks written often left open, was never run and is gone, and with it
+  the guards' changes of protection under their lock,
+  `VICTORY_GUARD_UNLOCKED=0` and `VICTORY_ALIAS_RUNS=0`; and
+  `VICTORY_MARK_ONLY=0`, which opened every other view of a written
+  block's pages: what keeps a clean block's other views read-only goes by
+  the marks.)
   (`VICTORY_MERGE_FORGET` is gone: it dropped the kernel's written bits a
   landing set, and with them the title's of before the landing;
   `VICTORY_LAND_TAKEN` takes them and notes them.)
@@ -661,7 +689,7 @@ Diagnostics build: `cargo build --profile diag -p victory --features diagnostics
 | Switch | Effect |
 |---|---|
 | `VICTORY_CAPTURE=<dir>` + `VICTORY_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
-| `VICTORY_TIMELINE=<file>` (+ `VICTORY_TIMELINE_AFTER=<seconds>`, 130 unless told; `VICTORY_TIMELINE_FRAMES=<n>`, 8 unless told) | a few frames event by event (diagnostics build): one line per event with the milliseconds since the first of those presents, the thread, the event and two numbers of its own. Events: the present call and its return, each submission of the title and its signals, what the submitting thread sends and when it idles, what the landing thread lands, bottom-of-pipe writes and fences set, every list's reset and close (the close with what the list holds: draws, indexed draws, indirect executions and dispatches, sixteen bits each), the pass over picked buffer views on its thread (`pass>`, `pass<`) and a submission that waits for it (`pwait>`, `pwait<`), the early pass over textures picked by index (`early>`, `early<`), and the title's own waits and wake-ups (`WaitForSingleObject`, `SetEvent`, `ReleaseSemaphore`, served by the layer only with this switch). It shows what a frame waits for where the profile only shows who idles. Also in it: the steps of every send with their microseconds (`p.blocked`, `p.heap`, `p.sweep`, `p.ask`, `p.stale`, `p.steps`, `p.refresh`, `p.texture`, `p.prelude`, `p.snap`, `p.card`, `p.exec`), each submission sent (`sent`: its number and the value signalled behind it), the card reaching that value (`done`, from a thread that only waits for it), the landing's steps (`l.fetch`, `l.merge`, `l.card`, `l.hand`, `l.done`, `l.tell`, `l.bury`) and the submissions landed (`landed`), a wait of the submitting thread for landings (`rwait>`, `rwait<`), and every wait of 0.2 ms or more for one of the pipeline's locks, named (`L:submitted`, `L:line`, `L:cardwork`, `L:order`, `L:journal`, `L:guards`, `L:mapping.r`, `L:mapping.w`, `L:side`, `L:queue`) with the microseconds waited |
+| `VICTORY_TIMELINE=<file>` (+ `VICTORY_TIMELINE_AFTER=<seconds>`, 130 unless told; `VICTORY_TIMELINE_FRAMES=<n>`, 8 unless told) | a few frames event by event (diagnostics build): one line per event with the milliseconds since the first of those presents, the thread, the event and two numbers of its own. Events: the present call and its return, each submission of the title and its signals, what the submitting thread sends and when it idles, what the landing thread lands, bottom-of-pipe writes and fences set, every list's reset and close (the close with what the list holds: draws, indexed draws, indirect executions and dispatches, sixteen bits each), the pass over picked buffer views on its thread (`pass>`, `pass<`) and a submission that waits for it (`pwait>`, `pwait<`), the early pass over textures picked by index (`early>`, `early<`), and the title's own waits and wake-ups (`WaitForSingleObject`, `SetEvent`, `ReleaseSemaphore`, served by the layer only with this switch). It shows what a frame waits for where the profile only shows who idles. Also in it: the steps of every send with their microseconds (`p.blocked`, `p.heap`, `p.sweep`, `p.ask`, `p.stale`, `p.steps`, `p.refresh`, `p.texture`, `p.prelude`, `p.snap`, `p.card`, `p.exec`), each submission sent (`sent`: its number and the value signalled behind it), the card reaching that value (`done`, from a thread that only waits for it), the landing's steps (`l.fetch`, `l.merge`, `l.card`, `l.hand`, `l.done`, `l.tell`, `l.bury`) and the submissions landed (`landed`), a wait of the submitting thread for landings (`rwait>`, `rwait<`), and every wait of 0.2 ms or more for one of the pipeline's locks, named (`L:submitted`, `L:line`, `L:cardwork`, `L:order`, `L:journal`, `L:guards`, `L:mapping.r`, `L:mapping.w`, `L:side`, `L:queue`) with the microseconds waited. For the guards' locks (one a region of 4 MiB; `L:guards` is a wait for those an operation takes together) the holds are in it too, by holder: every hold of 0.2 ms or more (`H:check` a check's walk over its blocks, with the blocks of its range; `H:settle`; `H:fault` a write of the title's that faulted; `H:opening`, `H:marking` writes of the layer's and the runtime's; `H:mapped`, `H:remapped` the runtime's mappings), and each thread's holds summed (`HS:` and the same names: microseconds and holds, said whenever a thread has a millisecond or 256 holds together), since many short holds keep the others waiting as one long hold does |
 | `VICTORY_READ_CENSUS=<n>` | a count, not for frame rate: one 4 KiB page in `n` of what landings write into private title memory is made inaccessible until its next access, and the line "read census" says per frame who touched such pages first: other code than the layer's on a title thread (the title's own reads and writes), the layer's code on a title thread, another thread of the layer's, or the landing thread's own next access with nothing between (nobody on the processor's side looked at what was brought back). Run it with `VICTORY_LAND_TAKEN=1`, so that the copy's own refresh does not read the pages again |
 | `VICTORY_SEEN_CHECK=1` | diagnostics build: a draw makes ready every view of its tables as it did before a list remembered what it had made ready (`draw.rs`, `Seen`), and makes every buffer view again that its list would copy from the ones it kept (`descriptor/host.rs`, `KeptViews`); the frame lines count the views a list knew ready that were not (the recording then holds another step, upload, state or kept object) and the kept views that are not the descriptor made now. Both stayed 0 over 100 million views and 29 million copies in the first room (2026-11-26). It costs what the remembering saves |
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build); the key bindings make them pad input |

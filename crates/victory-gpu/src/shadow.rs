@@ -5184,6 +5184,19 @@ static LANDED: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 /// still closed to refreshes: see [`land_taken`].
 pub(crate) fn landed(pieces: &[(Arc<Shadow>, usize, usize)]) {
     let mode = land_taken();
+    // The pieces in view memory: the guards' marks of them are taken as the
+    // kernel's bits are below, and counted by the same copy.
+    crate::watch::landed_views(
+        pieces
+            .iter()
+            .filter(|(shadow, _, _)| shadow.card.is_some() && shadow.place.is_none())
+            .map(|(shadow, lo, hi)| (Arc::as_ptr(shadow) as usize, shadow.start as usize + lo, shadow.start as usize + hi)),
+        |copy, noted, runs, now| {
+            if let Some((shadow, _, _)) = pieces.iter().find(|piece| Arc::as_ptr(&piece.0) as usize == copy) {
+                shadow.landed_pages(noted, runs, now, mode);
+            }
+        },
+    );
     // The pieces in private memory, as title addresses.
     let mut private: Vec<(&Arc<Shadow>, usize, usize)> = pieces
         .iter()
