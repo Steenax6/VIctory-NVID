@@ -1153,11 +1153,16 @@ extern "system" fn present(
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     // (With list calls written down, every submission is translated first:
-    // what is free to run is then what it was before.)
-    #[cfg(windows)]
-    crate::list::thin::settle();
+    // what is free to run is then what it was before. Not for a present
+    // that goes into the line: it stands there behind the lists submitted
+    // before it, which the line's thread sends only once they are
+    // translated, and the title's thread need not wait for that.)
     #[cfg(windows)]
     let in_line = async_present();
+    #[cfg(windows)]
+    if !in_line {
+        crate::list::thin::settle();
+    }
     #[cfg(windows)]
     if in_line {
         // The present goes into the line below, behind the waits there;
@@ -1277,6 +1282,11 @@ extern "system" fn present(
             }
         }
         if let Some(show) = show {
+            // Shown from here after all (its queue held nothing): what
+            // other queues were given is translated first, as above.
+            if in_line {
+                crate::list::thin::settle();
+            }
             show();
         }
     }
