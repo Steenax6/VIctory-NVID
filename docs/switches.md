@@ -103,7 +103,8 @@ census's "guarded blocks opened by the layer's own writes" should fall to
 nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
 pull request 3069; this tree's own code).
 
-`VICTORY_REFRESH_EVENTS` (2026-11-26; off until its check has run again): a
+`VICTORY_REFRESH_EVENTS` (2026-11-26; off: its check counts 0 now, and with it and
+`VICTORY_LAND_TAKEN` on the frame did not move): a
 copy in view memory is not asked about again while nothing happened in
 its memory since it was last brought up to date. What can make a guarded
 block count as written (a write that faults, one of ours that opens or
@@ -141,7 +142,16 @@ then). The line now counts those askings as well: the ones that found
 blocks that had been absent, which is what they are for, and the ones
 that found other bytes no event had announced, which must be 0 too.
 
-`VICTORY_LAND_TAKEN=1` (2026-11-26; off, not yet run; `=2` is its check):
+Measured with both this switch and `VICTORY_LAND_TAKEN` at `=1` against
+unset, same build, back to back in the first room: preparing 36.4 against
+40.6 ms a frame, the copies read 70 against 89 MB a frame, the frame 67.8
+against 66.6 ms. The work comes off the submitting thread and the frame
+does not follow, because the title's render thread and the submitting
+thread take turns (see "Where the time goes"); both stay off until that
+is changed.
+
+`VICTORY_LAND_TAKEN=1` (2026-11-26; off; `=2` is its check, which counted 0 of
+743,252 pages in the prologue and 0 of 181,911 at the open world's entry):
 what shaders wrote into private title memory (which the kernel
 write-watches; no guard there) set the written bits of its pages, the
 next refresh took them for the title's, and the landing's own copy read
@@ -443,6 +453,26 @@ Since the title's buffers are in the card's memory the same room takes
 78.6 ms with the card busy 54 % of the time: the card alone no longer sets
 the pace there, and the title's recording threads and our submitting
 thread share the rest.
+
+On 2026-11-26 the first room takes 66 to 69 ms. A profile of it (35 s,
+1000 looks a second) shows no thread saturated: the submitting thread is
+on a processor 72 % of the frame and waits 26 %, each of the title's five
+recording threads is on a processor 48 % and waits 46 %, the thread that
+lands what shaders wrote 36 %. The title's render thread and the
+submitting thread take turns: about 30 ms the render thread waits for its
+recording (of the recording threads' 171 ms summed, 144 are our
+`State::bind`: what a draw may read 41, views made at the draw 36, clock
+reads 12) while the submitting thread idles 15 ms for want of work; then
+about 36 ms it stands in its present, blocked on the queue's lock until
+the submitting thread has sent the frame, while each recording thread
+idles 28 ms. The order is inferred from idle times that match, not seen
+event by event. So work taken off the submitting thread no longer
+shortens the frame by itself (4 ms less preparing left it where it was);
+what would is letting the two turns overlap (the present in the line of
+submissions; `VICTORY_ASYNC_PRESENT` was measured no faster when the
+submitting thread was the whole frame, and it faulted), the heap sync
+started at the title's submit instead of in the sending turn (9 ms), and
+less work in `State::bind` on the recording threads.
 
 ## Tried and not kept
 

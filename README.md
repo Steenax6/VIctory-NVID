@@ -18,8 +18,10 @@ mouse, for one). Each commit says where its change is from. The fork's
 ## Status (2026-11-26)
 
 Measured on Windows 11 with an **NVIDIA GeForce RTX 4070 Ti** (12 GB), an
-AMD Ryzen 7 9800X3D and 64 GB of memory, with the settings of
-`scripts\play.ps1`. Frame times are medians over a scene.
+AMD Ryzen 7 9800X3D and 64 GB of memory, driver 621.40, with the settings
+of `scripts\play.ps1`. Frame times are medians over a scene; they differ
+by a tenth from one hour to the next on this machine, so gains are stated
+from runs made back to back.
 
 | | |
 |---|---|
@@ -27,8 +29,8 @@ AMD Ryzen 7 9800X3D and 64 GB of memory, with the settings of
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase, boat, binoculars |
 | Open world | played from a save at the first boat mission: the boat floats, casts off and steers; on foot; a car is entered and driven |
 | Saves | the game's autosave is written and continued at the next start; a save made with another fork loads |
-| Frame rate | opening cutscene 7 to 10 fps (100 to 140 ms a frame, differs from run to run), first room 13.6 fps (74 ms), open world 11 to 12 fps in the first interior (82 to 92 ms); an earlier build held 77 ms by boat and by car over 22 minutes |
-| Stability | 22 minutes in the open world in one session, ended by hand: no device loss, no error in the log (an earlier build). The entry into the open world lost the host device in 10 of about 70 starts on 2026-11-26 (the card stands in an indirect draw of the terrain pass, no fault address), in several builds and none since the last 36; the cause is not found, and a loss now logs where the card stood |
+| Frame rate | opening cutscene 9 to 13 fps (78 to 115 ms a frame, differs from run to run), first room 15 fps (66 ms; back to back the tree of the morning of 2026-11-26 ran 13.3 fps there), open world 12 fps in the first interior (83 ms); an earlier build held 77 ms by boat and by car over 22 minutes |
+| Stability | 22 minutes in the open world in one session, ended by hand: no device loss, no error in the log (an earlier build). The entry into the open world lost the host device in 10 of about 70 starts on 2026-11-26 (the card stands in an indirect draw of the terrain pass, no fault address), in several builds and none in the 50 starts since; the cause is not found, and a loss now logs where the card stood |
 | Memory | the process peaks at 20 to 26 GB. The card's 12 GB are full: textures that do not fit lose their most detailed levels first and go to the PC's memory last; none waits for room, in the prologue or in the open world |
 | Known problems | the game's ray-traced lighting does not run yet: a stand-in fills in for its indirect light (`VICTORY_AMBIENT`), so what the sun does not reach is evenly lit, not black, and bright scenes overexpose; the black squares on the water are gone in the scene checked (the open world's opening shot), the shallows seen from a boat are not checked again yet |
 
