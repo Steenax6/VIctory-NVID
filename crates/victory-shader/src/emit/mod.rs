@@ -84,6 +84,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod coherent_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod descriptor_tests;

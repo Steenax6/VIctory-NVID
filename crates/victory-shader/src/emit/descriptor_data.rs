@@ -9,6 +9,27 @@ use super::{
 };
 
 impl<'a> Lower<'a> {
+    /// The title address (low dword, bits from 32 up) of the view at the heap slot the
+    /// descriptor load at `site` reads, from the host's table
+    /// ([`crate::emit::SLOT_VIEW_ADDRESSES`]), in the current block. After
+    /// ka1qux/BRVIctory-ka1qux 699236769 (from fxceless/victory-fork PR #994, PiloteCode).
+    pub(super) fn heap_view_address(&mut self, site: Site) -> Option<(V, V)> {
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let c = self.cur;
+        // Inside the table whatever the index (lanes that do not run compute one too).
+        let last = self.s.m.i32(crate::emit::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, super::Tag::Clamp);
+        let k3 = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, k3);
+        let h = self.s.root_srv_handle(crate::emit::SLOT_VIEW_ADDRESSES);
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), self.s.m.i32(4));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, both, align]);
+        let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        Some((self.as_int(lo), self.as_int(hi)))
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code reads as numbers, besides using the descriptor or (an image's
     /// size) instead of it: the console compiler computes sizes
