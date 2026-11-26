@@ -9033,6 +9033,7 @@ impl Meter {
             crate::watch::events_line(frames);
             crate::watch::kernel_line();
             crate::shadow::landed_line(frames);
+            crate::pipeline::compute_waits_line();
         }
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;

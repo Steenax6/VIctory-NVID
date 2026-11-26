@@ -629,6 +629,13 @@ pub(crate) fn passed_over() -> u64 {
     make::passed_over()
 }
 
+/// With the frame line: the compute pipelines dispatches stood for
+/// (`make::ready`).
+#[cfg(windows)]
+pub(crate) fn compute_waits_line() {
+    make::compute_waits_line();
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

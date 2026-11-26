@@ -182,7 +182,11 @@ are not cached yet (default: half the logical processors, at most 8). With
 to 6-12 s; 16 was no better than the default.
 
 `VICTORY_PIPELINE_WAIT_MS=24`: a shorter per-frame wait for pipelines still
-being built (objects can go missing meanwhile).
+being built (objects can go missing meanwhile). It bounds draws only: a
+dispatch stands for its compute pipeline until it is made, since a
+compute pass the title runs once is not run again (fxceless/victory-fork
+pull request #1312); the line "compute pipelines a dispatch stood for"
+says how many and how long.
 
 ## Textures the game reads back
 
