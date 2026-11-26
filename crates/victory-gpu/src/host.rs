@@ -426,6 +426,9 @@ fn submitting(phase: u64, lists: usize) {
 mod removal;
 pub(crate) use removal::*;
 
+/// Keeps the card's clocks up between submissions (`VICTORY_CARD_AWAKE`).
+mod awake;
+
 /// Whether [`Host::removal_data`] was asked for (once is enough for
 /// [`log_removal_context`]).
 static DATA_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -6511,6 +6514,7 @@ impl Host {
                 crate::timeline::ev("sent", this_submission, *submitted);
                 card_watch(*submitted);
             }
+            awake::sent(&self.device);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6552,6 +6556,7 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                awake::sent(&self.device);
                 self.card_sent();
                 let waited = self
                     .queue
