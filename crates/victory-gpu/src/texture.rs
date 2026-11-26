@@ -201,7 +201,7 @@ enum PartIs {
 /// texture objects is all its own. `there`: whether all the part's pages
 /// are there, asked only of a part that is the title's.
 fn part_is(placed: bool, of_part: u32, end: u64, [first, limit]: [u64; 2], there: impl FnOnce() -> bool) -> PartIs {
-    let viewed = u64::from(of_part) >> first.min(32) != 0;
+    let viewed = reaches(of_part, first);
     if placed && !viewed && end > limit {
         PartIs::Left
     } else if there() {
@@ -209,6 +209,12 @@ fn part_is(placed: bool, of_part: u32, end: u64, [first, limit]: [u64; 2], there
     } else {
         PartIs::Zeros
     }
+}
+
+/// Whether a part that holds the levels `of_part` (a bit a level) holds
+/// one from level `first` on.
+fn reaches(of_part: u32, first: u64) -> bool {
+    u64::from(of_part) >> first.min(32) != 0
 }
 
 /// The key of what a part of a texture's memory detiles to: of the digest
@@ -2556,7 +2562,7 @@ impl Staging {
         self.judged[1].store(judged[1], Relaxed);
         let on_demand = self.on_demand.then(|| self.held_levels(judged));
         let mut is = [PartIs::Left; c::PARTS];
-        let (mut held, mut left, mut away) = (0u32, 0u64, 0u64);
+        let (mut held, mut left, mut away, mut out) = (0u32, 0u64, 0u64, 0u64);
         for k in 0..n {
             let ((from, to), of_part) = (parts[k], self.place.levels_of_part[k]);
             is[k] = match on_demand {
@@ -2574,6 +2580,17 @@ impl Staging {
                 }
                 PartIs::Read => held |= on_demand.map_or(of_part, |levels| of_part & levels),
             }
+            // Every level of it is left out of the host copy, and so of
+            // the staging buffer (a texture made without its most detailed
+            // levels, `crate::tiles`): the title's all the same (the levels
+            // stay held), with nothing to read it for. It was read and
+            // hashed at every upload: the levels left out are three
+            // quarters of such a texture's bytes or more, and the uploads
+            // read 91.2 GB of title memory for 47.5 GB of staging.
+            if is[k] != PartIs::Left && !reaches(of_part, u64::from(self.first)) {
+                is[k] = PartIs::Left;
+                out += (to - from) as u64;
+            }
         }
         self.detiled.store(held, Relaxed);
         if in_place {
@@ -2586,6 +2603,7 @@ impl Staging {
         let by_level = &c::BY_LEVEL;
         by_level[c::L_LEFT].fetch_add(left, Relaxed);
         by_level[c::L_AWAY].fetch_add(away, Relaxed);
+        by_level[c::L_OUT].fetch_add(out, Relaxed);
         if away > 0 {
             PAGES_MISSING[0].fetch_add(1, Relaxed);
         }
@@ -3758,6 +3776,13 @@ mod digest_tests {
         assert_eq!(part_is(true, 0, 1, [0, 0], never), PartIs::Left);
         assert_eq!(part_is(true, 1 << 31, u64::MAX, [31, 0], || true), PartIs::Read);
         assert_eq!(part_is(true, 1 << 31, u64::MAX, [32, u64::MAX], || true), PartIs::Read);
+        // A part holds a level from a given one on, or none: the part of
+        // level 1 alone holds none from level 2 on (a host copy made
+        // without its first two levels has nothing of it).
+        use super::reaches;
+        assert!(reaches(0b0010, 0) && reaches(0b0010, 1) && !reaches(0b0010, 2));
+        assert!(reaches(0b1111_0000, 7) && !reaches(0b1111_0000, 8));
+        assert!(!reaches(0, 0) && !reaches(u32::MAX, 32) && !reaches(u32::MAX, u64::MAX) && reaches(u32::MAX, 31));
     }
 
     /// A texture's memory is told apart at the starts of its levels, in
