@@ -233,20 +233,21 @@ e=Unsupported" once).
 
 ## When the card's memory is full
 
-`VICTORY_TEXTURE_SPILL` (on by default; `=0`: as on 2026-11-25): once the
-card has no room for more of the game's textures, their host copies are made
-whole in the PC's memory that the system lets the card read over the bus,
-instead of waiting for room. As memory fills, a texture is made whole on the
-card, then whole in the PC's memory, and only once that has no room either
-without its most detailed levels (`VICTORY_TEXTURE_DROP_LEVELS` above, which
-with the spill waits for that point). A texture in the PC's memory is read
-more slowly, but it is there and whole (fxceless/victory-fork pull request
-#601, NitricAcidDev/VIctory-Omega-Fork `4237574084`).
+`VICTORY_TEXTURE_SPILL` (on by default; `=0`: they wait, as on 2026-11-25):
+the last step when the card is full. Levels are left out first, exactly as
+`VICTORY_TEXTURE_DROP_LEVELS` above says; a texture that finds no room on
+the card even so is made whole in the PC's memory that the system lets the
+card read over the bus, instead of waiting for room (and being missing:
+black skin and walls in the open world). A texture there is read more
+slowly, but it is there (fxceless/victory-fork pull request #601,
+NitricAcidDev/VIctory-Omega-Fork `4237574084`). It goes back to the card
+when it is let go as idle and next made while the card has room.
 `VICTORY_TEXTURE_SPILL_PERCENT` (50; 10 to 90) is the share of the system's
 budget for that memory the textures may fill; 4 GB of the PC's memory are
-always left free. The log line "host copies of textures in the PC's memory"
-counts them and their bytes. Not yet measured in a run here: compare the
-frame rate and the memory line with `=0`.
+always left free. The log line "textures that found no room on the card"
+counts those made there and the passes that found no room in either.
+Spilling before leaving levels out was measured and dropped: the opening
+cutscene took 170 ms a frame against 106, with the same picture.
 
 `VICTORY_WAIT_RESIDENT` (on by default; `=0`: as before): new heaps for
 textures and committed host textures are made resident, and waited for,
