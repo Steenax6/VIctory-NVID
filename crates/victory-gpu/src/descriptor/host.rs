@@ -2414,6 +2414,18 @@ impl HostHeap {
         self.changed.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
+    /// Diagnostics: the title slots on the list of [`HostHeap::buffer_changes`]
+    /// that hold a buffer view and are not made: written, and waiting for
+    /// the pass that takes the list (a draw that reads one through a table
+    /// makes it before that).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn buffer_views_unmade(&self) -> u64 {
+        // (The order the pass's making takes them in.)
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+        changed.noted().iter().filter(|&&index| buffers.contains(index) && self.made_key(index) == Some(0)).count() as u64
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.

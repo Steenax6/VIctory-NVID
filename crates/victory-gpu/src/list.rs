@@ -259,24 +259,6 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
-/// `lists` are about to be submitted: each takes the refreshes of the pass
-/// over picked buffer views its recording started, if it started one
-/// (`crate::host::HostList::picked_in`), in every part of a list cut at
-/// waits.
-#[cfg(windows)]
-pub(crate) fn picked_in(lists: &[This]) {
-    for &this in lists {
-        if this.is_null() {
-            continue;
-        }
-        // SAFETY: the title passes our lists.
-        let list = unsafe { &*this.cast::<List>() };
-        for host in list.earlier.iter().map(|part| &part.host).chain(&list.host) {
-            host.picked_in();
-        }
-    }
-}
-
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {

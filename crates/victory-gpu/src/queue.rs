@@ -50,8 +50,9 @@ enum Held {
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
-    /// (which it may reset meanwhile), and the order they run in.
-    Run(Vec<crate::list::Detached>, Vec<usize>),
+    /// (which it may reset meanwhile), the order they run in, and its
+    /// place among the submissions that stand in a line ([`Stands`]).
+    Run(Vec<crate::list::Detached>, Vec<usize>, Stands),
     /// A signal of the queue's, due after what it holds before it.
     Signal(crate::fence::FenceRef, u64),
     /// With [`behind`]: the submission at the head of the line is being
@@ -64,7 +65,67 @@ enum Held {
     /// With list calls written down (`crate::list::thin`): a submission
     /// whose lists are translated by threads of ours. It is free to run when
     /// they are, and then becomes what [`submit_cut`] makes of a submission.
-    Lists(std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>),
+    /// With its place among those that stand, as [`Held::Run`].
+    Lists(std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>, Stands),
+}
+
+/// The submissions the title has made that stand in a queue's line and have
+/// not begun ([`Held::Run`], [`Held::Lists`]): the last ticket given, and
+/// the tickets of those that stand (a submission cut into parts later
+/// stands once for each part, under one ticket). Such a submission has no
+/// number yet: the host numbers a submission where it begins to prepare it
+/// (`crate::host`'s `STARTED`), so what waits "for every submission started
+/// by now" does not wait for these.
+#[cfg(windows)]
+static STANDING: std::sync::Mutex<(u64, Vec<u64>)> = std::sync::Mutex::new((0, Vec::new()));
+/// How many stand ([`STANDING`]), read without its lock.
+#[cfg(windows)]
+static STANDING_NOW: AtomicU64 = AtomicU64::new(0);
+
+/// A submission's place among those that stand in a line ([`STANDING`]),
+/// by its ticket: given up where it goes, which is once the host has
+/// numbered the submission (the entry that held it is done with), or when
+/// its queue goes with it still in the line.
+#[cfg(windows)]
+struct Stands(u64);
+
+#[cfg(windows)]
+impl Stands {
+    /// A submission goes into a line.
+    fn new() -> Stands {
+        let mut standing = STANDING.lock().unwrap_or_else(|e| e.into_inner());
+        standing.0 += 1;
+        let ticket = standing.0;
+        standing.1.push(ticket);
+        STANDING_NOW.store(standing.1.len() as u64, Ordering::Release);
+        Stands(ticket)
+    }
+
+    /// One more part of the submission stands, with its ticket.
+    fn again(&self) -> Stands {
+        let mut standing = STANDING.lock().unwrap_or_else(|e| e.into_inner());
+        standing.1.push(self.0);
+        STANDING_NOW.store(standing.1.len() as u64, Ordering::Release);
+        Stands(self.0)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Stands {
+    fn drop(&mut self) {
+        let mut standing = STANDING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = standing.1.iter().position(|&ticket| ticket == self.0) {
+            standing.1.swap_remove(at);
+        }
+        STANDING_NOW.store(standing.1.len() as u64, Ordering::Release);
+    }
+}
+
+/// How many submissions the title has made stand in a line and have not
+/// begun.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn standing() -> u64 {
+    STANDING_NOW.load(Ordering::Acquire)
 }
 
 /// A submission with list calls written down (`crate::list::thin`): put
@@ -81,7 +142,7 @@ fn submit_thin(this: This, lists: &[This]) {
         )
     });
     if !recordings.is_empty() {
-        lock(&queue(this).held).push(Held::Lists(recordings));
+        lock(&queue(this).held).push(Held::Lists(recordings, Stands::new()));
         let mut waiting = lock(&WAITING);
         if !waiting.contains(&(this as usize)) {
             waiting.push(this as usize);
@@ -242,7 +303,7 @@ fn submit_cut(this: This, lists: &[This]) {
             let mut held = lock(&queue(this).held);
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
-                held.push(Held::Run(taken, order));
+                held.push(Held::Run(taken, order, Stands::new()));
             }
         }
         let mut waiting = lock(&WAITING);
@@ -323,7 +384,7 @@ fn submit_split(this: This, lists: &[This]) {
             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
             pieces.extend(waits.into_iter().map(Held::Value));
             let (taken, order) = crate::list::detach(&lists[from..to]);
-            pieces.push(Held::Run(taken, order));
+            pieces.push(Held::Run(taken, order, Stands::new()));
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
@@ -618,7 +679,7 @@ fn release_held_now(all: bool) {
                 let passed = all;
                 // A submission whose lists are not translated yet stands; one
                 // passed (at a present) is waited for, with the line open.
-                if let Some(Held::Lists(recordings)) = held.first()
+                if let Some(Held::Lists(recordings, _)) = held.first()
                     && !crate::list::thin::translated(recordings)
                 {
                     if !passed {
@@ -642,18 +703,13 @@ fn release_held_now(all: bool) {
                 }
                 match held.remove(0) {
                     Held::Wait(..) | Held::Running => {}
-                    Held::Lists(recordings) => {
+                    Held::Lists(recordings, stands) => {
                         // Translated: cut at its waits and taken from the
                         // lists of ours as `submit_cut` does, in its place,
                         // with the line open meanwhile.
                         held.insert(0, Held::Running);
                         drop(held);
                         let backs = crate::list::thin::backs(&recordings);
-                        // As at the title's submit call for lists recorded
-                        // in the call: the refreshes of a pass over picked
-                        // buffer views one of them started go into it
-                        // before anything looks at its steps.
-                        crate::list::picked_in(&backs);
                         let parts = crate::list::detach_parts(&backs);
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
@@ -668,10 +724,12 @@ fn release_held_now(all: bool) {
                             format!("TRANSLATED submission, {} parts: {named:?}", parts.len())
                         });
                         let mut pieces = Vec::new();
+                        // Its parts stand in its place, with its ticket.
                         for (waits, taken, order) in parts {
                             pieces.extend(waits.into_iter().map(Held::Value));
-                            pieces.push(Held::Run(taken, order));
+                            pieces.push(Held::Run(taken, order, stands.again()));
                         }
+                        drop(stands);
                         held = lock(line);
                         if matches!(held.first(), Some(Held::Running)) {
                             held.remove(0);
@@ -708,7 +766,7 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
+                    Held::Run(lists, order, stands) => {
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -766,6 +824,8 @@ fn release_held_now(all: bool) {
                                 crate::list::recycle(lists, &order);
                             }
                         }
+                        // The host has numbered it.
+                        drop(stands);
                         if all {
                             #[cfg(feature = "diagnostics")]
                             crate::copystat::add(crate::copystat::C::Forced, 1);
@@ -896,9 +956,6 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let _span = crate::timeline::span("exec>", "exec<", this as u64, u64::from(count));
-        // Before anything looks at the lists' steps: those of a pass a list
-        // started beside its recording (`crate::draw::Picked`).
-        crate::list::picked_in(lists);
         crate::resubmit::submitted(this, lists);
         if crate::list::thin::on() && !this.is_null() {
             submit_thin(this, lists);
@@ -930,7 +987,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         }
         let kept = hold(this, || {
             let (taken, order) = crate::list::detach(lists);
-            Held::Run(taken, order)
+            Held::Run(taken, order, Stands::new())
         });
         // Diagnostics: the order submissions are made in, next to the
         // commands of the frame's `ops` file (which are in recording order).

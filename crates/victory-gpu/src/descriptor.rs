@@ -272,6 +272,20 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Diagnostics: over the shader-visible heaps, the buffer views the title
+/// has written that no pass over picked buffer views has made
+/// (`HostHeap::buffer_views_unmade`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn buffer_views_unmade() -> u64 {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        // SAFETY: registered heaps are live (removed when dropped).
+        .filter_map(|&(_, _, at)| unsafe { &*(at as *const Heap) }.host.get().and_then(|host| host.as_ref()))
+        .map(|host| host.buffer_views_unmade())
+        .sum()
+}
+
 /// Whether [`sync_heaps`] takes a page's records at once and mirrors the
 /// buffer views among them in runs (`HostHeap::mirror_picked`);
 /// `VICTORY_HEAP_SYNC_FAST=0`: one record at a time, as before.

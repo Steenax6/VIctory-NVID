@@ -278,10 +278,14 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let_go_standing(0);
         drop(object);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    let_go_standing(1);
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -296,10 +300,49 @@ pub(crate) fn retire<T: 'static>(object: T) {
 /// space), 20 ms a frame of that thread in the opening cutscene.
 pub(crate) fn retire_later<T: 'static>(object: T) {
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    let_go_standing(2);
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((STARTED.load(Ordering::Acquire), Retired(Box::new(object))));
+}
+
+/// Diagnostics: objects let go ([`retire`], [`retire_later`]) while a
+/// submission the title had made stood in a line and had not begun
+/// (`crate::queue::standing`): dropped at once, kept for the submissions
+/// started by then, and the same by [`retire_later`]; since the last line
+/// and since the start. A submission that stands has no number yet, so
+/// none of the three waits for it; whether its lists name the object is
+/// not looked at here.
+#[cfg(feature = "diagnostics")]
+static LET_GO_STANDING: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+#[cfg(feature = "diagnostics")]
+fn let_go_standing(how: usize) {
+    if crate::queue::standing() > 0 {
+        LET_GO_STANDING[how].fetch_add(1, Ordering::Relaxed);
+        LET_GO_STANDING[how + 3].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The line of [`LET_GO_STANDING`], where anything was counted.
+#[cfg(feature = "diagnostics")]
+fn standing_line() {
+    let [at_once, kept, later] = [0, 1, 2].map(|i| LET_GO_STANDING[i].swap(0, Ordering::Relaxed));
+    if at_once + kept + later == 0 {
+        return;
+    }
+    let ever = [3, 4, 5].map(|i| LET_GO_STANDING[i].load(Ordering::Relaxed));
+    tracing::info!(
+        "host objects let go while a submission stood in a line not begun, since the last line: {at_once} dropped at once \
+         (nothing was running), {kept} kept only for the submissions begun by then, {later} more of those by the sweeps; \
+         since the start: {}, {} and {}; {} stand now",
+        ever[0],
+        ever[1],
+        ever[2],
+        crate::queue::standing()
+    );
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -946,7 +989,7 @@ mod tests {
         for quarantined in [false, true] {
             list.defer_gpu_write(&copy, start as usize + 0x100, 16);
             list.defer_refresh(&copy, start as usize + 0x200, 16);
-            list.defer_picked(crate::draw::Picked::done(vec![(copy.clone(), start + 0x1000, 64), (copy.clone(), start + 0x2000, 1 << 20)]));
+            list.defer_picked(crate::draw::Picked::done(vec![(copy.clone(), start + 0x1000, 64), (copy.clone(), start + 0x2000, 1 << 20)]), true);
             list.defer_refresh(&copy, start as usize + 0x300, 16);
             if quarantined {
                 list.quarantine();
@@ -965,6 +1008,20 @@ mod tests {
             assert_eq!(steps(&list), expected, "taken once");
             list.close();
             list.reset();
+        }
+        // Two lists one pass covers: the first to come up in the line
+        // carries its refreshes, whichever of them started the pass; the
+        // other only stands behind it.
+        if let Ok(other) = host.new_list() {
+            let pass = crate::draw::Picked::done(vec![(copy.clone(), start + 0x1000, 64)]);
+            list.defer_picked(pass.clone(), true);
+            other.defer_refresh(&copy, start as usize + 0x200, 16);
+            other.defer_picked(pass, false);
+            other.picked_in();
+            list.picked_in();
+            assert_eq!(steps(&other), [('r', 0x200), ('r', 0x1000)]);
+            assert_eq!(steps(&list), []);
+            other.close();
         }
         list.close();
         drop(copy);
@@ -2265,12 +2322,18 @@ struct Deferred {
     /// structure builder, so nothing its shaders write is copied back into
     /// title memory ([`HostList::quarantine`]).
     quarantined: bool,
-    /// The pass over the view heap's picked buffer views this recording
-    /// started (`crate::draw::Picked`), with how many steps and how many
-    /// read-backs were recorded before it: the refreshes of what the pass
-    /// finds are put among `copies` there before the list is submitted
+    /// The pass over the view heap's picked buffer views that covers this
+    /// recording (`crate::draw::Picked`), with how many steps and how many
+    /// read-backs were recorded before its first bind of a shader that
+    /// picks buffers by index: the list waits for the pass where its
+    /// submission is prepared, and the refreshes of what the pass found are
+    /// put among `copies` there if no list before it took them
     /// ([`HostList::picked_in`]).
     picked: Option<(usize, usize, std::sync::Arc<crate::draw::Picked>)>,
+    /// Diagnostics (`crate::draw::picked_counts`): whether this recording
+    /// started that pass, and its binds of such shaders.
+    #[cfg(feature = "diagnostics")]
+    picked_seen: (bool, u32),
 }
 
 impl Deferred {
@@ -6315,6 +6378,20 @@ impl Host {
         crate::copystat::submission_begins();
         #[cfg(feature = "diagnostics")]
         crate::profile::seen(crate::profile::Seen::Submit);
+        // Before anything looks at the lists' steps: each list that binds a
+        // shader picking buffers by index stands for the pass over the
+        // heap's buffer views that covers it (`crate::draw::Picked`), here
+        // in the line, where the title's thread does not wait.
+        // (One submission with such lists at a time from here until it is
+        // sent: the one that takes a pass's refreshes is prepared before
+        // the next one the pass covers, whichever threads submit them.)
+        static PICKING: Mutex<()> = Mutex::new(());
+        let _picking = runs.iter().any(|r| r.deferred().picked.is_some()).then(|| PICKING.lock().unwrap_or_else(|e| e.into_inner()));
+        #[cfg(feature = "diagnostics")]
+        crate::draw::picked_counts::coming(&runs.iter().filter_map(|r| r.picked_coming()).collect::<Vec<_>>());
+        for run in runs {
+            run.picked_in();
+        }
         // A quarantined builder stage in one list keeps the whole
         // submission's shader writes from the title: the copy-back compares
         // every list's declared ranges after all of them ran, so a range of
@@ -6355,6 +6432,13 @@ impl Host {
         // command lists that index those slots are submitted.
         crate::timeline::ev("sub.", 2, runs.len() as u64);
         crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        {
+            let (lists, binds) = runs.iter().map(|r| r.deferred().picked_seen.1).filter(|&n| n > 0).fold((0, 0), |a, n| (a.0 + 1, a.1 + u64::from(n)));
+            if lists > 0 {
+                crate::draw::picked_counts::unmade(lists, binds, crate::descriptor::buffer_views_unmade());
+            }
+        }
         steps.mark("p.heap", 0);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -7770,22 +7854,47 @@ impl HostList {
         }
     }
 
-    /// The recording started the pass over the view heap's picked buffer
-    /// views here (`crate::draw::Picked`): the refreshes of the ranges the
-    /// pass finds are steps of this list from this place on, put in before
-    /// the list is submitted ([`HostList::picked_in`]).
-    pub(crate) fn defer_picked(&self, pass: std::sync::Arc<crate::draw::Picked>) {
+    /// The recording binds a shader that picks buffers by index here, for
+    /// the first time: `pass` over the view heap's picked buffer views
+    /// covers it (`crate::draw::Picked`; `started`: this bind started it).
+    /// The refreshes of the ranges the pass finds are steps of this list
+    /// from this place on, if it is the first the pass covers to come up
+    /// in the line ([`HostList::picked_in`]).
+    pub(crate) fn defer_picked(&self, pass: std::sync::Arc<crate::draw::Picked>, started: bool) {
         let mut deferred = self.deferred();
         deferred.picked = Some((deferred.copies.len(), deferred.backs.len(), pass));
+        #[cfg(feature = "diagnostics")]
+        {
+            deferred.picked_seen.0 = started;
+        }
+        let _ = started;
     }
 
-    /// Before the list is submitted: the refreshes of the pass the
-    /// recording started ([`HostList::defer_picked`]) become its steps, at
-    /// the place the pass was started, as [`HostList::defer_refresh`]
-    /// recorded them there when the pass ran in the recording. Waits for
-    /// the pass. (Not noted in `refreshed`: an ask for the same range of the
-    /// same copy later in the list is then a second step, which a
-    /// submission joins with the first.)
+    /// Diagnostics: the recording binds a shader that picks buffers by index.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn picked_bind(&self) {
+        self.deferred().picked_seen.1 += 1;
+    }
+
+    /// Diagnostics: the pass that covers the recording, if it has not come
+    /// up in the line yet, with whether it started the pass and its binds.
+    #[cfg(feature = "diagnostics")]
+    fn picked_coming(&self) -> Option<(std::sync::Arc<crate::draw::Picked>, bool, u32)> {
+        let deferred = self.deferred();
+        deferred.picked.as_ref().map(|picked| (picked.2.clone(), deferred.picked_seen.0, deferred.picked_seen.1))
+    }
+
+    /// Where the list's submission is prepared, before anything looks at
+    /// its steps: waits for the pass that covers the recording
+    /// ([`HostList::defer_picked`]), and if no list before it in the line
+    /// took the pass's refreshes they become its steps, at the place it
+    /// first bound a shader that picks buffers by index, as
+    /// [`HostList::defer_refresh`] recorded them where the pass ran in the
+    /// recording. A submission's steps all run before any of its lists
+    /// goes to the card, and submissions are prepared one at a time: every
+    /// list the pass covers runs behind those refreshes. (Not noted in
+    /// `refreshed`: an ask for the same range of the same copy later in the
+    /// list is then a second step, which a submission joins with the first.)
     pub(crate) fn picked_in(&self) {
         let Some((at, backs, pass)) = self.deferred().picked.take() else {
             return;
@@ -9198,6 +9307,11 @@ impl Meter {
                 beside_us as f64 / 1e3 / frames,
                 waited_us as f64 / 1e3 / frames
             );
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::draw::picked_counts::line();
+            standing_line();
         }
         crate::shadow::exact_line(frames);
         crate::draw::seen_line(frames);
