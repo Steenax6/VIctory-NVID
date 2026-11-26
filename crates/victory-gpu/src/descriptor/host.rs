@@ -1231,6 +1231,16 @@ fn view_heap_fit(count: u32, extra: u32, null: u32) -> u32 {
     }
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        // What the pass over picked buffer views keeps by this heap's
+        // address (`crate::draw::forget_heap_ranges`).
+        if !self.sampler {
+            crate::draw::forget_heap_ranges(self);
+        }
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
