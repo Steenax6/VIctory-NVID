@@ -5084,8 +5084,46 @@ impl Shadow {
             if went_beside {
                 crate::watch::written_beside(start + hull_lo, hull_hi - hull_lo, crate::writes::Cause::Back);
             }
+            if SAMPLE_NEXT.take() {
+                // The last stretch written, up to 256 bytes of it, as written
+                // and as the card held it.
+                let mut put = 0;
+                let mut last = None;
+                for (&(a, b), &write) in stretches.iter().zip(write.iter()) {
+                    if write {
+                        last = Some((a, put, (b - a).min(256)));
+                    }
+                    put += b - a;
+                }
+                if let Some((a, put, m)) = last {
+                    LAST_MERGED.set(Some((a, title[put..put + m].to_vec(), gpu[a - at..a - at + m].to_vec())));
+                }
+            }
             written
         })
+    }
+
+    /// The check at a landing's telling (`VICTORY_LAND_SAMPLE=1`), for a
+    /// stretch a merge wrote at offset `at` of the copy (`merged`: what it
+    /// wrote; `card`: what the card held there): the bytes the stretch
+    /// landed (those it wrote as the card held them) that title memory and
+    /// the copy's CPU side do not both hold now, looked at under the lock
+    /// of their pieces. The stretch's other bytes are the title's as the
+    /// merge read them, which the CPU side takes only with a refresh: not
+    /// looked at. (Title memory that is not there: 0.)
+    pub(crate) fn landed_apart(&self, at: usize, merged: &[u8], card: &[u8]) -> usize {
+        let n = merged.len().min(card.len());
+        if n == 0 || at + n > self.len as usize {
+            return 0;
+        }
+        let _side = self.side_of(at, at + n);
+        let mut read = vec![0u8; n];
+        if !crate::host::read_into((self.start as usize + at) as *const u8, &mut read) {
+            return 0;
+        }
+        // SAFETY: inside the copy's mapping (checked above).
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(at).cast_const(), n) };
+        (0..n).filter(|&i| merged[i] == card[i] && read[i] != held[i]).count()
     }
 }
 
@@ -5294,6 +5332,28 @@ pub(crate) fn landed_line(frames: f64) {
 /// pattern. An equal byte inside a stretch is put back as the title holds
 /// it (as the old merge did for its whole span).
 const MERGE_JOIN: usize = 64;
+
+thread_local! {
+    /// Whether [`Shadow::card_merge_relay_fast`] on this thread keeps the
+    /// last stretch it writes in [`LAST_MERGED`] ([`sample_next`]).
+    static SAMPLE_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The last stretch [`Shadow::card_merge_relay_fast`] wrote on this
+    /// thread when asked to keep it (offset in its copy, up to 256 bytes as
+    /// written, the same bytes as the card held them): for the sample at a
+    /// landing's telling ([`last_merged`]).
+    static LAST_MERGED: std::cell::Cell<Option<(usize, Vec<u8>, Vec<u8>)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The next merge on this thread keeps the last stretch it writes.
+pub(crate) fn sample_next() {
+    SAMPLE_NEXT.set(true);
+}
+
+/// The stretch kept ([`LAST_MERGED`]), taken; and no more is kept.
+pub(crate) fn last_merged() -> Option<(usize, Vec<u8>, Vec<u8>)> {
+    SAMPLE_NEXT.set(false);
+    LAST_MERGED.take()
+}
 
 thread_local! {
     /// [`Shadow::card_merge_relay_fast`]'s lists, kept between calls.

@@ -2141,19 +2141,6 @@ fn sync_batch() -> bool {
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each.
-fn wide_merge() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
-}
-
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -3440,6 +3427,7 @@ fn late_copy(dst: usize, src: usize, len: usize) {
 /// Title buffer copies recorded behind a write of their own submission's
 /// shaders, counted and looked at ([`copy_order`]).
 mod copy_order;
+mod land_jobs;
 
 /// Diagnostics: the fills of upload memory that made a submission wait for
 /// flights, and whether the wait was needed ([`fill_check`]).
@@ -5564,49 +5552,10 @@ impl Host {
                 crate::card_fine::STATS[3].fetch_add(total, Ordering::Relaxed);
             }
         }
-        let mut written = 0;
-        if wide_merge() && pieces.len() >= 8 {
-            // As `card_back` with the switch: the runs are apart from one
-            // another (each its own bytes of its copy and of title memory;
-            // a copy's own lock orders the merges into it), so several at a
-            // time on the wide workers. This thread waits for all of them
-            // before anything of the landing goes on.
-            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let each = pieces.len().div_ceil(8);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
-                .chunks(each)
-                .map(|chunk| {
-                    let chunk = chunk.to_vec();
-                    let count = count.clone();
-                    Box::new(move || {
-                        let mut title = Vec::new();
-                        for (shadow, lo, hi, at) in chunk {
-                            // SAFETY: the mapping of the fetched bytes; the
-                            // copy into it has run, and the caller waits for
-                            // this job.
-                            let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
-                            let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
-                            shadow.walls_merged(gpu.len(), merged);
-                            crate::card_fine::merged(&shadow, gpu.len(), merged);
-                            count.fetch_add(merged, Ordering::Relaxed);
-                        }
-                    }) as Box<dyn FnOnce() + Send>
-                })
-                .collect();
-            crate::shadow::wide_run(jobs);
-            written = count.load(Ordering::Relaxed);
-        } else {
-            let mut title = Vec::new();
-            for (shadow, lo, hi, at) in &pieces {
-                // SAFETY: the mapping of the fetched bytes, `total` of them;
-                // the copy into it has run.
-                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-                shadow.walls_merged(gpu.len(), merged);
-                crate::card_fine::merged(shadow, gpu.len(), merged);
-                written += merged;
-            }
-        }
+        // As jobs of 256 KiB of one copy each, on the threads kept for
+        // wide work and this one (`land_jobs`): done, all of them, before
+        // anything of the landing goes on.
+        let written = land_jobs::merge(&pieces, data, after);
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         if let Some(merging) = merging {
             crate::timeline::ev("l.merge", merging.elapsed().as_micros() as u64, written as u64);
@@ -6060,39 +6009,7 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
-                // The pieces are apart from one another (each its own bytes
-                // of its copy and of title memory): several at a time.
-                let fetched = *data;
-                let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
-                    std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
-                let each = pieces.len().div_ceil(8);
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
-                    .chunks(each)
-                    .map(|chunk| {
-                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
-                            chunk.iter().map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at)).collect();
-                        let counts = counts.clone();
-                        Box::new(move || {
-                            let mut title = Vec::new();
-                            for (shadow, i, lo, hi, at) in chunk {
-                                // SAFETY: the mapping of the fetched bytes;
-                                // the copy into it has run, and the caller
-                                // waits for this job.
-                                let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
-                                let merged = shadow.card_merge(lo, gpu, &mut title);
-                                shadow.walls_merged(gpu.len(), merged);
-                                crate::card_fine::merged(&shadow, gpu.len(), merged);
-                                counts[i].fetch_add(merged, Ordering::Relaxed);
-                            }
-                        }) as Box<dyn FnOnce() + Send>
-                    })
-                    .collect();
-                crate::shadow::wide_run(jobs);
-                for (written, count) in written.iter_mut().zip(counts.iter()) {
-                    *written += count.load(Ordering::Relaxed);
-                }
-            } else {
+            {
                 let mut title = Vec::new();
                 for &(i, lo, hi, at) in &pieces {
                     // SAFETY: the mapping of the fetched bytes, `total` of
@@ -9352,6 +9269,7 @@ impl Meter {
                 );
             }
             copy_order::line(frames);
+            land_jobs::line(frames);
             crate::beside::line(frames);
             crate::watch::events_line(frames);
             crate::watch::kernel_line();
