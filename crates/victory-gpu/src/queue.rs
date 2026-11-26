@@ -44,15 +44,16 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value (the title may
+    /// release the fence meanwhile: ours holds it).
+    Wait(crate::fence::FenceRef, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::FenceRef, u64),
     /// With [`behind`]: the submission at the head of the line is being
     /// prepared and sent by our thread, with the line unlocked, so the
     /// title can add to its end meanwhile; whatever is added stays behind
@@ -565,8 +566,8 @@ fn release_held_now(all: bool) {
                 let passed = all;
                 match held.first() {
                     None | Some(Held::Running) => break,
-                    Some(&Held::Wait(fence, value))
-                        if !passed && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !passed && crate::fence::completed(fence.this()) < *value =>
                     {
                         break;
                     }
@@ -677,8 +678,8 @@ fn release_held_now(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        if let Err(fence) = crate::host::late_signal(fence, value) {
+                            crate::fence::set(fence.this(), value);
                         }
                     }
                 }
@@ -887,13 +888,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(crate::fence::FenceRef::new(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    if crate::host::late() && crate::host::late_signal(crate::fence::FenceRef::new(fence), value).is_ok() {
         return S_OK;
     }
     let _ = this;
@@ -926,7 +927,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(crate::fence::FenceRef::new(fence), value));
             }
             behind
         };
@@ -1101,6 +1102,14 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    // With the Series X profile the title presents one plane with its
+    // interface in it; a second plane (the interface apart, as with the
+    // Series S profile: fxceless/victory-fork pull request #1081) is not
+    // shown, and said once.
+    if planes > 1 {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!(planes, "the title presents more than one plane: only the first is shown"));
+    }
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
@@ -1212,8 +1221,12 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Done at once, once the
+/// flights sent ahead whose shaders may write the pages have landed
+/// ([`crate::host::land_before_remap`]).
+/// shortcut: a submission a queue still holds behind a wait (`Held`) runs
+/// after the remap, where the console runs it before when it was sent to
+/// the same queue first (fxceless/victory-fork #1131).
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1232,6 +1245,19 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // The console maps the pages behind the work sent before: what that
+    // work's shaders write must land in the pages mapped now, not in those
+    // mapped next (flights sent ahead land after their submission returned).
+    #[cfg(windows)]
+    for b in batches.into_iter().flatten() {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
+        crate::host::land_before_remap(b.destination, len);
+    }
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -1357,6 +1383,42 @@ mod tests {
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7
         );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// A wait and a signal a queue holds back hold their fences: the title
+    /// may release a fence it signals before the signal is due, and the
+    /// fence it waits for before the wait is met. Both are let go when the
+    /// queue runs on (fxceless/victory-fork #404).
+    #[cfg(windows)]
+    #[test]
+    fn held_waits_and_signals_hold_their_fences() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut waited, mut signalled) = (null, null);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut waited), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut signalled), S_OK);
+        let add_ref = |f: This| slot::<extern "system" fn(This) -> u32>(f, 0x08)(f);
+        let release = |f: This| slot::<extern "system" fn(This) -> u32>(f, 0x10)(f);
+        assert_eq!(wait(q, waited, 1), S_OK);
+        assert_eq!(signal(q, signalled, 7), S_OK);
+        // The title lets go of the fence it signals: the held signal keeps
+        // it alive.
+        assert_eq!(release(signalled), 1, "the held signal's reference");
+        assert_eq!(add_ref(waited), 3, "the title's, the held wait's and this one");
+        assert_eq!(release(waited), 2);
+        // The wait is met: the queue runs on, sets the signal and lets
+        // both fences go.
+        assert_eq!(crate::fence::signal(waited, 1), S_OK);
+        assert_eq!(release(waited), 0, "the held wait's reference is gone");
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 

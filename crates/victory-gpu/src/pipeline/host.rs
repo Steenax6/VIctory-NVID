@@ -347,6 +347,16 @@ impl GraphicsState {
         (!fixes.is_empty()).then_some((f, fixes))
     }
 
+    /// The same state for render targets of `targets`: for a draw whose
+    /// bound views are not in the formats the title's pipeline names (the
+    /// console writes each target in its view's format).
+    pub(crate) fn with_targets(&self, targets: D3D12_RT_FORMAT_ARRAY) -> GraphicsState {
+        GraphicsState {
+            targets,
+            ..self.copy()
+        }
+    }
+
     /// The state copied (the input elements' names point into the copy's).
     fn copy(&self) -> GraphicsState {
         let names = self.names.clone();

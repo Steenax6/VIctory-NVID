@@ -545,22 +545,30 @@ impl RtvRecord {
     #[cfg(windows)]
     fn host_desc<T>(&self, dimension: u32) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
-        let mut words = if self.described != 0 {
-            self.desc
+        let words = self.host_words(dimension, || crate::resource::view_format(self.resource))?;
+        // SAFETY: both host view descriptions are 24 bytes in this layout.
+        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+
+    /// [`RtvRecord::host_desc`]'s words; `own` is the format a view of the
+    /// resource must name if its host copy is typeless (none if typed). A
+    /// description in the unknown format ("the resource's") names the
+    /// title's to a typeless host copy, which has none of its own to give
+    /// (Marvisak PR #2279).
+    #[cfg(windows)]
+    fn host_words(&self, dimension: u32, own: impl FnOnce() -> Option<u32>) -> Option<[u32; 6]> {
+        let mut words = if self.described == 0 {
+            [own()?, dimension, 0, 0, 0, 0]
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            let mut words = self.desc;
+            if words[0] == 0 {
+                words[0] = own().unwrap_or(0);
+            }
+            words
         };
         // A target or depth view: of a target, in its stand-in format.
         words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
-        // SAFETY: both host view descriptions are 24 bytes in this layout.
-        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+        Some(words)
     }
 }
 
@@ -1163,11 +1171,24 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
+/// The most bytes a shader reads through a constant buffer view: 4,096
+/// vectors of 16 bytes (`D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT`), and the
+/// most a host constant buffer view may span.
+pub(crate) const CONSTANT_VIEW_MOST: u32 = 4096 * 16;
+
 /// Device method.
+///
+/// The title names constant views of more than [`CONSTANT_VIEW_MOST`]
+/// bytes (969,472 and 1,306,368 were seen, in slots it does not read). A
+/// host view of that size is an invalid call, for which NVIDIA removes the
+/// device; and a shader reads no more than the first 64 KiB of any constant
+/// view. The view is recorded at most that size, so that nothing made or
+/// copied for it (its host view, the list's copy of its bytes, the window
+/// of the buffer that holds them) reaches further.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
+        record(handle, View::Constant(address, size.min(CONSTANT_VIEW_MOST)));
     }
 }
 
@@ -1421,6 +1442,31 @@ mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    /// A render or depth view description in the unknown format on a
+    /// texture the host made typeless (a depth texture shaders read) names
+    /// the title's format; on a typed one it stays unknown.
+    #[cfg(windows)]
+    #[test]
+    fn an_unknown_format_in_a_view_description_is_the_resources() {
+        let record = |format| RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: std::ptr::null(),
+            desc: [format, 3, 1, 0, 0, 0],
+        };
+        let d32 = 40;
+        assert_eq!(record(0).host_words(3, || Some(d32)).unwrap()[..3], [d32, 3, 1], "typeless host copy");
+        assert_eq!(record(0).host_words(3, || None).unwrap()[0], 0, "typed host copy");
+        assert_eq!(record(45).host_words(3, || Some(d32)).unwrap()[0], 45, "a format named is kept");
+        assert_eq!(record(0).host_words(3, || Some(118)).unwrap()[0], 45, "as the host has it");
+        let undescribed = RtvRecord {
+            described: 0,
+            ..record(0)
+        };
+        assert_eq!(undescribed.host_words(4, || Some(d32)).unwrap(), [d32, 4, 0, 0, 0, 0]);
+        assert!(undescribed.host_words(4, || None).is_none(), "the texture's own view");
+    }
+
     #[cfg(windows)]
     #[test]
     fn raw_heap_sync_stops_before_dynamic_host_slots() {
@@ -1525,6 +1571,19 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// A constant view larger than a shader reads through one is recorded
+    /// at the 64 KiB it reads: no host view, copy or window reaches past it.
+    #[test]
+    fn constant_views_are_recorded_at_most_64_kib() {
+        let null = std::ptr::null();
+        let heap = [0u64; 3 * 4]; // three 32-byte slots
+        let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
+        for (i, (size, recorded)) in [(969_472, 65_536), (65_536, 65_536), (480, 480)].into_iter().enumerate() {
+            create_cbv(null, &[0x2000, 1, size, 0], at(i));
+            assert_eq!(view(at(i)), Some(View::Constant(0x1_0000_2000, recorded)), "{size}");
+        }
     }
 
     #[test]

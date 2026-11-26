@@ -126,6 +126,13 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address
+    /// ([`stores_by_address`]); true when its code is not known.
+    pub(crate) stores_by_address: bool,
+    /// A compute program's thread-group size (`numthreads`) on the
+    /// console, `[0; 3]` for other stages: what a dispatch that counts
+    /// threads (`crate::list::dispatch_groups`) divides by.
+    pub(crate) threads: [u32; 3],
 }
 
 #[cfg(windows)]
@@ -184,17 +191,25 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let main = programs.into_iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let threads = match main.as_ref().map(|p| &p.io) {
+        Some(victory_shader::native::StageIo::Cs(cs)) => cs.threads,
+        _ => [0; 3],
+    };
+    let used = main.map(|p| p.used).unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        stores_by_address,
+        threads,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -233,6 +248,29 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     off: false,
 });
 
+/// Whether one of `shaders` walks the ray-tracing structures: its native
+/// code has a node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`).
+#[cfg(windows)]
+fn walks_structures(shaders: &[Arc<Shader>]) -> bool {
+    use victory_shader::{Container, FourCC};
+    shaders.iter().any(|shader| {
+        let Ok(c) = Container::parse(&shader.container) else {
+            return false;
+        };
+        c.part(FourCC::DXIL)
+            .and_then(|part| victory_shader::native_programs(part.data).ok())
+            .is_some_and(|programs| programs.iter().any(walks))
+    })
+}
+
+/// Whether a console program has a ray-tracing node test.
+#[cfg(windows)]
+fn walks(program: &victory_shader::NativeProgram) -> bool {
+    victory_shader::gfx10::decode(&program.code)
+        .is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -254,9 +292,17 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// check for a first run of the whole builder: a stage that stores where
 /// it should not can then not reach the title's own objects (run 98), and
 /// the programs that walk the structures read the host's copies anyway.
+/// It holds for every shader of a submission with a builder stage in it
+/// (`HostList::quarantine`): copy-backs are declared per list and compared
+/// per submission, so another shader's range over the builder's memory
+/// would carry its stores back too (it did before, fxceless/victory-fork
+/// #1013: the earlier quarantine runs did not show what they were meant
+/// to). Copies in place (`VICTORY_INPLACE=1`) are the title's memory
+/// itself and cannot be held back: test without them.
 /// shortcut: not a way to run: the title also reads results back (sizes,
-/// counters) and gets none, and a copy's pages are overwritten from title
-/// memory when the title writes them.
+/// counters) and gets none, nor what the other shaders of those lists
+/// write, and a copy's pages are overwritten from title memory when the
+/// title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -279,12 +325,38 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// `VICTORY_BVH_BUILDER=1`: the structure builder may run ([`Builder`]).
+#[cfg(windows)]
+pub(crate) fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// The builder has run whole once ([`builder_runs`] said yes): its
+/// structures exist from then on.
+#[cfg(windows)]
+static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the title's pipeline `this` walks the ray-tracing structures
+/// (`image_bvh*_intersect_ray`) and is held back: with the builder on, until
+/// the builder has run whole once. Before that the structures are memory
+/// nothing has built, and the walk runs on whatever lies there, in a loop
+/// the title bounds at 65,535 steps a wave: on an RTX 5090 that outlasted
+/// the driver's timeout at world entry, every run (Marvisak/VIctory#2311).
+/// With the builder off (the default) walkers run as before.
+#[cfg(windows)]
+pub(crate) fn walker_held(this: This) -> bool {
+    !this.is_null()
+        && pipeline(this).walks
+        && builder_allowed()
+        && !BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -309,6 +381,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -341,6 +414,35 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Whether a console program can store to title memory by address
+/// (`crate::memory`): a scalar-memory, flat or global store or atomic, or
+/// code that is not all known (as [`stores`]). Only such stores reach the numbered copies
+/// through raw addresses; a program that only loads by address (the
+/// programs that walk the structures) and stores through its views
+/// declares those views' ranges, not every numbered copy. Declared, each
+/// copy costs a compare after the submission (1,023 copies, 4.3 GB, and
+/// seconds a frame in the source's builder runs) and, with the builder's
+/// quarantine, carried what the builder wrote back to the title
+/// (fxceless/victory-fork #294 part 2 and #916, AllStars101-sudo/
+/// victory-lap aca8308ab3, ka1qux/BRVIctory-ka1qux `writes_guest_memory`).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -356,6 +458,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// It walks the builder's structures ([`walker_held`]); only looked
+    /// for with the builder on.
+    #[cfg(windows)]
+    walks: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -394,10 +500,104 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The render target formats a draw of title pipeline `this` writes when
+/// the views bound are in `bound` (format per slot, `UNKNOWN` where none
+/// is): `None` if every target the pipeline names is bound in the format it
+/// names (or not bound), else the pipeline's formats with the bound ones in
+/// the slots that differ. The console writes each target in its view's
+/// format; the host leaves a draw whose pipeline names another undefined.
+/// Each such draw is counted by its pixel shader ([`note_other_targets`]).
+#[cfg(windows)]
+pub(crate) fn other_targets(
+    this: This,
+    bound: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8],
+) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let mut targets = p.host.graphics.as_ref()?.targets;
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let mut differs = false;
+    for (named, &bound) in targets.RTFormats[..count].iter_mut().zip(bound) {
+        if *named != DXGI_FORMAT_UNKNOWN && bound != DXGI_FORMAT_UNKNOWN && *named != bound {
+            *named = bound;
+            differs = true;
+        }
+    }
+    if !differs {
+        return None;
+    }
+    note_other_targets(p, &targets);
+    Some(targets)
+}
+
+/// The host pipeline a draw of title pipeline `this` (host pipeline `own`)
+/// draws with into views of `bound` ([`other_targets`]): `own` if the
+/// pipeline names the formats bound, else the pipeline made again for them
+/// ([`make::for_targets`]), and `own` while that is being made or if the
+/// host refuses it.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for_targets<'a>(
+    this: This,
+    own: &'a host::HostPipeline,
+    bound: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8],
+) -> &'a host::HostPipeline {
+    if own.compute {
+        return own;
+    }
+    let Some(targets) = other_targets(this, bound) else {
+        return own;
+    };
+    make::for_targets(&pipeline(this).host, targets).unwrap_or(own)
+}
+
+/// Draws whose pipeline names other render target formats than the views
+/// bound ([`other_targets`]), by pixel shader and formats: each distinct
+/// case is logged at its first draw and when its count reaches a power of
+/// two (at most 256 cases).
+#[cfg(windows)]
+fn note_other_targets(p: &Pipeline, bound: &windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY) {
+    static SEEN: Mutex<Option<HashMap<(String, [i32; 8], [i32; 8]), u64>>> = Mutex::new(None);
+    let Some(named) = p.host.graphics.as_ref().map(|g| g.targets) else {
+        return;
+    };
+    let pixel = p.shaders.iter().find(|s| s.stage == "pixel").map_or("", |s| s.hash.as_str());
+    let count = (named.NumRenderTargets as usize).min(8);
+    let (named, bound) = (named.RTFormats.map(|f| f.0), bound.RTFormats.map(|f| f.0));
+    let times = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(HashMap::new);
+        let key = (pixel.to_owned(), named, bound);
+        if seen.len() >= 256 && !seen.contains_key(&key) {
+            return;
+        }
+        let times = seen.entry(key).or_insert(0);
+        *times += 1;
+        *times
+    };
+    if times.is_power_of_two() {
+        tracing::info!(
+            pixel,
+            times,
+            named = ?&named[..count],
+            bound = ?&bound[..count],
+            "draws whose pipeline names other render target formats than the views bound"
+        );
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Of [`making`], those draws no longer wait for (`make::wait`).
+#[cfg(windows)]
+pub(crate) fn passed_over() -> u64 {
+    make::passed_over()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -521,6 +721,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        walks: builder_allowed() && walks_structures(&shaders),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -651,9 +853,11 @@ pub(crate) extern "system" fn create_stream(
             break;
         };
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8; the title's
+            // stream is bytes and need not put it on 8 (a reference to it
+            // there would be undefined, and a panic in checked builds).
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -838,6 +1042,73 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+            // A draw into a view of the format named, or into none, writes
+            // as the pipeline says; into an sRGB view, in sRGB.
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+            let bound = |first: i32| {
+                let mut formats = [DXGI_FORMAT(0); 8];
+                formats[0] = DXGI_FORMAT(first);
+                formats[1] = DXGI_FORMAT(10);
+                formats
+            };
+            assert!(other_targets(p, &bound(28)).is_none());
+            assert!(other_targets(p, &bound(0)).is_none());
+            let other = other_targets(p, &bound(29)).unwrap();
+            assert_eq!((other.NumRenderTargets, other.RTFormats[0].0, other.RTFormats[1].0), (1, 29, 0));
         }
+    }
+
+    /// A stream need not be 8-aligned: its shaders' bytecode is read as it
+    /// lies (Marvisak/VIctory #2301).
+    #[test]
+    fn a_stream_off_8_yields_its_shaders() {
+        let vs = [7u8; 3];
+        // 8-aligned, so one byte in is not.
+        let mut backing = [0u64; 4];
+        // SAFETY: 24 of the 32 bytes of `backing`, from its second byte.
+        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 24) };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // a vertex shader
+        stream[8..16].copy_from_slice(&(vs.as_ptr() as u64).to_le_bytes());
+        stream[16..24].copy_from_slice(&(vs.len() as u64).to_le_bytes());
+        let desc = StreamDesc {
+            size: stream.len(),
+            stream: stream.as_ptr(),
+        };
+        assert_ne!(desc.stream as usize % 8, 0);
+        let mut p = std::ptr::null();
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(shaders(p), [("vertex", vs.to_vec())]);
+    }
+
+    /// A program that only loads by address and stores through a buffer
+    /// view does not store by address; one with a global store does.
+    #[cfg(windows)]
+    #[test]
+    fn only_global_stores_and_atomics_store_by_address() {
+        use victory_shader::native::{HwStage, NativeProgram, StageIo};
+        let program = |words: &[u32]| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::default(),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        const END: u32 = 0xBF81_0000; // s_endpgm
+        // global_load_dword v3, v[0:1], off
+        let load = [0xDC30_8000, 0x037D_0000];
+        // global_store_dword v[0:1], v2, off
+        let store = [0xDC70_8000, 0x007D_0200];
+        // buffer_store_dword v2, off, s[0:3], 0
+        let view_store = [0xE070_0000, 0x8000_0200];
+        let walker = program(&[load[0], load[1], view_store[0], view_store[1], END]);
+        assert!(stores(&walker));
+        assert!(!stores_by_address(&walker));
+        let builder = program(&[load[0], load[1], store[0], store[1], END]);
+        assert!(stores(&builder));
+        assert!(stores_by_address(&builder));
+        // Code that does not decode may do anything.
+        assert!(stores_by_address(&program(&[0xFFFF_FFFF])));
     }
 }

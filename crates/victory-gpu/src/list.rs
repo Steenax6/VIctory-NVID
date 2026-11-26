@@ -114,7 +114,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Uploads>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -189,7 +189,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) struct Detached {
     host: crate::host::HostList,
-    _uploads: Vec<Vec<u8>>,
+    _uploads: Uploads,
     _state: crate::draw::State,
 }
 
@@ -418,7 +418,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                     part.waits,
                     Detached {
                         host: part.host,
-                        _uploads: Vec::new(),
+                        _uploads: Uploads::default(),
                         _state: Default::default(),
                     },
                 )
@@ -643,7 +643,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *uploads.lock().unwrap_or_else(|e| e.into_inner()) = Uploads::default();
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
     #[cfg(windows)]
@@ -682,7 +682,15 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    // The barrier names the host resource by a borrowed pointer: the list
+    // holds it until it is reset, as it does the textures it moves, since
+    // the title may release its resource (and the sweep its host copy)
+    // before the list has run.
+    let held = |texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource| -> This {
+        list.keep(texture);
+        texture.as_raw().cast_const().cast()
+    };
+    let host = |r: This| crate::resource::host_resource(r).map(held);
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -723,7 +731,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 // (the host gives the depth texture none): the barrier is
                 // on the texture shaders write.
                 match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
+                    Some(twin) => held(twin),
                     None => host(b.first)?,
                 }
             },
@@ -1338,16 +1346,56 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with the console's
+/// `COMPUTE_DISPATCH_INITIATOR` flags. Bit 5 ([`USE_THREAD_DIMENSIONS`])
+/// says `x`, `y` and `z` count threads, not groups ([`dispatch_groups`]);
+/// the ray-tracing structure builder dispatches this way (0x20, 0x8020 for
+/// its 32-lane programs). The other bits ask nothing of the host.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_x(this, x, y, z, flags);
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
+}
+
+/// `COMPUTE_DISPATCH_INITIATOR` bit 5, `USE_THREAD_DIMENSIONS`: a
+/// dispatch's three numbers are thread counts, and the console runs as
+/// many groups as hold them, the last along an axis cut to the count.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const USE_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// The groups a console dispatch of `dims` with `flags` runs, for a
+/// program of `group` threads a group (`numthreads`), and whether its last
+/// group along some axis is partial (the console starts only the threads
+/// up to the count there). None: a dispatch that counts threads and has
+/// none along an axis, which runs nothing.
+///
+/// Taking the thread counts for group counts ran the structure builder up
+/// to 64 times over: its box stages write 8 KiB a group, and in the first
+/// frame of a run that failed they ran 272,948 and 47,026 groups where
+/// 5,983 and 4,217 hold the threads, 2.2 GiB of empty nodes written past
+/// their structures into the title's own objects (fxceless/victory-fork
+/// #646 and #994, as DexNom bc3cd4b and uiliannn/VItoriaBr 633ba6e found
+/// too).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn dispatch_groups(dims: [u32; 3], group: [u32; 3], flags: u32) -> Option<([u32; 3], bool)> {
+    if flags & USE_THREAD_DIMENSIONS == 0 {
+        return Some((dims, false));
+    }
+    if dims.contains(&0) {
+        return None;
+    }
+    let mut groups = [0; 3];
+    let mut partial = false;
+    for i in 0..3 {
+        let g = group[i].max(1);
+        groups[i] = dims[i].div_ceil(g);
+        partial |= !dims[i].is_multiple_of(g);
+    }
+    Some((groups, partial))
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
@@ -1418,10 +1466,47 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. The host orders
+/// nothing between draws and dispatches of a list by itself: a sync waits
+/// for every shader write before it, as the title's barriers do (one
+/// unordered access barrier on all resources). Dispatches that read what
+/// the one before wrote, with a sync and no barrier between them (the
+/// ray-tracing structure builder has no other wait between its stages),
+/// ran overlapped before (avatarmanz/VIctory-7900XTX 0b5f191b8,
+/// Marvisak/VIctory #1228). `VICTORY_SYNC_BARRIER=0`: nothing, as before,
+/// to measure what the barriers cost on the card.
+extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
+    #[cfg(windows)]
+    if sync_barrier()
+        && let Some(list) = host_list(this)
+    {
+        // Whether and how the title syncs (the first calls).
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            tracing::info!(
+                flags = format_args!("{flags:#x}"),
+                control = format_args!("{control:#x}"),
+                address = format_args!("{address:#x}"),
+                size,
+                "a pipeline sync: waits for earlier shader writes"
+            );
+        }
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // SAFETY: the same layout; no resource named.
+        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: an open list.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+    let _ = (this, flags, control, address, size);
+}
+
+/// Whether a pipeline sync waits for earlier shader writes ([`sync`]; on
+/// by default, `VICTORY_SYNC_BARRIER=0`: not).
+#[cfg(windows)]
+fn sync_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_none_or(|v| v != "0"))
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1436,21 +1521,221 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some((size, len)) = usize::try_from(size).ok().and_then(|s| Some((s, s.checked_add(align)?))) else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
+    // SAFETY: the title passes one of our lists.
+    let uploads = unsafe { &(*this.cast::<List>()).uploads };
+    let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(windows)]
+    if upload::reachable()
+        && let Some(at) = uploads.carve(size, align)
+    {
+        // Zeros, as the heap blocks below are (a chunk comes back with what
+        // its last list left in it).
+        // SAFETY: bytes just carved out of a committed chunk the list holds.
+        unsafe { at.write_bytes(0, size) };
+        return at;
+    }
+    let _ = size;
     let mut block = vec![0u8; len];
     let start = block.as_mut_ptr();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
-    // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads.heap.push(block);
     at
+}
+
+/// What [`allocate_upload`] handed out to a list, kept until the list is
+/// reset or, once submitted, until the submission has run.
+#[derive(Default)]
+pub(crate) struct Uploads {
+    /// Chunks of upload memory shaders reach by address ([`upload`]), the
+    /// last one being carved, and the bytes of it handed out.
+    #[cfg(windows)]
+    chunks: Vec<upload::Chunk>,
+    #[cfg(windows)]
+    used: usize,
+    /// Blocks of the process heap: requests larger than a chunk, or all of
+    /// them when no chunk can be had.
+    heap: Vec<Vec<u8>>,
+}
+
+impl Uploads {
+    /// `size` bytes at a multiple of `align` (a power of two) from the
+    /// list's last chunk, or from a new one.
+    #[cfg(windows)]
+    fn carve(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        if size > upload::CHUNK || align > upload::CHUNK {
+            return None;
+        }
+        let fits = |used: usize| used.next_multiple_of(align) + size <= upload::CHUNK;
+        if self.chunks.is_empty() || !fits(self.used) {
+            self.chunks.push(upload::Chunk::take()?);
+            self.used = 0;
+        }
+        let offset = self.used.next_multiple_of(align);
+        self.used = offset + size;
+        // (Chunks start at multiples of their size, so of `align`.)
+        Some((self.chunks.last()?.at() + offset) as *mut u8)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        #[cfg(windows)]
+        if !self.chunks.is_empty() {
+            return false;
+        }
+        self.heap.is_empty()
+    }
+}
+
+/// List upload memory ([`allocate_upload`]) that shaders reach by address.
+///
+/// The structure builder writes what its stages read into list upload
+/// memory and hands the stages its addresses: its header stage gets the
+/// address of its 40-byte records as a root view and reads them through a
+/// buffer descriptor it makes of that address, that is by address. Blocks
+/// of the process heap lie wherever the heap puts them (at 1.5 to 1.8 TiB
+/// in the source's runs), beyond the console's 40 bits and the directory of
+/// title memory by address (`crate::memory`, below 128 GiB): the records
+/// read as zeros, so the stage stored its headers at address 0, which drops
+/// them, and no structure got a header. With the builder asked for, the
+/// memory comes from 4 MiB chunks of one reservation where the title's GPU
+/// memory lies (from 4 GiB, below 128 GiB), write-watched as XMem makes
+/// the title's: each chunk is one window of memory outside buffers
+/// (`crate::shadow`), whose pages the CPU wrote are copied when a list that
+/// names it is submitted, and none is on the process heap, which the guards
+/// must not touch (`crate::watch::protect_here`).
+#[cfg(windows)]
+pub(crate) mod upload {
+    use std::sync::Mutex;
+
+    use windows_sys::Win32::System::Memory::{
+        MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE,
+        MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+        VirtualAlloc2,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// A chunk: one window of memory outside buffers (`crate::shadow`).
+    pub(crate) const CHUNK: usize = 4 << 20;
+    /// Chunks reserved (512 MiB).
+    const CHUNKS: usize = 128;
+    /// The host's write watching (not in windows-sys' memory module).
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Whether list upload memory comes from the chunks: with the
+    /// structure builder asked for (`VICTORY_BVH_BUILDER=1`), or
+    /// `VICTORY_UPLOAD_CHUNKS=1`; `=0` never. Otherwise from the process
+    /// heap, as before.
+    pub(crate) fn reachable() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("VICTORY_UPLOAD_CHUNKS").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::pipeline::builder_allowed(),
+        })
+    }
+
+    struct Region {
+        /// The reservation's start; 0 if it could not be made.
+        base: usize,
+        /// Chunks committed so far, from the start.
+        next: usize,
+        /// Committed chunks no list holds.
+        free: Vec<usize>,
+    }
+
+    static REGION: Mutex<Option<Region>> = Mutex::new(None);
+
+    /// A chunk a list holds; it goes back to the free ones when dropped.
+    pub(crate) struct Chunk(usize);
+
+    impl Chunk {
+        /// A free chunk, or a new one; none when all are held (the heap
+        /// serves then, out of shaders' reach).
+        pub(crate) fn take() -> Option<Chunk> {
+            let mut region = REGION.lock().unwrap_or_else(|e| e.into_inner());
+            let r = region.get_or_insert_with(|| Region {
+                base: reserve().unwrap_or(0),
+                next: 0,
+                free: Vec::new(),
+            });
+            if r.base == 0 {
+                return None;
+            }
+            if let Some(at) = r.free.pop() {
+                return Some(Chunk(at));
+            }
+            if r.next == CHUNKS {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        chunks = CHUNKS,
+                        "list upload memory: every chunk is held; more comes from the heap, which shaders cannot reach by address"
+                    );
+                });
+                return None;
+            }
+            let at = r.base + r.next * CHUNK;
+            // SAFETY: a chunk of our reservation.
+            if unsafe { VirtualAlloc(at as *const _, CHUNK, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+                return None;
+            }
+            r.next += 1;
+            Some(Chunk(at))
+        }
+
+        pub(crate) fn at(&self) -> usize {
+            self.0
+        }
+    }
+
+    impl Drop for Chunk {
+        fn drop(&mut self) {
+            if let Some(r) = REGION.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                r.free.push(self.0);
+            }
+        }
+    }
+
+    fn reserve() -> Option<usize> {
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 32) as *mut _,
+            HighestEndingAddress: (((victory_shader::emit::MEMORY_PAGES as usize) << 16) - 1) as *mut _,
+            Alignment: CHUNK,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: a reservation of our own; the parameter and the
+        // requirements it points at outlive the call.
+        let at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                CHUNKS * CHUNK,
+                MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_NOACCESS,
+                &mut parameter,
+                1,
+            )
+        };
+        if at.is_null() {
+            tracing::warn!("list upload memory: no room below 128 GiB; it comes from the heap, which shaders cannot reach by address");
+            return None;
+        }
+        tracing::info!(
+            at = format_args!("{:#x}", at as usize),
+            "list upload memory comes from 4 MiB chunks shaders reach by address (VICTORY_UPLOAD_CHUNKS)"
+        );
+        Some(at as usize)
+    }
 }
 
 /// Draw state the host has no use for (root signatures: ours come with
@@ -1603,8 +1888,11 @@ mod state {
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        dispatch_x(this, x, y, z, 0);
+    }
+    pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, [x, y, z], flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1616,20 +1904,51 @@ mod state {
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`. One whose
+    /// group count is in memory (`indirect`, a title address) runs as an
+    /// indirect execution of one mesh record (`D3D12_DISPATCH_MESH_ARGUMENTS`,
+    /// three group counts, 12 bytes) through `State::execute_indirect`, as
+    /// an `ExecuteIndirect` with a mesh signature does: its count is
+    /// clamped there like any record's. The layout is inferred from the
+    /// direct form and the PC's method, not seen in the title's code
+    /// (Marvisak/VIctory#1546, which this follows; before, such dispatches
+    /// were dropped). The flags and payload are logged the first time one
+    /// is not 0; the host has no use for them.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
-        _flags: u64,
+        flags: u64,
         indirect: u64,
-        _payload: u64,
+        payload: u64,
     ) {
         super::count_draw();
-        if indirect != 0 {
+        if flags != 0 || payload != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            ONCE.call_once(|| {
+                tracing::info!(
+                    flags = format_args!("{flags:#x}"),
+                    payload = format_args!("{payload:#x}"),
+                    "a mesh dispatch with flags or a payload, which the host does not use (logged once)"
+                );
+            });
+        }
+        if indirect != 0 {
+            const MESH: u32 = 10;
+            const STRIDE: u32 = 12;
+            let mut ran = false;
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
+            });
+            if !ran {
+                super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        indirect = format_args!("{indirect:#x}"),
+                        "an indirect mesh dispatch did not run on the host (first time; counted with the dropped indirect executions)"
+                    );
+                });
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -2227,9 +2546,66 @@ mod tests {
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        // Where shaders reach title memory by address; more than a chunk
+        // comes from the heap. (Carved from chunks only with the builder
+        // asked for: the chunks themselves, here.)
+        #[cfg(windows)]
+        {
+            let mut chunks = Uploads::default();
+            if let Some(p) = chunks.carve(40, 0x100) {
+                assert!((1 << 32..(victory_shader::emit::MEMORY_PAGES as usize) << 16).contains(&(p as usize)));
+                let q = chunks.carve(24, 16);
+                assert_eq!(q.map(|q| q as usize), Some(p as usize + 48), "carved from the same chunk");
+                assert!(chunks.carve(8 << 20, 16).is_none(), "more than a chunk comes from the heap");
+                // SAFETY: committed bytes of the chunk.
+                unsafe { p.write_bytes(0xab, 40) };
+            }
+            assert!(!allocate_upload(list, 8 << 20, 16).is_null());
+        }
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// Group counts pass as they are; thread counts (bit 5, also with the
+    /// 32-lane bit 0x8000) become the groups that hold them, and a count
+    /// that is not a multiple of the group says its last group is partial
+    /// (after fxceless/victory-fork#646's test).
+    #[test]
+    fn a_dispatch_that_counts_threads_runs_the_groups_that_hold_them() {
+        assert_eq!(dispatch_groups([48, 1, 1], [64, 1, 1], 0), Some(([48, 1, 1], false)));
+        assert_eq!(dispatch_groups([48, 1, 1], [64, 1, 1], 0x8000), Some(([48, 1, 1], false)));
+        assert_eq!(dispatch_groups([0, 1, 1], [64, 1, 1], 0), Some(([0, 1, 1], false)));
+        assert_eq!(dispatch_groups([48, 1, 1], [64, 1, 1], 0x20), Some(([1, 1, 1], true)));
+        assert_eq!(dispatch_groups([1, 1, 1], [32, 1, 1], 0x8020), Some(([1, 1, 1], true)));
+        assert_eq!(dispatch_groups([65, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], true)));
+        assert_eq!(dispatch_groups([128, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], false)));
+        assert_eq!(dispatch_groups([10, 16, 5], [8, 8, 4], 0x20), Some(([2, 2, 2], true)));
+        assert_eq!(dispatch_groups([16, 16, 4], [8, 8, 4], 0x20), Some(([2, 2, 1], false)));
+        // The builder's box stage, run 64 times over before.
+        assert_eq!(dispatch_groups([382_912, 1, 1], [64, 1, 1], 0x20), Some(([5_983, 1, 1], false)));
+        // A program whose group size is not known divides by 1.
+        assert_eq!(dispatch_groups([7, 1, 1], [0; 3], 0x20), Some(([7, 1, 1], false)));
+        assert_eq!(dispatch_groups([0, 1, 1], [64, 1, 1], 0x20), None);
+    }
+
+    /// An indirect `DispatchMeshX` goes to the indirect execution, which
+    /// without a host GPU or a bound pipeline does not run it: it is
+    /// counted with the dropped executions, not lost unseen.
+    #[cfg(windows)]
+    #[test]
+    fn an_indirect_mesh_dispatch_goes_to_the_indirect_execution() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let _ = take_indirect();
+        state::dispatch_mesh_x(list, 0, 0, 0x1_0000_0000, 0);
+        assert!(take_indirect() >= 1);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

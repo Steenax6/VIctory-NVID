@@ -57,9 +57,100 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and the early list in `dir` from now on: the
+/// early list in `dir` itself, the library in a directory of its
+/// translation's there ([`library_dir`]).
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
+}
+
+/// The library's directory: `DIR/<translation>`, the first 16 hex digits of
+/// a hash of the translation's fingerprint
+/// (`victory_shader::emit::translation_fingerprint`, which the shader cache
+/// keys on too), and the library of another translation it is seeded from
+/// ([`keyed`]). Worked out at the first use, after the device has told the
+/// translator its facts (wave size, view heap limit).
+///
+/// A pipeline's name ([`name`]) is a hash of what its host description
+/// holds: our root signature, the translated shaders' code and the state.
+/// A translator change changes the names of the pipelines whose shaders it
+/// translates differently, and of no other: a pipeline of an unchanged
+/// shader keeps its name in every translation. So a library of another
+/// translation holds the right pipeline for every name it still has. What
+/// a translation's own library holds is what this translation used:
+/// pipelines made, and pipelines found in the seed, which are stored into
+/// it as they are found ([`pipeline`]); pipelines of shaders that
+/// translate differently now are never asked for, so they stay behind in
+/// the older libraries, which go when they are no longer among the [`KEPT`]
+/// newest. The own library therefore does not grow past what the title
+/// uses (Marvisak/VIctory #2706 wanted a library per translation because a
+/// first run after a change wrote a small library over the big one; one of
+/// its own each, seeded, keeps both).
+fn library_dir() -> Option<&'static PathBuf> {
+    keyed_dirs().map(|(dir, _)| dir)
+}
+
+/// The library files the own library is seeded from, in the order they
+/// are asked ([`library_dir`], [`keyed`]).
+fn seed_files() -> &'static [PathBuf] {
+    keyed_dirs().map_or(&[], |(_, seeds)| seeds.as_slice())
+}
+
+fn keyed_dirs() -> Option<&'static (PathBuf, Vec<PathBuf>)> {
+    static KEYED: OnceLock<Option<(PathBuf, Vec<PathBuf>)>> = OnceLock::new();
+    KEYED
+        .get_or_init(|| {
+            let dir = DIR.get()?;
+            let print = blake3::hash(&victory_shader::emit::translation_fingerprint());
+            let name: String = print.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            Some(keyed(dir, &name))
+        })
+        .as_ref()
+}
+
+/// Translations that keep a library: the one in use and the two before (a
+/// run cut short leaves a small library, and the one before it is still
+/// there to seed from).
+const KEPT: usize = 3;
+
+/// `dir/<name>`, and the libraries to seed it from, newest first: the
+/// other translations' libraries, then the one file earlier builds kept in
+/// `dir` itself (left as it is: it no longer changes). The other
+/// translations' libraries are pruned to the newest [`KEPT`]` - 1` (by
+/// when they were last written). Only what this wrote goes: directories
+/// named by 16 lowercase hex digits that hold a library.
+fn keyed(dir: &std::path::Path, name: &str) -> (PathBuf, Vec<PathBuf>) {
+    let path = dir.join(name);
+    let ours = |other: &std::path::Path| {
+        other.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.len() == 16 && n.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) && other.join(LIBRARY_FILE).is_file()
+    };
+    let written = |file: &std::path::Path| file.metadata().ok()?.modified().ok();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (path, Vec::new());
+    };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|other| *other != path && ours(other))
+        .filter_map(|other| Some((written(&other.join(LIBRARY_FILE))?, other)))
+        .collect();
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let mut seeds = Vec::new();
+    for (k, (_, other)) in others.into_iter().enumerate() {
+        if k < KEPT - 1 {
+            seeds.push(other.join(LIBRARY_FILE));
+        } else {
+            tracing::info!(dir = %other.display(), "pipeline library of an older translation removed");
+            let _ = std::fs::remove_dir_all(&other);
+        }
+    }
+    let shared = dir.join(LIBRARY_FILE);
+    if written(&shared).is_some() {
+        seeds.push(shared);
+    }
+    (path, seeds)
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -401,7 +492,21 @@ struct Library {
     /// Stores share it and a save takes it alone: the size the library
     /// asks for must still be its size when it is written out.
     saving: RwLock<()>,
+    /// Libraries of other translations, asked for a pipeline this one does
+    /// not have ([`seed_files`]); read only.
+    seeds: Vec<Seed>,
 }
+
+/// A library of another translation and the bytes it is made from (in
+/// this order: the library goes before its bytes).
+struct Seed {
+    library: ID3D12PipelineLibrary1,
+    _blob: Blob,
+}
+
+/// Pipelines found in a seed and stored into the own library since the
+/// start ([`pipeline`]).
+pub(crate) static SEEDED: AtomicU64 = AtomicU64::new(0);
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
 // its own calls (see the module's notes); what it does not, two loads of
@@ -442,14 +547,37 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
-            if library.is_none() {
-                tracing::warn!("no host pipeline library: pipelines are not kept");
+            let blob = library_dir().map_or(Blob::None, |d| Blob::of(d));
+            let mut library = open(&device, blob);
+            match &mut library {
+                Some(library) => library.seeds = seed_files().iter().filter_map(|f| open_seed(&device, f)).collect(),
+                None => tracing::warn!("no host pipeline library: pipelines are not kept"),
             }
             library
         })
         .as_ref()
+}
+
+/// The library in the file `path` of another translation, to seed this
+/// one's from; `None` if it is not there or the host rejects it.
+fn open_seed(device: &ID3D12Device1, path: &std::path::Path) -> Option<Seed> {
+    let blob = match mapped().then(|| Mapped::open(path)).flatten() {
+        Some(file) => Blob::Mapped(file),
+        None => Blob::Held(std::fs::read(path).ok().filter(|b| !b.is_empty())?),
+    };
+    // SAFETY: the bytes outlive the library (kept beside it).
+    let made = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(blob.bytes()) }
+        .and_then(|l| l.cast::<ID3D12PipelineLibrary1>());
+    match made {
+        Ok(library) => {
+            tracing::info!(file = %path.display(), bytes = blob.bytes().len(), "host pipeline library of another translation opened to seed this one's");
+            Some(Seed { library, _blob: blob })
+        }
+        Err(e) => {
+            tracing::info!(file = %path.display(), error = %e, "host pipeline library of another translation rejected");
+            None
+        }
+    }
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -477,6 +605,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
+                    seeds: Vec::new(),
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -493,6 +622,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
+                    seeds: Vec::new(),
     })
 }
 
@@ -508,17 +638,29 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
+/// there with the same description, else from a library of another
+/// translation (and stored into this one), else made by `create` and
+/// stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    pipeline_in(library, name, load, create)
+}
+
+/// [`pipeline`] with `library`.
+fn pipeline_in(
+    library: &Library,
+    name: &str,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let wide = HSTRING::from(name);
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
@@ -540,16 +682,36 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
-    let pso = {
-        let _call = call("make", name);
-        create()?
+    // Another translation's library: a pipeline of a shader this
+    // translation translates as it did is there under the same name.
+    let seeded = library.seeds.iter().find_map(|seed| {
+        let _all = one_call();
+        let _one = same_name(name);
+        let _call = call("load from a seed", name);
+        load(&seed.library, PCWSTR(wide.as_ptr())).ok()
+    });
+    let from_seed = seeded.is_some();
+    let pso = match seeded {
+        Some(pso) => {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            SEEDED.fetch_add(1, Ordering::Relaxed);
+            pso
+        }
+        None => {
+            // Compiled outside any lock: compiles take up to seconds.
+            let pso = {
+                let _call = call("make", name);
+                create()?
+            };
+            MADE.fetch_add(1, Ordering::Relaxed);
+            pso
+        }
     };
-    MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
+            "pipeline library: {} {label} in {:.1} ms (the library did not load it: {refused})",
+            if from_seed { "loaded from another translation's" } else { "made" },
             began.elapsed().as_secs_f64() * 1e3
         )
     });
@@ -569,7 +731,9 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    // (The library first: its directory is worked out after the device.)
+    let Some(library) = library() else { return };
+    let (Some(early_dir), Some(dir)) = (DIR.get(), library_dir()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -627,13 +791,14 @@ pub(crate) fn save(now: bool) {
         });
     }
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&early_dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            from_other_translations = SEEDED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
@@ -735,6 +900,101 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    /// A library of another translation gives a pipeline this one does not
+    /// have under the same name, and the pipeline is stored into this one:
+    /// nothing is compiled.
+    #[test]
+    fn a_pipeline_comes_from_another_translations_library() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let source = "RWByteAddressBuffer b : register(u0); [numthreads(1, 1, 1)] void main() { b.Store(0, 1); }";
+        let blob_bytes = |b: &ID3DBlob| {
+            // SAFETY: a live blob's own bytes.
+            unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) }.to_vec()
+        };
+        // SAFETY: plain compiles and object creation with live inputs.
+        let (root, code) = unsafe {
+            let mut code: Option<ID3DBlob> = None;
+            D3DCompile(source.as_ptr().cast(), source.len(), None, None, None, windows::core::s!("main"), windows::core::s!("cs_5_1"), 0, 0, &mut code, None).unwrap();
+            let range = D3D12_DESCRIPTOR_RANGE { RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV, NumDescriptors: 1, ..Default::default() };
+            let parameter = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: 1, pParameters: &parameter, ..Default::default() };
+            let mut serialized: Option<ID3DBlob> = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut serialized, None).unwrap();
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &blob_bytes(serialized.as_ref().unwrap())).unwrap();
+            (root, blob_bytes(code.as_ref().unwrap()))
+        };
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            ..Default::default()
+        };
+        // SAFETY: the description points at live data.
+        let load = |library: &ID3D12PipelineLibrary1, name: PCWSTR| unsafe { library.LoadComputePipeline(name, &desc) };
+        // SAFETY: as above.
+        let create = || unsafe { device.CreateComputePipelineState(&desc) };
+        // The other translation's library, holding the pipeline.
+        let other = open(&device, Blob::None).unwrap();
+        pipeline_in(&other, "seeded test", load, create).unwrap();
+        // SAFETY: plain queries and a buffer of the asked size.
+        let bytes = unsafe {
+            let mut bytes = vec![0u8; other.library.GetSerializedSize()];
+            other.library.Serialize(&mut bytes).unwrap();
+            bytes
+        };
+        // SAFETY: the bytes live beside the library.
+        let seed = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&bytes) }.unwrap().cast().unwrap();
+        let mut own = open(&device, Blob::None).unwrap();
+        own.seeds.push(Seed { library: seed, _blob: Blob::Held(bytes) });
+        let seeded = SEEDED.load(Ordering::Relaxed);
+        pipeline_in(&own, "seeded test", load, || panic!("compiled although another translation's library had it")).unwrap();
+        assert!(SEEDED.load(Ordering::Relaxed) > seeded);
+        assert_eq!(own.added.load(Ordering::Relaxed), 1, "stored into the own library");
+        // Next time from the own library itself.
+        own.seeds.clear();
+        assert!(load(&own.library, PCWSTR(HSTRING::from("seeded test").as_ptr())).is_ok());
+    }
+
+    /// Each translation's library has a directory of its own; the newest
+    /// two of the other translations' stay and are the seeds, newest first,
+    /// then the file of earlier builds; what this did not write (a
+    /// directory of another name, one without a library) is left alone.
+    #[test]
+    fn a_library_per_translation_seeded_from_the_ones_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = |name: &str, age: u64| {
+            let at = dir.path().join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            let file = std::fs::File::create(at.join(LIBRARY_FILE)).unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            file.set_modified(when).unwrap();
+        };
+        library("00000000000000aa", 300);
+        library("00000000000000bb", 100);
+        library("00000000000000cc", 200);
+        library("00000000000000ee", 400);
+        std::fs::write(dir.path().join(LIBRARY_FILE), b"earlier builds").unwrap();
+        std::fs::create_dir_all(dir.path().join("backup")).unwrap();
+        std::fs::create_dir_all(dir.path().join("00000000000000dd")).unwrap(); // no library
+        let (path, seeds) = keyed(dir.path(), "0123456789abcdef");
+        assert_eq!(path, dir.path().join("0123456789abcdef"));
+        let of = |name: &str| dir.path().join(name).join(LIBRARY_FILE);
+        assert_eq!(seeds, [of("00000000000000bb"), of("00000000000000cc"), dir.path().join(LIBRARY_FILE)]);
+        let left = |name: &str| dir.path().join(name).exists();
+        assert!(!left("00000000000000aa") && !left("00000000000000ee"), "older ones go");
+        assert!(left("backup") && left("00000000000000dd"), "nothing this did not write goes");
     }
 
     /// A mapped file reads as the file's bytes, a file written through a

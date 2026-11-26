@@ -483,6 +483,10 @@ pub(crate) fn page_written(at: usize, len: usize) {
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// More ranges came than [`REMAPPED`] keeps: the next texture pass looks
+/// at every placed slot once instead ([`HostHeap::texture_slots_remapped`]).
+static OVERFLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -520,8 +524,9 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them: a world's loading maps more
+    /// than 2^15 apart before a pass runs.
+    const MOST: usize = 1 << 20;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -537,8 +542,12 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     if ranges.len() >= MOST {
         // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
+        // the ranges go, and the next pass looks at every placed slot. Lost,
+        // which textures streamed in there were looked at again hung on
+        // timing: walls, a window frame and an outfit stayed wrong for a
+        // whole run, at random (PastiiJay/klbf-lab 74315e765).
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        OVERFLOWED.store(true, Relaxed);
         ranges.clear();
     }
     ranges.push((start, end));
@@ -682,14 +691,20 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), newest write first: the look is a query, and memory
+    ///   that has arrived since is what the title streamed in last;
+    /// - the others, the newest write first and the oldest next, in turns:
+    ///   slot order served the low slots of a backlog of 25,000-40,000
+    ///   while the textures of the shot on screen waited (run 52: 98% of
+    ///   the drawn pixels had no colour texture in the first 3D frames);
+    /// - the two kinds one after the other, one looked at before first.
+    ///   With all those looked at before first, a backlog of thousands
+    ///   streaming in a part at a time filled every pass, which the pass's
+    ///   time then cut, and slots never looked at waited 300 to 1,500
+    ///   frames: faces whose textures are picked by index read an empty
+    ///   slot (black) or an older view (red, noise) in the opening
+    ///   cutscene (fxceless/victory-fork pull request #1246, RTX 5060 Ti).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
@@ -701,15 +716,26 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        let mut fresh_order = fresh_order.into_iter();
+        let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
+        while order.len() < max {
+            let (a, b) = (again_order.next(), fresh_order.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            order.extend(b);
         }
         order.truncate(max);
         order
@@ -1177,6 +1203,44 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// A sampler heap of our own, for a list that sets one of our root
+/// signatures while the title binds no sampler heap: every one says its
+/// sampler heap is indexed directly (`SAMPLER_HEAP_DIRECTLY_INDEXED`), and
+/// D3D12 requires such a heap to be bound before such a signature is set
+/// (the debug layer's id 1419); NVIDIA removes the device for it
+/// (Marvisak/VIctory #1754, a compute list that reads views and no
+/// samplers). Slot 0 holds a point sampler, so an indexed read of it gives
+/// something defined.
+pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
+    fallback(true)
+}
+
+/// A view heap of our own, for a list that sets one of our root signatures
+/// while the title binds no view heap: they index the view heap directly
+/// too (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`), with the same rule as
+/// [`fallback_samplers`] (Marvisak/VIctory #2894). Made as a title heap of
+/// no slots: every slot up to the one shaders clamp view indices to is a
+/// null view, so whatever a shader indexes reads zeros.
+pub(crate) fn fallback_views() -> Option<&'static HostHeap> {
+    fallback(false)
+}
+
+/// [`fallback_samplers`] and [`fallback_views`], each made on first use.
+fn fallback(sampler: bool) -> Option<&'static HostHeap> {
+    static HEAPS: [std::sync::OnceLock<Option<HostHeap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    HEAPS[usize::from(sampler)]
+        .get_or_init(|| {
+            if sampler {
+                let heap = HostHeap::new(true, 1)?;
+                heap.null_sampler(0);
+                Some(heap)
+            } else {
+                HostHeap::new(false, 0)
+            }
+        })
+        .as_ref()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1336,20 +1400,30 @@ impl HostHeap {
     /// went makes the slot null ([`HostHeap::texture_slot_gone`]), and a
     /// texture streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
-    /// left to their draws. Returns how many slots it made due.
+    /// left to their draws. After ranges were dropped ([`OVERFLOWED`]) it
+    /// makes every placed slot due, once. Returns how many slots it made due.
     /// shortcut: the ranges are kept in one place for all heaps; the heap
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() {
+        // Taken once: only another overflow sets it again.
+        let all = OVERFLOWED.swap(false, Relaxed);
+        if ranges.is_empty() && !all {
             return 0;
         }
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            if all {
+                placed.by_slot.keys().copied().collect()
+            } else {
+                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            }
         };
+        if all {
+            tracing::info!(slots = slots.len(), "remapped ranges overflowed: every placed slot is looked at again");
+        }
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
@@ -2245,13 +2319,17 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
+    /// memory (the list's own, which it holds); a null one for no bytes.
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+        let desc = match constant_view_bytes(size) {
+            Some(bytes) if gpu != 0 => D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: gpu,
+                SizeInBytes: bytes,
+            },
+            // A zero location and size: the null constant view.
+            _ => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -3187,14 +3265,110 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// A shader view whose format has the same bytes as its texture's but
+/// the channels in other places: in which format of the texture's family
+/// the host makes it, and which channel of that view each channel of the
+/// title's comes from (0 to 3: red to alpha; 4: zero; 5: one). The console
+/// reads the bytes as the view's format says; the host allows views only
+/// in the texture's own family. So an alpha-only (A8) view of an R8
+/// texture reads (0, 0, 0, r), an R8 view of an A8 texture (a, 0, 0, 1),
+/// a B8G8R8X8 view of a B8G8R8A8 texture (r, g, b, 1), and B8G8R8A8 views
+/// of R8G8B8A8 textures (and the other way round) have red and blue
+/// swapped. Only UNORM (and sRGB) views of UNORM, sRGB or typeless
+/// textures: the others would read the bytes as another kind of number.
+/// `None`: not such a pair (the view is made, or refused, as it names).
+/// Unordered access views have no component mapping: such a view of
+/// another family is refused (`fits`).
+pub(crate) fn other_channels(view: u32, own: u32) -> Option<(u32, [u32; 4])> {
+    const R8_TYPELESS: u32 = 60;
+    const R8_UNORM: u32 = 61;
+    const A8_UNORM: u32 = 65;
+    // Typeless, UNORM and sRGB.
+    const RGBA: [u32; 3] = [27, 28, 29];
+    const BGRA: [u32; 3] = [90, 87, 91];
+    const SRGB: [u32; 3] = [29, 91, 93];
+    // In the UNORM or sRGB format of the texture's family, as the title's
+    // view is one or the other (`fits` keeps it on a typed texture where
+    // the host casts, else takes the texture's).
+    let host = |family: [u32; 3]| if SRGB.contains(&view) { family[2] } else { family[1] };
+    match view {
+        A8_UNORM if matches!(own, R8_TYPELESS | R8_UNORM) => Some((R8_UNORM, [4, 4, 4, 0])),
+        R8_UNORM if own == A8_UNORM => Some((A8_UNORM, [3, 4, 4, 5])),
+        // B8G8R8A8 and B8G8R8X8 views of R8G8B8A8 textures.
+        87 | 91 if RGBA.contains(&own) => Some((host(RGBA), [2, 1, 0, 3])),
+        88 | 93 if RGBA.contains(&own) => Some((host(RGBA), [2, 1, 0, 5])),
+        // B8G8R8X8 and R8G8B8A8 views of B8G8R8A8 textures.
+        88 | 93 if BGRA.contains(&own) => Some((host(BGRA), [0, 1, 2, 5])),
+        28 | 29 if BGRA.contains(&own) => Some((host(BGRA), [2, 1, 0, 3])),
+        _ => None,
+    }
+}
+
+/// The title's component mapping `title` for a view whose channels come
+/// from the host view's as `from` says ([`other_channels`]): each channel
+/// the title's mapping takes from the view takes what the view has there.
+pub(crate) fn mapped_through(title: u32, from: [u32; 4]) -> u32 {
+    // Set in every mapping the host takes.
+    const ALWAYS: u32 = 1 << 12;
+    let mut mapping = title & !0xfff | ALWAYS;
+    for channel in 0..4 {
+        let source = title >> (3 * channel) & 7;
+        let source = from.get(source as usize).copied().unwrap_or(source);
+        mapping |= source << (3 * channel);
+    }
+    mapping
+}
+
+/// Shader views read through other channels ([`other_channels`]), since
+/// the start.
+pub(crate) static OTHER_CHANNELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The title's shader view `desc` of `texture` as the host makes it when
+/// its format has the texture's bytes in other channels
+/// ([`other_channels`]). Each distinct case is logged once (at most 32),
+/// and so is each distinct alpha-only view of an alpha-only texture, which
+/// needs no change: they say how the title's A8 tables are read.
+fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    const A8_UNORM: u32 = 65;
+    // SAFETY: a live resource.
+    let own = unsafe { texture.GetDesc() }.Format.0 as u32;
+    let view = desc.Format.0 as u32;
+    let other = other_channels(view, own);
+    if let Some((format, from)) = other {
+        OTHER_CHANNELS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        desc.Format = DXGI_FORMAT(format as i32);
+        desc.Shader4ComponentMapping = mapped_through(desc.Shader4ComponentMapping, from);
+    }
+    if other.is_some() || view == A8_UNORM || own == A8_UNORM {
+        static SEEN: Mutex<Vec<(u32, u32, i32, u32)>> = Mutex::new(Vec::new());
+        let case = (view, own, desc.ViewDimension.0, desc.Shader4ComponentMapping);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 32 && !seen.contains(&case) {
+            seen.push(case);
+            tracing::info!(
+                view_format = view,
+                texture_format = own,
+                host_format = desc.Format.0,
+                dimension = desc.ViewDimension.0,
+                mapping = desc.Shader4ComponentMapping,
+                through_other_channels = other.is_some(),
+                "a shader view of an alpha-only format, or read through other channels"
+            );
+        }
+    }
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
-/// view; the host refuses (and removes the device for) views without the
-/// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
+/// view and reads the bytes as the view's format says; the host refuses
+/// (and removes the device for) views without the resource's permission,
+/// of typed depth, and in another family than the resource's. A view of a
+/// typed texture in another format of its family keeps that format where
+/// the host casts between the two ([`casts`]: an sRGB view of a UNORM
+/// texture converts, a UINT view of a UNORM texture reads integers), else
+/// takes the texture's format. A shader view in a format with the
+/// texture's bytes in other channels is one of the texture's family by
+/// now ([`read_through`]).
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -3245,10 +3419,63 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && !(casts(texture, own, view, unordered))
     {
         *format = d.Format;
     }
     true
+}
+
+/// Whether the host makes a view in format `view` of a typed texture in
+/// format `own` of the same family (D3D12's relaxed format casting, where
+/// the host has it: `CastingFullyTypedFormatSupported`). Never between a
+/// float and another kind, nor between SNORM and UNORM; not for depth
+/// formats; no unordered access in B8G8R8A8 or B8G8R8X8 (optional on
+/// the host). (fxceless PR #644 kept sRGB and linear RGBA8 views so; the
+/// casting rules allow every such pair.)
+fn casts(texture: &ID3D12Resource, own: u32, view: u32, unordered: bool) -> bool {
+    const FLOAT: [u32; 9] = [2, 6, 10, 16, 34, 41, 54, 95, 96];
+    const SNORM: [u32; 8] = [13, 31, 37, 51, 58, 63, 81, 84];
+    const UNORM: [u32; 22] = [11, 24, 28, 29, 35, 49, 56, 61, 71, 72, 74, 75, 77, 78, 80, 83, 87, 88, 91, 93, 98, 99];
+    const DEPTH: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
+    if own == view {
+        return true;
+    }
+    let float = |f: u32| FLOAT.contains(&f);
+    let normalized = |a: u32, b: u32| SNORM.contains(&a) && UNORM.contains(&b);
+    let pair = float(own) == float(view)
+        && !normalized(own, view)
+        && !normalized(view, own)
+        && !DEPTH.contains(&own)
+        && !DEPTH.contains(&view)
+        && !(unordered && (87..=93).contains(&view));
+    pair && typed_casting(texture)
+}
+
+/// Whether the host has relaxed format casting (asked of the device of
+/// the first texture viewed; logged once).
+fn typed_casting(texture: &ID3D12Resource) -> bool {
+    static CASTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CASTING.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a live resource's device; the query writes `options` of
+        // the size passed.
+        let asked = unsafe {
+            texture.GetDevice(&mut device).is_ok()
+                && device.is_some_and(|d| {
+                    d.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+                })
+        };
+        let supported = asked && options.CastingFullyTypedFormatSupported.as_bool();
+        tracing::info!(supported, "views of typed textures in other formats of their family (relaxed format casting)");
+        supported
+    })
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -3318,6 +3545,15 @@ fn twin_uav(
     Some(desc)
 }
 
+/// The bytes of a host constant buffer view of a title's of `size`: whole
+/// 256s (the host's step), and at most the 64 KiB a shader reads (a larger
+/// view is an invalid call, for which NVIDIA removes the device). `None`
+/// for a view of no bytes, which reads zeros: a null view, not one of 256
+/// bytes of whatever lies at its address.
+fn constant_view_bytes(size: u32) -> Option<u32> {
+    (size != 0).then(|| size.min(crate::descriptor::CONSTANT_VIEW_MOST).next_multiple_of(256))
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3325,6 +3561,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            let bytes = constant_view_bytes(size)?;
+            if address == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -3336,7 +3576,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: bytes,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3370,6 +3610,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(desc) = desc.as_mut() {
+                    read_through(texture, desc);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -3400,6 +3643,35 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         },
                     };
                     crate::tiles::shape_view(desc.get_or_insert(whole), levels, u32::from(own.MipLevels));
+                } else if let Some(first) = crate::texture::levels_shown_from(resource) {
+                    // Uploaded whole while it streams in: shown from its first
+                    // level whose pages are there, its larger ones zeros
+                    // until then (`crate::texture` `note_levels_there`). A
+                    // view the title gave is clamped (2D and 2D arrays; a
+                    // clamp of its own is kept if higher); the default view
+                    // of a one-layer 2D texture too. Cubes, volumes and the
+                    // default view of an array are not: they show the zeros.
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() };
+                    if desc.is_none() && own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && own.DepthOrArraySize == 1
+                    {
+                        desc = Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: own.Format,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: 5768,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MostDetailedMip: 0,
+                                    MipLevels: u32::MAX,
+                                    PlaneSlice: 0,
+                                    ResourceMinLODClamp: 0.0,
+                                },
+                            },
+                        });
+                    }
+                    if let Some(desc) = desc.as_mut() {
+                        crate::tiles::clamp_from(desc, first, u32::from(own.MipLevels));
+                    }
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -3949,6 +4221,282 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Views read through other channels, made as [`make`] makes them and
+/// read by a shader on the software adapter.
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows::core::Interface;
+
+    const DEFAULT: u32 = 5768;
+    const A8_UNORM: u32 = 65;
+    const R8_TYPELESS: u32 = 60;
+    const R8_UNORM: u32 = 61;
+    const TEXTURE_2D: u32 = 4;
+
+    /// Each texel of a 4x1 texture, as a float4.
+    const LOAD: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float4> t : register(t0);
+RWStructuredBuffer<float4> o : register(u0);
+[RootSignature(RS)]
+[numthreads(4, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); }
+"#;
+
+    fn warp() -> Option<ID3D12Device> {
+        // SAFETY: plain DXGI queries and device creation on the software
+        // adapter; a card is never opened.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                return None;
+            }
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            device
+        }
+    }
+
+    /// The title's 2D view of mip 0 in `format` with `mapping`.
+    fn view(format: u32, mapping: u32) -> [u32; 10] {
+        [format, TEXTURE_2D, mapping, 0, 0, 1, 0, 0, 0, 0]
+    }
+
+    /// What a shader reads from a 4x1 texture of `format` holding `bytes`
+    /// through the title's view `words`, made as [`make`] makes it.
+    fn read(device: &ID3D12Device, format: u32, bytes: &[u8], words: [u32; 10]) -> [[f32; 4]; 4] {
+        let cpu_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let one = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+        let code = crate::host::compile(LOAD, windows::core::s!("main"), windows::core::s!("cs_5_1"))
+            .expect("the test's shader");
+        // SAFETY: plain object creation on the software adapter; the
+        // mappings hold what is written and read; the list is waited for.
+        unsafe {
+            let mut texture: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &cpu_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 4,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT(format as i32),
+                        SampleDesc: one,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+                .expect("a texture");
+            let texture = texture.unwrap();
+            texture.Map(0, None, None).expect("a mapped texture");
+            let len = bytes.len() as u32;
+            texture
+                .WriteToSubresource(0, None, bytes.as_ptr().cast(), len, len)
+                .expect("the texels");
+            texture.Unmap(0, None);
+            let mut desc = srv_desc(&words);
+            read_through(&texture, &mut desc);
+            assert!(fits(&texture, Some(&mut desc.Format), false), "a view the host makes");
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("a heap");
+            device.CreateShaderResourceView(&texture, Some(&desc), heap.GetCPUDescriptorHandleForHeapStart());
+            let mut out: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &cpu_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 64,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: one,
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut out,
+                )
+                .expect("an output buffer");
+            let out = out.unwrap();
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("a queue");
+            let allocator: ID3D12CommandAllocator =
+                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("an allocator");
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso)
+                .expect("a list");
+            list.SetComputeRootSignature(&root);
+            list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+            list.Close().expect("a closed list");
+            queue.ExecuteCommandLists(&[Some(list.cast().expect("a command list"))]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("a fence");
+            queue.Signal(&fence, 1).expect("a signal");
+            // No event: the call returns when the fence has the value.
+            fence
+                .SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default())
+                .expect("the list ran");
+            let mut data = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut data)).expect("a mapped output");
+            let texels = data.cast::<[[f32; 4]; 4]>().read();            out.Unmap(0, None);
+            texels
+        }
+    }
+
+    fn near(got: [[f32; 4]; 4], want: [[f32; 4]; 4]) -> bool {
+        got.iter().flatten().zip(want.iter().flatten()).all(|(g, w)| (g - w).abs() < 1e-6)
+    }
+
+    /// The bytes of each texel over 255.
+    fn unorm(bytes: [u8; 4]) -> [f32; 4] {
+        bytes.map(|b| f32::from(b) / 255.0)
+    }
+
+    #[test]
+    fn mappings_take_each_channel_from_where_the_view_has_it() {
+        // (0, 0, 0, r): the A8 view of an R8 texture.
+        assert_eq!(mapped_through(DEFAULT, [4, 4, 4, 0]), 4388);
+        // The title's own (a, a, a, a) of an A8 view: (r, r, r, r).
+        let alpha = 3 | 3 << 3 | 3 << 6 | 3 << 9 | 1 << 12;
+        assert_eq!(mapped_through(alpha, [4, 4, 4, 0]), 1 << 12);
+        // The title's constants stay.
+        let constants = 4 | 5 << 3 | 4 << 6 | 5 << 9 | 1 << 12;
+        assert_eq!(mapped_through(constants, [3, 4, 4, 5]), constants);
+        assert_eq!(other_channels(A8_UNORM, R8_UNORM), Some((R8_UNORM, [4, 4, 4, 0])));
+        assert_eq!(other_channels(A8_UNORM, R8_TYPELESS), Some((R8_UNORM, [4, 4, 4, 0])));
+        assert_eq!(other_channels(R8_UNORM, A8_UNORM), Some((A8_UNORM, [3, 4, 4, 5])));
+        // Integer and signed views read other numbers: not mapped.
+        assert_eq!(other_channels(62, A8_UNORM), None);
+        assert_eq!(other_channels(A8_UNORM, 62), None);
+        // Typeless textures: in the UNORM or sRGB format the view names.
+        assert_eq!(other_channels(91, 27), Some((29, [2, 1, 0, 3])));
+        assert_eq!(other_channels(88, 90), Some((87, [0, 1, 2, 5])));
+        assert_eq!(other_channels(28, 91), Some((87, [2, 1, 0, 3])));
+        // Views of their own family are left to `fits`.
+        assert_eq!(other_channels(A8_UNORM, A8_UNORM), None);
+        assert_eq!(other_channels(R8_UNORM, R8_TYPELESS), None);
+        assert_eq!(other_channels(28, 27), None);
+    }
+
+    /// The case of the title's blur strength table: its alpha is read
+    /// (it read 1 everywhere when the A8 view became an R8 view).
+    #[test]
+    fn warp_an_alpha_only_view_of_an_r8_texture_reads_alpha() {
+        let Some(device) = warp() else {
+            return;
+        };
+        let bytes = [0x00, 0x40, 0x80, 0xff];
+        let alpha = bytes.map(|b| [0.0, 0.0, 0.0, f32::from(b) / 255.0]);
+        for texture in [R8_UNORM, R8_TYPELESS, A8_UNORM] {
+            let got = read(&device, texture, &bytes, view(A8_UNORM, DEFAULT));
+            assert!(near(got, alpha), "A8 view of a texture of format {texture}: {got:?}");
+        }
+        // The other way round: an R8 view of an A8 texture.
+        let red = bytes.map(|b| [f32::from(b) / 255.0, 0.0, 0.0, 1.0]);
+        let got = read(&device, A8_UNORM, &bytes, view(R8_UNORM, DEFAULT));
+        assert!(near(got, red), "R8 view of an A8 texture: {got:?}");
+        // The title's mapping (a, a, a, a) of the A8 view.
+        let all = 3 | 3 << 3 | 3 << 6 | 3 << 9 | 1 << 12;
+        let wide = bytes.map(|b| [f32::from(b) / 255.0; 4]);
+        let got = read(&device, R8_UNORM, &bytes, view(A8_UNORM, all));
+        assert!(near(got, wide), "A8 view with (a, a, a, a): {got:?}");
+    }
+
+    /// An sRGB view of a UNORM texture converts, a UNORM view of an sRGB
+    /// texture does not (where the host casts); an SNORM view of a UNORM
+    /// texture, which no host casts to, reads as the texture.
+    #[test]
+    fn warp_views_in_another_format_of_the_family_read_as_that_format() {
+        let Some(device) = warp() else {
+            return;
+        };
+        let bytes = [0x80; 16];
+        let linear = [[128.0 / 255.0; 4]; 4];
+        let mut srgb = [[0.215_860_5; 4]; 4];
+        for texel in &mut srgb {
+            texel[3] = 128.0 / 255.0;
+        }
+        let close = |got: [[f32; 4]; 4], want: [[f32; 4]; 4]| {
+            got.iter().flatten().zip(want.iter().flatten()).all(|(g, w)| (g - w).abs() < 0.002)
+        };
+        // SAFETY: a plain query into our own structure.
+        let casting = unsafe {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, (&raw mut options).cast(), size_of_val(&options) as u32)
+                .is_ok()
+                && options.CastingFullyTypedFormatSupported.as_bool()
+        };
+        let got = read(&device, 28, &bytes, view(29, DEFAULT));        assert!(close(got, if casting { srgb } else { linear }), "sRGB of UNORM: {got:?}");
+        let got = read(&device, 29, &bytes, view(28, DEFAULT));
+        assert!(close(got, if casting { linear } else { srgb }), "UNORM of sRGB: {got:?}");
+        let got = read(&device, 28, &bytes, view(31, DEFAULT));
+        assert!(close(got, linear), "SNORM of UNORM: {got:?}");
+    }
+
+    #[test]
+    fn warp_views_of_four_bytes_in_another_order_swap_and_fill_channels() {
+        let Some(device) = warp() else {
+            return;
+        };
+        let texel = [10, 20, 30, 40];
+        let bytes: Vec<u8> = texel.repeat(4);
+        // B8G8R8A8 view of an R8G8B8A8 texture: byte 0 is blue.
+        let got = read(&device, 28, &bytes, view(87, DEFAULT));
+        assert!(near(got, [unorm([30, 20, 10, 40]); 4]), "BGRA of RGBA: {got:?}");
+        // B8G8R8X8 view of a B8G8R8A8 texture: alpha 1.
+        let mut opaque = unorm([30, 20, 10, 40]);
+        opaque[3] = 1.0;
+        let got = read(&device, 87, &bytes, view(88, DEFAULT));
+        assert!(near(got, [opaque; 4]), "BGRX of BGRA: {got:?}");
+        // R8G8B8A8 view of a typeless B8G8R8A8 texture: byte 0 is red.
+        let got = read(&device, 90, &bytes, view(28, DEFAULT));
+        assert!(near(got, [unorm(texel); 4]), "RGBA of BGRA: {got:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4145,6 +4693,57 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// Host constant views are whole 256s and at most 64 KiB (a larger one
+    /// removes the device on NVIDIA); one of no bytes is a null view. Made
+    /// on the device, an oversized one and one of nothing leave it alive.
+    #[test]
+    fn constant_views_are_at_most_64_kib_and_none_is_null() {
+        assert_eq!(constant_view_bytes(0), None);
+        assert_eq!(constant_view_bytes(16), Some(256));
+        assert_eq!(constant_view_bytes(480), Some(512));
+        assert_eq!(constant_view_bytes(65_536), Some(65_536));
+        assert_eq!(constant_view_bytes(969_472), Some(65_536));
+        assert_eq!(constant_view_bytes(u32::MAX), Some(65_536));
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some((buffer, _)) = host.upload_buffer(1 << 20) else {
+            return;
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        heap.constant_at(0, gpu, 969_472);
+        heap.constant_at(1, gpu, 0);
+        heap.constant_at(2, 0, 256);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Our sampler and view heaps, for lists whose title binds none, are
+    /// made once each; a list that binds both and runs leaves the device
+    /// alive.
+    #[test]
+    fn our_heaps_are_made_once_and_bind() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let samplers = fallback_samplers().expect("a sampler heap of ours");
+        let views = fallback_views().expect("a view heap of ours");
+        assert!(std::ptr::eq(samplers, fallback_samplers().unwrap()));
+        assert!(std::ptr::eq(views, fallback_views().unwrap()));
+        assert!(samplers.sampler && !views.sampler);
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list and shader-visible heaps of ours.
+        unsafe { list.list.SetDescriptorHeaps(&[Some(views.heap.clone()), Some(samplers.heap.clone())]) };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn a_structured_view_made_raw_passes_the_host_check() {
@@ -4219,6 +4818,33 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Slots looked at before and slots never looked at are served in
+    /// turns, one looked at before first: a pass that can take only some
+    /// of a backlog of slots streaming in a part at a time still reaches
+    /// the slots never looked at (fxceless/victory-fork pull request #1246).
+    #[test]
+    fn the_texture_queue_serves_looked_at_and_fresh_slots_in_turns() {
+        let mut q = TextureQueue::default();
+        // Slots 100..110 looked at before (their memory not there yet).
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+        }
+        for i in 0..10u32 {
+            let w = q.due(u64::MAX, 100).iter().find(|d| d.0 == 100 + i).unwrap().1;
+            q.later(100 + i, w, 1, 1);
+        }
+        // Slots 1..4 never looked at.
+        for i in 1..4u32 {
+            q.written(i, 2, 0, false);
+        }
+        let order: Vec<u32> = q.due(10, 6).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 6);
+        assert!(order[0] >= 100, "a slot looked at before comes first: {order:?}");
+        assert_eq!(order.iter().filter(|&&i| i < 100).count(), 3, "every fresh slot is reached: {order:?}");
+        // In turns: looked at, fresh, looked at, fresh...
+        assert!(order.iter().step_by(2).all(|&i| i >= 100) && order.iter().skip(1).step_by(2).all(|&i| i < 100));
     }
 
     /// Slots held back for lack of room on the card are not handed out
@@ -4511,6 +5137,7 @@ mod tests {
     /// again from the next frame; a stale slot leaves the queue.
     #[test]
     fn remapped_memory_makes_its_texture_slots_due() {
+        let _one = REMAPPED_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
@@ -4537,6 +5164,34 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// The tests that take [`REMAPPED`] and [`OVERFLOWED`], one at a time.
+    static REMAPPED_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Ranges dropped on overflow make every placed slot due at the next
+    /// pass, once; the pass after has nothing to do (PastiiJay/klbf-lab
+    /// 74315e765).
+    #[test]
+    fn overflowed_ranges_make_every_placed_slot_due_once() {
+        let _one = REMAPPED_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let at = 0x7fed_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(3, Some(&view), false).is_empty());
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(queued, 3);
+        heap.texture_slot_done(3, write, None);
+        REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        OVERFLOWED.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(heap.texture_slots_remapped(50), 1);
+        assert_eq!(slots(51), [3]);
+        assert_eq!(heap.texture_slots_remapped(52), 0);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

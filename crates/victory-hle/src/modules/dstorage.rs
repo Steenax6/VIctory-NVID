@@ -29,6 +29,7 @@ use victory_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
+use super::xmem::PageRuns;
 use crate::{HleModule, hle_export};
 
 /// The factory interface the title asks for.
@@ -369,9 +370,14 @@ struct Lane {
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
-    /// Submitted, by sequence number: reads not started, status entries
-    /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    /// Left out when the queue submitted itself, until the title's Submit:
+    /// reads into physical pages and the status entries behind them
+    /// ([`Lanes::submit_as`]).
+    held: Vec<Command>,
+    /// Submitted, by sequence number: reads not started (with the pages of
+    /// a page destination as resolved at the title's Submit), status
+    /// entries not written, reads running, and failures not yet reported.
+    reads: VecDeque<(u64, Request, Option<PageRuns>)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -388,6 +394,8 @@ struct Job {
     lane: u64,
     seq: u64,
     request: Request,
+    /// A page destination's pages, resolved at the title's Submit.
+    pages: Option<PageRuns>,
     staging: u64,
 }
 
@@ -493,13 +501,13 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, job.pages.take());
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
@@ -557,14 +565,13 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, request, pages) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -576,6 +583,7 @@ impl Lanes {
             lane: id,
             seq,
             request,
+            pages,
             staging,
         })
     }
@@ -591,8 +599,24 @@ impl Lanes {
         }
     }
 
-    /// Moves a queue's enqueued commands to the workers.
+    /// Moves a queue's enqueued commands to the workers: the title's
+    /// Submit, whose page destinations have their lists right now.
     fn submit(&mut self, id: u64) {
+        self.submit_as(id, Submit::Title);
+    }
+
+    /// As [`Lanes::submit`], for `how`. A request into physical pages
+    /// carries as its page list a pointer into the title's own table of
+    /// page numbers, which the title fills for a batch in its submit path,
+    /// right before Submit, and may change after it: until then the list
+    /// names no page, or a page that now holds something else (the data
+    /// would go there, silently). So at the title's Submit the lists are
+    /// resolved to their pages, held until the write; a queue that submits
+    /// itself half full leaves those reads, and the status entries behind
+    /// them, for the title's Submit; a full queue sends everything, lists
+    /// read when the requests run, so a title that waits for room cannot
+    /// deadlock.
+    fn submit_as(&mut self, id: u64, how: Submit) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -611,11 +635,33 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        for command in std::mem::take(&mut lane.unsubmitted) {
+        let mut commands = if how == Submit::Half {
+            Vec::new()
+        } else {
+            std::mem::take(&mut lane.held)
+        };
+        commands.append(&mut lane.unsubmitted);
+        for command in commands {
+            let hold = how == Submit::Half
+                && match &command {
+                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Status(_) => !lane.held.is_empty(),
+                };
+            if hold {
+                lane.held.push(command);
+                continue;
+            }
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    let pages = if how == Submit::Title {
+                        resolve(&request)
+                    } else {
+                        None
+                    };
+                    lane.reads.push_back((seq, request, pages));
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -630,6 +676,7 @@ impl Lane {
             capacity: usize::from(capacity),
             clock: 0,
             unsubmitted: Vec::new(),
+            held: Vec::new(),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
@@ -640,7 +687,11 @@ impl Lane {
 
     /// Requests and status entries held, submitted or not.
     fn entries(&self) -> usize {
-        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+        self.unsubmitted.len()
+            + self.held.len()
+            + self.reads.len()
+            + self.statuses.len()
+            + self.running.len()
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -688,6 +739,7 @@ fn close_lane(id: u64) {
     };
     lane.closed = true;
     lane.unsubmitted.clear();
+    lane.held.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
@@ -740,6 +792,57 @@ enum Command {
     Status(Status),
 }
 
+/// Who submits a queue's commands ([`Lanes::submit_as`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Submit {
+    /// The title's Submit: page lists are resolved now.
+    Title,
+    /// The queue, half full: reads into pages wait for the title's Submit.
+    Half,
+    /// The queue, full: everything goes, page lists read when run.
+    Full,
+}
+
+/// A page destination's pages as its list names them now; `None` for other
+/// requests, or if a page is not known (then read again when it runs).
+fn resolve(request: &Request) -> Option<PageRuns> {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
+        return None;
+    }
+    let (offset, len) = destination_span(request);
+    let pages = page_list(request, offset, len);
+    let runs = super::xmem::resolve_pages(&pages, offset, len);
+    if runs.is_none() {
+        UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+    }
+    runs
+}
+
+/// Page destinations whose list named an unknown page at the title's
+/// Submit (read again when they ran).
+static UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+
+/// Where in the first page a page destination starts, and how many bytes
+/// the request writes there.
+fn destination_span(request: &Request) -> (usize, usize) {
+    let len = if request.options & (ZLIB | BCPACK) == 0 {
+        request.source_size
+    } else {
+        request.destination_size
+    };
+    ((request.page_offset & 0xffff) as usize, len as usize)
+}
+
+/// A page destination's page numbers as the title has them now (it may
+/// still be writing them).
+fn page_list(request: &Request, offset: usize, len: usize) -> Vec<usize> {
+    (0..(offset + len).div_ceil(PAGE))
+        // SAFETY: the title passes a page number per 64 KiB of destination,
+        // which holds at least `len` bytes from `offset`.
+        .map(|i| unsafe { std::ptr::read_volatile(request.destination.cast::<usize>().add(i)) })
+        .collect()
+}
+
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -783,7 +886,9 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// submits on its own once half of it is enqueued, as the console does
+/// (reads into physical pages wait for the title's Submit, see
+/// [`Lanes::submit_as`]).
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -799,6 +904,22 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        // Full with commands left for a Submit the title cannot make while
+        // it waits here: they go now.
+        if !lane.held.is_empty() || !lane.unsubmitted.is_empty() {
+            let n = FULL_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    n,
+                    capacity = lane.capacity,
+                    held = lane.held.len(),
+                    "dstorage: a full queue sends its reads into physical pages before the title's Submit"
+                );
+            }
+            lanes.submit_as(id, Submit::Full);
+            scheduler.work.notify_all();
+            continue;
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -809,10 +930,13 @@ fn queue(this: QueueRef, command: Command) {
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
+        lanes.submit_as(id, Submit::Half);
         scheduler.work.notify_all();
     }
 }
+
+/// Times a full queue submitted itself (diagnostics).
+static FULL_SUBMITS: AtomicU32 = AtomicU32::new(0);
 
 extern "system" fn submit(this: QueueRef) {
     // SAFETY: as above.
@@ -821,8 +945,12 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
-    tracing::debug!(commands = pending, "dstorage: submit");
+    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
+    tracing::debug!(
+        commands = pending,
+        unresolved = UNRESOLVED.load(Ordering::Relaxed),
+        "dstorage: submit"
+    );
     lanes.submit(id);
     scheduler.work.notify_all();
 }
@@ -835,8 +963,9 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+/// Reads, inflates and/or unpacks, and writes one request; `pages` is a
+/// page destination's pages as resolved at the title's Submit.
+fn execute(request: &Request, pages: Option<PageRuns>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -874,7 +1003,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         // world's first frame). It is read beside and copied in: our copy
         // faults into the guard like the title's own writes.
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
-        return into_destination(request, size, |out| {
+        return into_destination(request, pages, size, |out| {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
@@ -896,7 +1025,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    into_destination(request, pages, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -1046,9 +1175,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// allocation, and otherwise go through a buffer. `resolved` is a page
+/// destination's pages as its list named them at the title's Submit;
+/// without them the list is read now.
 fn into_destination(
     request: &Request,
+    resolved: Option<PageRuns>,
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
@@ -1071,20 +1203,14 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    let count = (offset + len).div_ceil(PAGE);
-    // The page numbers as the title has them now: it may still be writing
-    // them (read each time, not kept).
-    let read_pages = || -> Vec<usize> {
-        (0..count)
-            // SAFETY: the title passes a page number per 64 KiB of
-            // destination, which holds at least `len` bytes from `offset`.
-            .map(|i| unsafe { std::ptr::read_volatile(request.destination.cast::<usize>().add(i)) })
-            .collect()
-    };
-    let mut pages = read_pages();
+    // Pages resolved at the Submit stay as they were; else the page numbers
+    // are read as the title has them now (read each time, not kept).
+    let at_submit = resolved.is_some();
+    let late = |len| super::xmem::resolve_pages(&page_list(request, offset, len), offset, len);
+    let mut runs = resolved.or_else(|| late(len));
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
+    if let Some(mut window) = runs.as_ref().and_then(PageRuns::window) {
         let filled = fill(window.bytes()).map(drop);
         drop(window);
         // The title maps pages where the card reads them and has them
@@ -1092,31 +1218,32 @@ fn into_destination(
         // learn of the bytes only from this (upstream c75fdba, fork PR
         // #571). After a decode that failed part way too: what it wrote
         // is there.
-        super::xmem::pages_written(&pages, offset, len);
+        if let Some(runs) = &runs {
+            runs.written(len);
+        }
         return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    // A page number not known yet: the title may fill the array after it
-    // enqueued the request, and a queue submits on its own once half full,
-    // so a worker can come to it first. (Failed at once, 302 requests of a
-    // burst at the opening's loading went unwritten in one run, 44 and 9 in
-    // others; one was known 17 us later.) The numbers are read again for a
-    // while.
+    // A page number not known yet, on a request sent before the title's
+    // Submit (a full queue) or one whose list named an unknown page then:
+    // the numbers are read again for a while. (Before the reads waited for
+    // the Submit, 302 requests of a burst at the opening's loading went
+    // unwritten in one run, 44 and 9 in others; one was known 17 us later.)
     let waiting = std::time::Instant::now();
     let mut waited = 0u32;
-    while !super::xmem::pages_known(&pages, offset, n) && waiting.elapsed() < std::time::Duration::from_millis(250) {
+    while runs.is_none() && waiting.elapsed() < std::time::Duration::from_millis(250) {
         waited += 1;
         if waited < 16 {
             std::thread::yield_now();
         } else {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        pages = read_pages();
+        runs = late(n);
     }
     if waited > 0 {
         DESTINATION_WAITS.fetch_add(1, Ordering::Relaxed);
-        if super::xmem::pages_known(&pages, offset, n) {
+        if runs.is_some() {
             static SEEN: std::sync::Once = std::sync::Once::new();
             SEEN.call_once(|| {
                 tracing::info!(
@@ -1132,8 +1259,8 @@ fn into_destination(
     // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
     // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
     // reads a launch here, all in one second of the loading; the one build
-    // that tried again (run 165) lost none of 13. The page numbers are read
-    // again before each try.
+    // that tried again (run 165) lost none of 13. Pages not resolved at the
+    // Submit are read again before each try.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
@@ -1141,15 +1268,18 @@ fn into_destination(
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let mut written = super::xmem::write_physical(&pages, offset, &data[..n]);
+    let write = |runs: &Option<PageRuns>| runs.as_ref().is_some_and(|r| r.write(&data[..n]));
+    let mut written = write(&runs);
     let mut tries = 0u32;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
-        pages = read_pages();
-        written = super::xmem::write_physical(&pages, offset, &data[..n]);
+        if !at_submit {
+            runs = late(n);
+        }
+        written = write(&runs);
     }
-    if written {
+    if let (true, Some(runs)) = (written, &runs) {
         if tries > 0 {
             let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
             tracing::info!(
@@ -1162,10 +1292,10 @@ fn into_destination(
             );
         }
         // As above, after the write that succeeded.
-        super::xmem::pages_written(&pages, offset, n);
+        runs.written(n);
         Ok(())
     } else {
-        let known = super::xmem::pages_known(&pages, offset, n);
+        let pages = page_list(request, offset, n);
         let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
@@ -1176,7 +1306,8 @@ fn into_destination(
             len,
             pages = pages.len(),
             first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
-            why = if known { "the host could not map them" } else { "a page number is unknown" },
+            why = if runs.is_some() { "the host could not map them" } else { "a page number is unknown" },
+            at_submit,
             tries,
             given_up,
             on_a_retry = RETRIED[0].load(Ordering::Relaxed),
@@ -1467,6 +1598,104 @@ mod tests {
         enqueue_status(queue, array, 0); // the second of four: no submit needed
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, pattern(64)[8..24]);
+    }
+
+    /// A queue half full sends its plain reads; a read into pages, and the
+    /// status behind it, wait for the title's Submit; a full queue sends
+    /// them too.
+    #[test]
+    fn a_queue_that_submits_itself_holds_reads_into_pages() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        read(&mut l, 0, 0, 16);
+        add_ref_instance(array);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        l.submit_as(0, Submit::Half);
+        let plain = l.start().unwrap();
+        assert_eq!(plain.request.options, 0);
+        assert!(l.start().is_none());
+        l.finish(&plain, Ok(()));
+        assert_eq!(l.lanes[&0].held.len(), 2);
+        assert_eq!(l.lanes[&0].entries(), 2);
+        l.submit_as(0, Submit::Full);
+        let paged = l.start().unwrap();
+        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        assert!(paged.pages.is_none(), "a full queue's lists are read when run");
+        assert!(l.lanes[&0].held.is_empty());
+        assert!(!l.lanes[&0].statuses.is_empty());
+        l.finish(&paged, Ok(()));
+        assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    /// The title's page table names the page's previous owner when the
+    /// request is enqueued, the right page by its Submit, and something
+    /// else again right after: the data lands in the page of the Submit.
+    #[test]
+    fn page_lists_are_read_at_the_titles_submit() {
+        use crate::modules::xmem;
+        let (mut given, mut pages) = (2usize, [0usize; 2]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
+        let mut list = [pages[0]];
+        let plain = pattern(4096);
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 1,
+            capacity: 4,
+            priority: 1,
+            name: c"pages".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(1);
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r);
+        let mut out = [0u8; 16];
+        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
+        // Half of four: the queue submitted itself. Time for a read started
+        // then to land in the old page.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // SAFETY: the list outlives the request.
+        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), pages[1]) };
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        // SAFETY: as above; the title reuses its table after the Submit.
+        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), 0) };
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, plain[..16]);
+        // SAFETY: both pages are mapped read-write.
+        let (first, second) = unsafe {
+            (
+                std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()),
+                std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE), plain.len()),
+            )
+        };
+        assert_eq!(second, plain);
+        assert!(first.iter().all(|&b| b == 0), "the old page was written");
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, std::ptr::null()), mapped);
+        assert_eq!(xmem::XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.

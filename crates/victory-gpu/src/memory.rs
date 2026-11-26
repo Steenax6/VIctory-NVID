@@ -39,10 +39,11 @@
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
 //! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
-//! date and, if it can store, declares all of them written (the bytes are
-//! compared on the CPU afterwards, as for any unordered access view): a
-//! dirty-page mask written by the shader would bound both.
+//! most). Every list with such a shader brings all numbered copies up to
+//! date and, if its shader stores by address, declares all of them written
+//! (the bytes are compared afterwards, as for any unordered access view),
+//! each copy once per list: a dirty-page mask written by the shader would
+//! bound both.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -158,17 +159,33 @@ impl Memory {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
-                // for: a structure is more than 64 KiB.
-                // shortcut: a page of a title buffer inside this one that
-                // has a copy of its own is given this copy too.
+                // for: a structure is more than 64 KiB. Not a page that
+                // lies whole in another title buffer with a copy of its
+                // own (one inside this one, or any inside a window outside
+                // buffers): the programs that bind a view of that buffer
+                // read and write the buffer's copy, so through this one a
+                // stage read stale bytes and its stores never reached them
+                // (alexanderskyequinn/victory-chapter-ii 8e68eb4ac: every
+                // one of 600 logged reload dispatches read its vertices
+                // so). Such a page is left empty: a shader that touches it
+                // notes it, and the next frame gives it the buffer's copy.
+                // shortcut: a page of a buffer whose copy is made later, or
+                // that is registered later, keeps this copy.
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     // SAFETY: inside the directory's mapping.
                     let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+                    let elsewhere = || {
+                        crate::shadow::existing(at, PAGE).is_some_and(|b| {
+                            // SAFETY: a live buffer.
+                            let flags = unsafe { b.buffer.GetDesc() }.Flags;
+                            !Arc::ptr_eq(&b, &shadow) && flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
+                        })
+                    };
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
-                        if other.read() == 0 {
+                        if other.read() == 0 && !elsewhere() {
                             other.add(1).write_volatile((at - first) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
@@ -273,7 +290,6 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     // The copies this dispatch names (`crate::card_fine::named_writes`).
     let mut named: Vec<usize> = Vec::new();
     for &address in addresses {
@@ -312,32 +328,51 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
+    // Each copy once per list, whichever list numbered it: the builder
+    // alone dispatches hundreds of times a frame. The title records its
+    // lists on several threads, so a copy can be numbered by another list
+    // (or by the frame's fault notes) after this list's first dispatch;
+    // this list's shaders reach it through the directory all the same, and
+    // a copy it had not brought up to date or declared written was read as
+    // it stood and its stores never looked for (16 dispatches in the
+    // builder's first 2 s saw such copies, fxceless/victory-fork#370).
+    // Copies are only ever added and a list takes all it has not taken at
+    // each dispatch, so the ones it has not taken yet are the last ones.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
+    const READ_COPY: usize = usize::MAX - 0x1_0000;
+    const WRITE_COPY: usize = usize::MAX - 0x2_0000;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
+    for (n, shadow) in m.copies.iter().enumerate().rev() {
+        if !list.first_use(READ_COPY - n) {
+            break;
+        }
+        let (start, len) = shadow.span();
+        shadow.refresh(list, start, len);
+    }
     // With `VICTORY_NAMED_WRITES=1`, but for every few frames: only the
     // copies a dispatch names are declared written (`card_fine::named_writes`
     // says what that risks).
     let narrow = writes && crate::card_fine::named_writes() && !frame.is_multiple_of(crate::card_fine::named_net());
-    for (n, shadow) in m.copies.iter().enumerate() {
+    let declare = |shadow: &Arc<Shadow>| {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
+        shadow.gpu_writes(list, start, len);
+        list.address_declared(shadow);
+    };
+    if writes {
+        for &n in &named {
+            // Noted for the count of flags in copies no dispatch named.
+            let first = list.address_named(&m.copies[n]);
+            if narrow && first {
+                declare(&m.copies[n]);
+            }
         }
-        if !writes {
-            continue;
-        }
-        // Noted for the count of flags in copies no dispatch named.
-        let fresh = named.contains(&n) && list.address_named(shadow);
-        let declare = if narrow { fresh } else { first_write || n >= numbered };
-        if declare {
-            shadow.gpu_writes(list, start, len);
-            list.address_declared(shadow);
+    }
+    if writes && !narrow {
+        for (n, shadow) in m.copies.iter().enumerate().rev() {
+            if !list.first_use(WRITE_COPY - n) {
+                break;
+            }
+            declare(shadow);
         }
     }
     if first_read {
