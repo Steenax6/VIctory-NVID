@@ -254,5 +254,11 @@ Diagnostics build: `cargo build --profile diag -p victory --features diagnostics
 | `VICTORY_BACK_RUN_GAP=0` | every run of a copy-back is a write of its own; by default runs under 64 bytes apart are one write (upstream pull request #857) |
 | `VICTORY_WAVE_PAIRS=0` | no paired form for 64-lane programs on 32-lane cards (upstream pull request #854) |
 | `VICTORY_MESH_LINK=0` | mesh programs over 32 KiB are not linked with their pixel program (upstream pull request #854) |
+| `VICTORY_CODE_IN_USE=0` | no measure of the shader code the host pipelines hold in the driver (on by default, release builds too, and cheap: one `GetCachedBlob` per pipeline where it is made). The periodic line `shader code of pipelines in use` gives the sum of the cached blobs' sizes of the pipelines bound at least once and not yet released, the most so far, and the sum of those made and never bound; a warning is logged once at 300, 400 and 450 MB. The blob is a proxy for the driver's machine code (it holds other state as well). NVIDIA drivers were measured elsewhere to remove the device at 512 MB of code in use (about 448 MB of blob in 262 pipelines at the point of removal) |
 | `VICTORY_GPU_TIMING=1` + `VICTORY_D3D12_DRED=1` | the card's time per command and per pass of ours (diagnostics build; submissions are waited for, so not for frame rate); `VICTORY_TIMING_LINES=<n>` lists that many commands |
 | `VICTORY_WINDOW_MAX=1920x1080` | largest size of the game window; unset, it is fitted to the screen's work area. The game's render targets keep their size |
+
+Two more lines come with the frame-rate line, without a switch (counters only, nothing waits):
+
+- `pipelines made by the driver: ...` while pipelines were made in the interval: the driver calls (create, library load, library store) of the pipeline workers, their summed time over the wall time (the average number at once) and the most in flight at once. A most near 2 with an average near 2 on many workers says the driver builds about two at a time.
+- `title lists submitted again in a later submission ...`: lists the title submits again without a reset, by the fence of the earlier submission (not reached, no signal behind it yet, reached). The first of the first two is logged once with the frame number.
