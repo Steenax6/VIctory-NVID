@@ -1,5 +1,6 @@
 //! What shaders wrote lands in title memory beside the guards
-//! (`VICTORY_LAND_BESIDE=1`; off by default).
+//! (`VICTORY_LAND_BESIDE`, on; `=0`: the guards are opened, as before;
+//! `=2`: on, and every such write is read back).
 //!
 //! A landing writes the bytes shaders changed into title memory at the
 //! title's own address. Where that is a view of physical pages the blocks
@@ -13,7 +14,7 @@
 //! 8.3 ms of the submitting thread in the guards, 4.6 of it changing
 //! protection.
 //!
-//! With the switch the landing writes through a view of the layer's own of
+//! Now the landing writes through a view of the layer's own of
 //! the same section, which no guard covers: the same physical pages, so the
 //! title's views show the bytes, and they stay read-only. The blocks are
 //! counted written where they are (`crate::watch::written_beside`, as a
@@ -23,10 +24,22 @@
 //! (private memory, which the kernel watches), a range no one view holds,
 //! and a page that is not there go the old way.
 //!
-//! Off by default because a view of ours that showed other pages than the
-//! title's would put the bytes where the title never reads them: `=2`
-//! reads every such write back through the title's address and counts the
-//! ones that are not there (and writes those the old way).
+//! A view of ours that showed other pages than the title's would put the
+//! bytes where the title never reads them: `=2` reads every such write
+//! back through the title's address and counts the ones that are not
+//! there (and writes those the old way). Measured on 2026-11-26 with that
+//! check, the prologue's first room and the open world's bedroom: 2,580
+//! and 3,856 writes a frame, none not there in 187 and 138 frame lines;
+//! the first room 75.5 to 68.7 ms a frame (preparing 55.1 to 42.2, copying
+//! back 36.0 to 29.8), the faces clean. On since then.
+//!
+//! What the check does not see is the other half, the count for the
+//! guards: a block whose bytes landed and that no later check reports
+//! written leaves every other host copy over those pages with the bytes
+//! from before, and reading the title's address back says nothing of it.
+//! That half is the guards' own (`mark_with_views`, in use for writes
+//! through the runtime's view since before this) and has its test in
+//! `crate::watch`.
 //!
 //! The idea is avatarmanz/VIctory-7900XTX's landing beside the guards
 //! (0d5e4c8cb) and Marvisak/VIctory pull request 3069; the code is this
@@ -41,9 +54,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_LAND_BESIDE").as_deref().map(str::trim) {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("2") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
@@ -133,6 +146,53 @@ pub(crate) fn find(at: usize, len: usize) -> Option<Place> {
     }
 }
 
+/// The places of one landed piece's stretches: one for all of them where
+/// one title view holds the piece, else one for each stretch.
+pub(crate) struct Places {
+    whole: Option<Place>,
+    each: Vec<Place>,
+}
+
+impl Places {
+    /// The place of the piece's `k`-th stretch.
+    pub(crate) fn of(&self, k: usize) -> Option<&Place> {
+        self.whole.as_ref().or_else(|| self.each.get(k))
+    }
+}
+
+/// [`find`] for a piece `[at, at + len)` that is written as `stretches`
+/// (address, bytes; inside the piece): if no one title view holds the
+/// piece, each stretch by itself. A piece of a copy is 64 KiB from where
+/// the copy begins, the title maps its physical pages 64 KiB at a time
+/// from where they begin, and so a piece of most copies lies across two
+/// of the title's views: 125 pieces a frame in the first room found no
+/// one place and opened their guards. `None`, counted for the frame line,
+/// if the piece begins outside every view (private memory, which has no
+/// guard to open) or a stretch lies across two views itself.
+pub(crate) fn find_all(at: usize, len: usize, stretches: &[(usize, usize)]) -> Option<Places> {
+    match place(at, len) {
+        Ok((ours, held)) if held >= len => {
+            return Some(Places { whole: Some(Place { title: at, ours, len }), each: Vec::new() });
+        }
+        Ok(_) => {}
+        Err(why) => {
+            STATS[why].fetch_add(1, Relaxed);
+            return None;
+        }
+    }
+    let mut each = Vec::with_capacity(stretches.len());
+    for &(at, len) in stretches {
+        match place(at, len) {
+            Ok((ours, held)) if held >= len => each.push(Place { title: at, ours, len }),
+            _ => {
+                STATS[3].fetch_add(1, Relaxed);
+                return None;
+            }
+        }
+    }
+    Some(Places { whole: None, each })
+}
+
 impl Place {
     /// Writes `bytes` to title memory at `at` through our view: how many
     /// bytes from the first went that way (all of them, unless a page is
@@ -202,8 +262,9 @@ pub(crate) fn line(frames: f64) {
     let [writes, bytes, no_view, none_of_ours, not_there, checked, missed] = [0, 1, 2, 3, 4, 5, 6].map(|i| STATS[i].swap(0, Relaxed));
     tracing::info!(
         "landings beside the guards per frame (VICTORY_LAND_BESIDE={}): {:.0} writes, {:.2} MB, through views of our own; pieces \
-         left to the old way: {:.0} at addresses that are no view of a section (private memory), {:.1} that no one view of ours \
-         holds; {:.1} writes with a page not there; read back since the last line: {checked}, not at the title's address: {missed}",
+         left to the old way: {:.0} at addresses that are no view of a section (private memory: no guard there), {:.1} with a \
+         stretch no one view of ours holds; {:.1} writes with a page not there; read back since the last line: {checked}, not \
+         at the title's address: {missed}",
         mode(),
         writes as f64 / frames,
         bytes as f64 / 1e6 / frames,
@@ -223,6 +284,12 @@ mod tests {
     };
 
     const K64: usize = 64 << 10;
+
+    /// An address in no view of a section.
+    fn private_at() -> usize {
+        static PRIVATE: [u8; 64] = [0; 64];
+        PRIVATE.as_ptr() as usize
+    }
 
     /// A write beside lands in the pages a read-only title view shows, at
     /// the view's offset in its section; past the view, and in memory that
@@ -268,10 +335,32 @@ mod tests {
             let before = title(2 * K64 - 8, 8);
             assert!(find(view + 2 * K64 - 8, 32).is_none());
             assert_eq!(title(2 * K64 - 8, 8), before);
-            // Memory that is no view of a section: nothing.
-            let mut private = vec![0u8; 64];
-            assert_eq!(write(private.as_mut_ptr() as usize, &[1; 64]), 0);
-            assert_eq!(private, [0u8; 64]);
+            // A piece across two title views: each stretch has its place,
+            // unless one lies across the two itself. (Two views side by
+            // side in the table at addresses nothing is mapped at: a title
+            // address is only looked up, the bytes go through our view.
+            // The first shows the section's first 64 KiB, the second its
+            // third, which the real view above shows from 64 KiB on.)
+            const SIDE: usize = 0x7_c000_0000;
+            crate::inplace::title_memory_view(SIDE, K64, handle, 0);
+            crate::inplace::title_memory_view(SIDE + K64, K64, handle, 2 * K64 as u64);
+            let piece = SIDE + K64 - 0x100;
+            assert!(find(piece, 0x200).is_none(), "no one view holds the piece");
+            let stretches = [(piece + 0x10, 0x20), (piece + 0x180, 0x20)];
+            let places = super::find_all(piece, 0x200, &stretches).expect("a place for each stretch");
+            assert_eq!(places.of(0).unwrap().write(stretches[0].0, &[3; 0x20]), 0x20);
+            assert_eq!(places.of(1).unwrap().write(stretches[1].0, &[4; 0x20]), 0x20);
+            // The second stretch is 0x80 into the section's third 64 KiB.
+            assert_eq!(title(K64 + 0x80, 0x20), [4; 0x20]);
+            // The first is 0x110 before the end of its first 64 KiB.
+            let (first, _) = place(SIDE + K64 - 0xf0, 0x20).expect("a place in our view");
+            assert_eq!(std::slice::from_raw_parts(first as *const u8, 0x20), [3; 0x20]);
+            assert!(super::find_all(piece, 0x200, &[(piece + 0xf0, 0x20)]).is_none(), "a stretch across the two");
+            let whole = super::find_all(view + 0x100, 0x100, &[(view + 0x110, 8)]).expect("one place");
+            assert_eq!(whole.of(0).unwrap().write(view + 0x110, &[6; 8]), 8);
+            assert_eq!(title(0x110, 8), [6; 8]);
+            assert!(super::find_all(private_at(), 16, &[]).is_none());
+            crate::inplace::views_gone(SIDE, 2 * K64);
             // The handle given to a section made later: the old view of
             // ours is let go, and the next write maps the new one.
             section_made(handle);

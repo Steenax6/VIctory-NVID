@@ -3534,13 +3534,24 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        if fast_merge() {
-            // The processor's copy, the kernel's for what faults.
-            write_title(start + at, &title[..]);
-        } else {
-            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        // Beside the guards where one view of ours shows the stretch
+        // (`crate::beside`), the blocks counted written once the bytes
+        // are there; else, and for what a missing page left, the guards
+        // are opened first, as ever.
+        let place = if crate::beside::mode() != 0 && fast_merge() { crate::beside::find(start + at, n) } else { None };
+        let done = place.as_ref().map_or(0, |place| place.write(start + at, &title[..]));
+        if done > 0 {
+            crate::watch::written_beside(start + at, done, crate::writes::Cause::Back);
+        }
+        if done < n {
+            crate::watch::writing_as(start + at + done, n - done, crate::writes::Cause::Back);
+            if fast_merge() {
+                // The processor's copy, the kernel's for what faults.
+                write_title(start + at + done, &title[done..]);
+            } else {
+                crate::host::write_mapped((start + at + done) as *mut u8, title[done..].as_ptr(), n - done);
+            }
         }
         n
     }
@@ -4632,18 +4643,25 @@ impl Shadow {
             // the old merge left out its whole run), and so is one the card's
             // bytes did not change in title memory.
             let (hull_lo, hull_hi) = (stretches[0].0, stretches[stretches.len() - 1].1);
-            // Beside the guards (`crate::beside`), where one view of ours
-            // shows all of it: the guards stay as they are, and the blocks
-            // are counted written once the bytes are there. Else the
-            // guards are opened first, as ever.
-            let place =
-                if crate::beside::mode() != 0 { crate::beside::find(start + hull_lo, hull_hi - hull_lo) } else { None };
+            // Beside the guards (`crate::beside`), where views of ours show
+            // every stretch of it: the guards stay as they are, and the
+            // blocks are counted written once the bytes are there. Else
+            // the guards are opened first, as ever.
+            let places = if crate::beside::mode() != 0 {
+                let to_write: Vec<(usize, usize)> =
+                    stretches.iter().zip(write.iter()).filter(|(_, w)| **w).map(|(&(a, b), _)| (start + a, b - a)).collect();
+                crate::beside::find_all(start + hull_lo, hull_hi - hull_lo, &to_write)
+            } else {
+                None
+            };
             let mut went_beside = false;
-            if place.is_none() {
+            if places.is_none() {
                 crate::watch::writing_as(start + hull_lo, hull_hi - hull_lo, crate::writes::Cause::Back);
             }
             let mut written = 0;
             let mut put = 0;
+            // Which of the stretches written this one is.
+            let mut nth = 0;
             let mut race = races.into_iter();
             for (&(a, b), &write) in stretches.iter().zip(write.iter()) {
                 let n = b - a;
@@ -4655,7 +4673,9 @@ impl Shadow {
                 }
                 crate::host::shaders_write(start + a, t);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + a, t, "card relay");
-                match &place {
+                let place = places.as_ref().and_then(|places| places.of(nth));
+                nth += 1;
+                match place {
                     Some(place) => {
                         let done = place.write(start + a, t);
                         went_beside |= done > 0;

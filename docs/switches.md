@@ -80,7 +80,11 @@ of 74-78, the frame line's copies from 17.5 to 26 ms, the picture the same
 frame on an RTX 4070). A line with the frame-rate line says how many copies
 went where, by size.
 
-`VICTORY_LAND_BESIDE=1` (2026-11-26; off, not measured in the game yet):
+`VICTORY_LAND_BESIDE` (2026-11-26; on, `=0`: as before; the first room
+75.5 to 68.7 ms a frame, preparing 55.1 to 42.2 ms, copying back 36.0 to
+29.8 ms, the faces clean, and with `=2` no write of 2,580 a frame there
+and 3,856 a frame in the open world's bedroom that was not at the title's
+address):
 what shaders wrote goes into title memory through a view of the layer's
 own of the same pages, beside the guards, wherever the title's address is
 a view of physical pages; the guarded blocks under it count as written
