@@ -239,4 +239,37 @@ fn copies_back_only_what_bound_views_expose() {
     };
     verify(host, 4);
     verify(host, 1);
+    released_before_landing(host);
+    state_after_the_copy(host);
+}
+
+/// A texture the title releases between the list's close and its run: its
+/// copy does not land (its memory is the title's no more), and nothing
+/// faults.
+fn released_before_landing(host: &crate::host::Host) {
+    let owner = texture(1, 1);
+    let title: This = owner.as_raw().cast();
+    let before = crate::texback::totals();
+    let list = host.new_list().unwrap();
+    readable(&list, ResourceType::Uav, &View::Unordered(title as usize, 0, None));
+    list.close();
+    drop(owner);
+    host.execute(&[&list]);
+    let after = crate::texback::totals();
+    assert_eq!(after[0], before[0], "a copy landed in released memory");
+    assert_eq!(after[1], before[1] + 1, "the copy was not dropped");
+}
+
+/// The copy leaves the texture in the state the list left it in, not in
+/// the copy's (fxceless/victory-fork pull request #1170).
+fn state_after_the_copy(host: &crate::host::Host) {
+    const UNORDERED_ACCESS: u32 = 0x8;
+    let owner = texture(1, 1);
+    let title: This = owner.as_raw().cast();
+    let list = host.new_list().unwrap();
+    readable(&list, ResourceType::Uav, &View::Unordered(title as usize, 0, None));
+    list.close();
+    let copy = crate::resource::host_copy(title).unwrap();
+    assert_eq!(list.end_state(&copy), Some(UNORDERED_ACCESS));
+    host.execute(&[&list]);
 }

@@ -1173,6 +1173,10 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// When the sweep first found its host copy held by nothing (by list
+    /// or slot) since it was last found held (`crate::host::moment`; 0:
+    /// held, or not looked at yet): [`let_go_idle`].
+    unheld: std::sync::atomic::AtomicU64,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -2175,11 +2179,29 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            // A slot that shows a copy holds it without asking for it: the
+            // time since it was asked for can be minutes when the title
+            // moves the texture to another slot, and the copy went at the
+            // next sweep, to be made and uploaded again a frame later with
+            // nothing shown meanwhile (tippythetaidum/VIppy 70bdfa4: 19,054
+            // of 75,053 copies let go in 600 s were made again). So the idle
+            // time also runs from when the copy was first found held by
+            // nothing.
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 let ms = if host.tiled.is_some() { tiled_idle_ms } else { idle_ms };
+                let unheld =
+                    std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1;
+                if !unheld {
+                    r.host.unheld.store(0, Relaxed);
+                    return false;
+                }
+                let since = r.host.unheld.load(Relaxed);
+                if since == 0 {
+                    r.host.unheld.store(crate::host::moment().max(1), Relaxed);
+                    return false;
+                }
                 crate::host::long_ago(r.host.used.load(Relaxed), ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+                    && crate::host::long_ago(since, ms, IDLE_FRAMES)
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -2192,6 +2214,7 @@ pub(crate) fn let_go_idle() {
         };
         if let Some((host, _)) = gone {
             r.host.gone.store(true, Relaxed);
+            r.host.unheld.store(0, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
             went += 1;
@@ -2929,6 +2952,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            unheld: std::sync::atomic::AtomicU64::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
