@@ -3166,7 +3166,7 @@ impl Shadow {
                 };
                 let at = at + first;
                 crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
-                crate::watch::writing(start + at, n);
+                crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays. Runs a few bytes apart go in one write
@@ -3265,7 +3265,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        crate::watch::writing(start + at, n);
+        crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         if fast_merge() {
             // The processor's copy, the kernel's for what faults.
@@ -4097,7 +4097,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::host::shaders_write(start + at, &title[..]);
-                crate::watch::writing(start + at, n);
+                crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
@@ -4187,7 +4187,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        crate::watch::writing(start + at, n);
+        crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
@@ -4287,7 +4287,7 @@ impl Shadow {
             // the old merge left out its whole run), and so is one the card's
             // bytes did not change in title memory.
             let (hull_lo, hull_hi) = (stretches[0].0, stretches[stretches.len() - 1].1);
-            crate::watch::writing(start + hull_lo, hull_hi - hull_lo);
+            crate::watch::writing_as(start + hull_lo, hull_hi - hull_lo, crate::writes::Cause::Back);
             let mut written = 0;
             let mut put = 0;
             let mut race = races.into_iter();

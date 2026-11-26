@@ -1938,10 +1938,52 @@ pub(crate) fn forgot(at: usize, len: usize) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    writing_as(at, len, crate::writes::Cause::Kernel);
+}
+
+/// [`writing`] for the layer's own writes, which say what they are
+/// (`cause`).
+pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
-    crate::descriptor::host::remapped(at, len);
+    crate::descriptor::host::remapped(at, len, cause);
+}
+
+/// What the journal and the guards hold of title memory `[start, end)`
+/// against the asking numbered `asked` (the one a texture's upload read
+/// after, `crate::texture` `Staging::asked`), asked without changing
+/// either (no kernel asking, no block guarded again): whether a page of it
+/// is noted written after that asking; how many of its 64 KiB blocks are
+/// guarded and counted written since they were last taken; and how many
+/// are not guarded at all, so that a store there is seen by nobody. For
+/// the count of what was known of a texture a look found changed
+/// (`crate::census`): two locks, one after the other.
+pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, usize) {
+    if start >= end {
+        return (false, 0, 0);
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let noted = asked != 0 && {
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.written.range(first..last).any(|(_, w)| w.at > asked)
+    };
+    let g = guards();
+    let (mut written, mut open) = (0, 0);
+    for block in first..last {
+        if !g.protected.contains(&block) {
+            open += usize::from(!g.absent.contains(&block));
+        } else if !g.clean.contains(&block) {
+            written += 1;
+        }
+    }
+    (noted, written, open)
+}
+
+/// The number of the journal's last asking: what a read of title memory
+/// that begins now comes after.
+pub(crate) fn asked_now() -> u64 {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked
 }
 
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write into physical
@@ -2022,7 +2064,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         }
     }
     // A placed texture there changed with no descriptor written.
-    crate::descriptor::host::page_written(at, len);
+    crate::descriptor::host::page_written(at, len, pages);
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -2109,7 +2151,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texture::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
-    crate::descriptor::host::remapped(at, len);
+    crate::descriptor::host::remapped(at, len, crate::writes::Cause::Mapped);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
@@ -2636,6 +2678,18 @@ mod copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Memory the guards do not hold is seen by nobody: every block of it
+    /// counts as not guarded, and an empty range has none.
+    #[test]
+    fn memory_no_guard_holds_is_seen_by_nobody() {
+        // An address no test maps and no guard holds.
+        let at = 0x7fe9_0000_0000usize;
+        assert_eq!(seen_since(at, at + 3 * BLOCK, 0), (false, 0, 3));
+        assert_eq!(seen_since(at + 1, at + BLOCK + 1, 5), (false, 0, 2));
+        assert_eq!(seen_since(at, at, 0), (false, 0, 0));
+        assert!(asked_now() <= asked_now());
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };

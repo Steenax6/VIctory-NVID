@@ -3339,6 +3339,57 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
+/// The placed textures by address ([`PLACED_TEXTURES`]), for the count of
+/// `crate::census`: textures in all; addresses with textures of several
+/// descriptions; the most at one address; and such addresses with several
+/// host copies alive now. One walk of the table under its lock (some
+/// 65,000 entries after two minutes: a fraction of a millisecond), asked
+/// once a second; the host copies are asked after it.
+#[cfg(windows)]
+pub(crate) fn placed_descriptions() -> [u64; 4] {
+    let mut several: Vec<Vec<usize>> = Vec::new();
+    let (mut all, mut most) = (0u64, 0u64);
+    {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut run: Vec<usize> = Vec::new();
+        let mut at = u64::MAX;
+        for (&(address, _), &texture) in map.iter() {
+            all += 1;
+            if address != at {
+                if run.len() > 1 {
+                    most = most.max(run.len() as u64);
+                    several.push(std::mem::take(&mut run));
+                }
+                run.clear();
+                at = address;
+            }
+            run.push(texture);
+        }
+        if run.len() > 1 {
+            most = most.max(run.len() as u64);
+            several.push(run);
+        }
+    }
+    let alive = |textures: &Vec<usize>| {
+        textures.iter().filter(|&&t| copy_state(t as This).is_some_and(|state| state.0 == 2)).count() > 1
+    };
+    [all, several.len() as u64, most, several.iter().filter(|t| alive(t)).count() as u64]
+}
+
+/// How many of the textures [`texture_at`] made at `address` (one for each
+/// description viewed there) have a host copy now.
+#[cfg(windows)]
+pub(crate) fn placed_copies(address: u64) -> usize {
+    let textures: Vec<usize> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.range((address, [0; 14])..=(address, [u32::MAX; 14])).map(|(_, &t)| t).collect()
+    };
+    if textures.len() < 2 {
+        return textures.len();
+    }
+    textures.iter().filter(|&&t| copy_state(t as This).is_some_and(|state| state.0 == 2)).count()
+}
+
 /// How many textures [`texture_at`] made for views placed in the title
 /// memory `[address, address + bytes)`, `this` itself left out: each has a
 /// host copy of its own, filled from that memory (for the count of

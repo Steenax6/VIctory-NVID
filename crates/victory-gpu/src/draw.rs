@@ -2045,6 +2045,10 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
+        use crate::census as c;
+        // Where the pass's time goes, by part (`crate::census`).
+        let mut clock = c::Clock::start();
+        c::PASS_COUNTS[c::N_PASSES].fetch_add(1, Ordering::Relaxed);
         let mut room = crate::resource::room();
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
@@ -2088,7 +2092,19 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
+        clock.lap(c::P_TOLD);
         let (due, census) = host.texture_slots_due(frame, 4096);
+        // Once a second: the queue by what its slots wait for, and the
+        // placed textures by address.
+        if c::counting_due() {
+            for (count, now) in c::QUEUE.iter().zip(host.texture_queue_kinds(frame)) {
+                count.store(now, Ordering::Relaxed);
+            }
+            for (count, now) in c::DESCRIPTIONS.iter().zip(crate::resource::placed_descriptions()) {
+                count.store(now, Ordering::Relaxed);
+            }
+        }
+        c::PASS_COUNTS[c::N_DUE].fetch_add(due.len() as u64, Ordering::Relaxed);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -2154,10 +2170,20 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        clock.lap(c::P_ORDER);
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            clock.lap(c::P_REST);
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most {
+                c::PASS_COUNTS[c::N_BYTES].fetch_add(1, Ordering::Relaxed);
                 break;
             }
+            if began.elapsed() > span {
+                c::PASS_COUNTS[c::N_TIME].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            c::PASS_COUNTS[c::N_SEEN].fetch_add(1, Ordering::Relaxed);
+            // A look found it changed: uploaded for that.
+            let mut relook = false;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2178,7 +2204,12 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                c::PASS_COUNTS[c::N_PRINTS].fetch_add(1, Ordering::Relaxed);
+                c::PASS_COUNTS[c::N_PRINT_BYTES].fetch_add(len.min(48 << 10), Ordering::Relaxed);
+                let same = crate::texture::fingerprint(at, len) == print;
+                c::LOOKS[usize::from(looks).min(4)][usize::from(!same)].fetch_add(1, Ordering::Relaxed);
+                clock.lap(c::P_LOOK);
+                if same {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2188,6 +2219,10 @@ impl State {
                     }
                     continue;
                 }
+                // What was known of its memory since the upload read it.
+                relook = true;
+                let known = host.texture_slot_found(index, at, len);
+                c::FOUND[known].fetch_add(1, Ordering::Relaxed);
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
@@ -2197,14 +2232,21 @@ impl State {
                         frames_after_upload = frame.saturating_sub(uploaded),
                         looks,
                         changed = n + 1,
+                        known,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
                 }
+                clock.lap(c::P_LOOK);
             }
             let mut partly = None;
+            // For a placed texture: its memory, the level its view starts
+            // at, and what its title texture has of a host copy (0: never
+            // one, 1: one that was let go, 2: one alive).
+            let mut placed_at = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                c::PASS_COUNTS[c::N_MAPPED].fetch_add(1, Ordering::Relaxed);
                 // A read the title has submitted is still to write some of
                 // it: left for after it (uploaded now, it would go up again
                 // once the read is done). Not before a bake, which reads
@@ -2213,6 +2255,7 @@ impl State {
                     if !bake {
                         crate::descriptor::host::PAGE_WRITES[4].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_after(index, write, frame + 1);
+                        clock.lap(c::P_MAPPED);
                         continue;
                     }
                     if BAKE_WRITES[3].fetch_add(1, Ordering::Relaxed) == 0 {
@@ -2226,6 +2269,7 @@ impl State {
                     }
                 }
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                clock.lap(c::P_MAPPED);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -2244,6 +2288,11 @@ impl State {
                     }
                     partly = Some(mapped);
                 }
+                let copy = crate::resource::placed_known(address, &resource)
+                    .and_then(crate::resource::copy_state)
+                    .map_or(0, |state| state.0);
+                placed_at = Some((address, len, desc[4], copy));
+                clock.lap(c::P_MAPPED);
             }
             // A texture object the host renders to or writes holds the
             // host's own contents: nothing to bring up to date, and this
@@ -2315,9 +2364,11 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            clock.lap(c::P_MAKE);
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
+            clock.lap(c::P_RECORD);
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
@@ -2360,12 +2411,42 @@ impl State {
             } else {
                 None
             };
+            // Why it goes up, for the count its read makes (`crate::census`).
+            let why = match host.texture_slot_why(index) {
+                _ if relook => c::RELOOK,
+                Some((_, true)) if placed_at.is_some() => c::MORE,
+                Some((_, true)) => c::AGAIN,
+                Some((why, false)) => why,
+                None => c::VIEW,
+            };
             // The number its read begins at, filled in at the list's
             // submission: a later write under it makes the slot stale.
-            if let Some(stamp) = crate::texture::read_stamp(resource) {
-                host.texture_slot_stamp(index, stamp);
+            match crate::texture::picked(resource, why, placed_at.map_or(0, |p| p.2)) {
+                Some(picked) => {
+                    let (start, size) = picked.memory;
+                    host.texture_slot_stamp(index, picked.stamp, picked.asked);
+                    // What else the upload is, as recorded.
+                    let flag = |k: usize, n: u64| c::FLAGS[k].fetch_add(n, Ordering::Relaxed);
+                    if let Some((_, _, _, copy)) = placed_at {
+                        flag(if copy == 1 { c::ANEW } else { c::NEVER }, u64::from(copy != 2));
+                        let (inner, held, slots) = host.texture_span_others(start, start.saturating_add(size), picked.own);
+                        if let Some(inner) = inner {
+                            flag(c::INNER, 1);
+                            flag(c::INNER_BYTES, (start + size).saturating_sub(inner));
+                            flag(c::INNER_HELD, u64::from(held));
+                        }
+                        flag(c::SLOTS, u64::from(slots > 1));
+                        flag(c::COPIES, u64::from(crate::resource::placed_copies(start) > 1));
+                    }
+                    flag(c::BAKE, u64::from(bake));
+                }
+                None => {
+                    c::FLAGS[c::NOTHING].fetch_add(1, Ordering::Relaxed);
+                }
             }
+            c::PASS_COUNTS[c::N_UPLOADS].fetch_add(1, Ordering::Relaxed);
             crate::texture::unstage(resource);
+            clock.lap(c::P_STAGED);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
@@ -2377,7 +2458,10 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
+                    c::PASS_COUNTS[c::N_PRINTS].fetch_add(1, Ordering::Relaxed);
+                    c::PASS_COUNTS[c::N_PRINT_BYTES].fetch_add(len.min(48 << 10), Ordering::Relaxed);
                     let print = crate::texture::fingerprint(at, len);
+                    clock.lap(c::P_PRINT);
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),

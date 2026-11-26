@@ -104,6 +104,41 @@ pub(crate) struct Staging {
     /// The first level its views show while its most detailed levels' pages
     /// are not there; 0: all ([`Staging::note_levels_there`]).
     shown_from: std::sync::atomic::AtomicU32,
+    /// The texture's memory by level, as byte ranges in memory order
+    /// ([`memory_parts`]): its digest is taken part by part.
+    parts: Vec<(usize, usize)>,
+    /// For an upload the texture pass recorded from this staging buffer:
+    /// its reason and one (`crate::census`; 0: not the pass's), and
+    /// whether its read has been counted.
+    picked: std::sync::atomic::AtomicU32,
+    counted: std::sync::atomic::AtomicBool,
+    /// The number of the write journal's asking the last read of title
+    /// memory came after (`crate::watch::asked_now`; 0 until a read).
+    asked: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The memory of a texture of `size` bytes by level, as byte ranges in
+/// memory order: `offsets` are where the levels before the shared block of
+/// the smallest ones start (the console's layout puts that block first,
+/// then the levels from the smallest up). One part for a texture of
+/// several slices or of more than `crate::census::PARTS` levels.
+fn memory_parts(size: u64, slices: u32, offsets: &[u64]) -> Vec<(usize, usize)> {
+    let size = size as usize;
+    let mut cuts: Vec<usize> = offsets.iter().map(|&o| o as usize).filter(|&o| o > 0 && o < size).collect();
+    cuts.extend([0, size]);
+    cuts.sort_unstable();
+    cuts.dedup();
+    if slices != 1 || cuts.len() - 1 > crate::census::PARTS {
+        return vec![(0, size)];
+    }
+    cuts.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// Whether `bytes` are all zero, a word at a time.
+fn all_zero(bytes: &[u8]) -> bool {
+    // SAFETY: any bytes are valid words.
+    let (head, words, tail) = unsafe { bytes.align_to::<u64>() };
+    head.iter().all(|&b| b == 0) && words.iter().all(|&w| w == 0) && tail.iter().all(|&b| b == 0)
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -1396,9 +1431,13 @@ impl Staging {
         let stamp = crate::writes::stamp();
         let (start, size) = (self.memory as u64, self.layout.size);
         let under = crate::writes::pending_over(start, start + size);
+        let asked = crate::watch::asked_now();
         let read = self.refresh_now();
         if read > 0 {
             self.stamp.store(stamp, SeqCst);
+            // What the read's own asking was numbered, or the last before.
+            let own = self.last.lock().unwrap_or_else(|e| e.into_inner()).asked;
+            self.asked.store(own.max(asked), SeqCst);
             if under {
                 READ_UNDER_PENDING.fetch_add(1, Relaxed);
             }
@@ -1406,6 +1445,13 @@ impl Staging {
             // Nothing read (the memory could not be had): as if read before
             // any write.
             self.stamp.store(0, SeqCst);
+        }
+        // An upload of the texture pass whose read took no digest: counted
+        // as such (`crate::census`).
+        let why = self.picked.load(Relaxed);
+        if why != 0 && !self.counted.swap(true, Relaxed) {
+            let none: &[crate::census::Part] = &[];
+            crate::census::read((why - 1) as u8, start, size, self.bytes, if read > 0 { None } else { Some(none) });
         }
         // A spare buffer nothing filled whole yet (the memory was all zeros,
         // or could not be read): zeros, as a new buffer holds, before the
@@ -1451,6 +1497,11 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                // (No digest decides here; the texture pass's uploads take
+                // one for their count.)
+                if self.picked.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    self.digest_of(read);
+                }
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -1567,7 +1618,7 @@ impl Staging {
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 PAGES_MISSING[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let hash = digest(read);
+                let hash = self.digest_of(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1588,7 +1639,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = digest(tiled);
+                let hash = self.digest_of(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1604,7 +1655,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = digest(tiled);
+        let hash = self.digest_of(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1629,7 +1680,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = digest(read);
+            let hash = self.digest_of(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1684,6 +1735,10 @@ impl Staging {
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
                 linear.fill(0);
+                if self.picked.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    crate::census::FLAGS[crate::census::NOT_HELD_BYTES]
+                        .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 continue;
             }
             if let Err(e) =
@@ -1697,6 +1752,51 @@ impl Staging {
         // Every staged level written: what a spare buffer held is gone.
         self.stale.store(false, std::sync::atomic::Ordering::Relaxed);
         self.filled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The digest of the texture's memory as read (`tiled`), taken part by
+    /// part ([`memory_parts`]) and folded into one. For an upload of the
+    /// texture pass the parts are counted against the memory's last upload
+    /// (`crate::census::read`), once: which hold other bytes, which the
+    /// same, which nothing.
+    fn digest_of(&self, tiled: &[u8]) -> Digest {
+        use std::sync::atomic::Ordering::Relaxed;
+        let why = self.picked.load(Relaxed);
+        let count = why != 0 && !self.counted.swap(true, Relaxed);
+        if self.parts.len() <= 1 && !count {
+            return digest(tiled);
+        }
+        let mut read = [crate::census::Part { bytes: 0, digest: 0, zero: false }; crate::census::PARTS];
+        let mut folded = [0u8; 16 * crate::census::PARTS];
+        let n = self.parts.len().min(crate::census::PARTS);
+        for (k, &(from, to)) in self.parts.iter().take(n).enumerate() {
+            let bytes = tiled.get(from..to.min(tiled.len())).unwrap_or(&[]);
+            let d = digest(bytes).0;
+            folded[16 * k..16 * k + 16].copy_from_slice(&d.to_le_bytes());
+            read[k] = crate::census::Part {
+                bytes: bytes.len() as u64,
+                digest: (d as u64 ^ (d >> 64) as u64).max(1),
+                zero: count && all_zero(bytes),
+            };
+        }
+        if count {
+            crate::census::read((why - 1) as u8, self.memory as u64, self.layout.size, self.bytes, Some(&read[..n]));
+        }
+        if n == 1 { digest(tiled) } else { digest(&folded[..16 * n]) }
+    }
+
+    /// The bytes from the start of the texture's memory that the levels
+    /// from `first` on take: what a view that starts at that level says
+    /// the title holds (all of it for level 0, and for a texture of
+    /// several slices).
+    fn own_bytes(&self, first: u32) -> u64 {
+        let (layout, mips) = (&self.layout, &self.layout.mips);
+        if layout.slices != 1 || first == 0 || mips.is_empty() {
+            return layout.size;
+        }
+        let tail = (layout.first_tail_mip as usize).min(mips.len());
+        let above = (first as usize - 1).min(mips.len() - 1);
+        if above < tail { mips[above].offset.min(layout.size) } else { layout.alignment.min(layout.slice_size) }
     }
 
     /// A texture uploaded whole while it streams in has its small levels
@@ -1828,12 +1928,33 @@ pub(crate) fn unstage_later(resource: This) {
     }
 }
 
-/// The read stamp of title texture `resource`'s staging buffer
-/// ([`Staging::stamp`]), shared: the texture pass keeps it for the slot it
-/// uploaded, and the refresh at the list's submission fills it in.
-pub(crate) fn read_stamp(resource: This) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+/// What the texture pass keeps of an upload it recorded
+/// ([`picked`]): the read stamp ([`Staging::stamp`]) and the journal's
+/// asking the read comes after ([`Staging::asked`]), both shared and
+/// filled in by the refresh at the list's submission; where the texture's
+/// memory is and its bytes; and the bytes of it a view from the level
+/// asked about holds.
+pub(crate) struct Picked {
+    pub(crate) stamp: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) asked: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) memory: (u64, u64),
+    pub(crate) own: u64,
+}
+
+/// The texture pass recorded an upload from title texture `resource`'s
+/// staging buffer for the reason `why` (`crate::census`), for a view that
+/// starts at level `first`: the upload's read counts itself under that
+/// reason. `None`: the texture has no staging buffer.
+pub(crate) fn picked(resource: This, why: u8, first: u32) -> Option<Picked> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()?.get(&(resource as usize)).map(|s| s.stamp.clone())
+    let s = map.as_ref()?.get(&(resource as usize))?;
+    s.picked.store(u32::from(why) + 1, std::sync::atomic::Ordering::Relaxed);
+    Some(Picked {
+        stamp: s.stamp.clone(),
+        asked: s.asked.clone(),
+        memory: (s.memory as u64, s.layout.size),
+        own: s.own_bytes(first),
+    })
 }
 
 /// Since the start: reads of texture memory into a staging buffer that a
@@ -2250,7 +2371,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let remapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     index_staged(memory as usize, layout.size as usize, &remapped);
+    let tail = (layout.first_tail_mip as usize).min(layout.mips.len());
+    let offsets: Vec<u64> = layout.mips[..tail].iter().map(|m| m.offset).collect();
     let s = Arc::new(Staging {
+        parts: memory_parts(layout.size, layout.slices, &offsets),
+        picked: std::sync::atomic::AtomicU32::new(0),
+        counted: std::sync::atomic::AtomicBool::new(false),
+        asked: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         remapped,
         filled: std::sync::atomic::AtomicBool::new(false),
         stamp: Arc::new(std::sync::atomic::AtomicU64::new(crate::writes::NOT_READ)),
@@ -2445,6 +2572,23 @@ mod digest_tests {
 
     /// The digest tells every length and every changed byte apart, zeros
     /// among them (avatarmanz/VIctory-7900XTX 2dfba4dbd).
+    /// A texture's memory is told apart at the starts of its levels, in
+    /// memory order, the block of the smallest ones first; one of several
+    /// slices, or of more levels than are told apart, is one part.
+    #[test]
+    fn memory_parts_follow_the_levels() {
+        // 0x1000 of small levels, then levels of 0x1000, 0x4000, 0x10000.
+        let offsets = [0x6000, 0x2000, 0x1000];
+        assert_eq!(super::memory_parts(0x16000, 1, &offsets), [(0, 0x1000), (0x1000, 0x2000), (0x2000, 0x6000), (0x6000, 0x16000)]);
+        assert_eq!(super::memory_parts(0x16000, 6, &offsets), [(0, 0x16000)]);
+        assert_eq!(super::memory_parts(0x1000, 1, &[]), [(0, 0x1000)]);
+        // An offset of 0 or past the end cuts nothing.
+        assert_eq!(super::memory_parts(0x3000, 1, &[0, 0x2000, 0x9000]), [(0, 0x2000), (0x2000, 0x3000)]);
+        let many: Vec<u64> = (1..=20).map(|k| k * 0x1000).collect();
+        assert_eq!(super::memory_parts(0x20_0000, 1, &many), [(0, 0x20_0000)]);
+        assert!(super::all_zero(&[0u8; 37]) && !super::all_zero(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]));
+    }
+
     #[test]
     fn a_digest_tells_bytes_apart() {
         let zeros = [0u8; 400];

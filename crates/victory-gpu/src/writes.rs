@@ -29,6 +29,60 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 
+/// Who tells the texture pass that title memory changes or changed
+/// (`crate::descriptor::host` `written`, `remapped`). The first three are
+/// told when the bytes are there and numbered ([`next`]); a copy of the
+/// title's is also told before it is done, as the others are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Cause {
+    /// DirectStorage wrote physical pages through a view of the runtime's
+    /// own: told at every title address that shows them.
+    Pages = 0,
+    /// A DirectStorage read to a plain address finished.
+    Plain,
+    /// A copy of the title's that the layer does in title memory (a buffer
+    /// copy at its submission or when its submission lands,
+    /// `CopyMemoryToMemoryX`).
+    Copy,
+    /// What shaders wrote to a buffer, copied back into title memory.
+    Back,
+    /// The texels of a texture shaders wrote, or of one the title reads
+    /// back into a buffer, copied into title memory.
+    Texels,
+    /// The runtime is about to write through the kernel (a file read, a
+    /// DirectStorage read to a plain address before it begins).
+    Kernel,
+    /// The runtime mapped or unmapped the memory.
+    Mapped,
+}
+
+/// The causes there are.
+pub(crate) const CAUSES: usize = 7;
+
+impl Cause {
+    pub(crate) const ALL: [Cause; CAUSES] =
+        [Cause::Pages, Cause::Plain, Cause::Copy, Cause::Back, Cause::Texels, Cause::Kernel, Cause::Mapped];
+
+    /// The cause a `u8` stands for (one past the last: the last).
+    pub(crate) fn of(code: u8) -> Cause {
+        Cause::ALL[usize::from(code).min(CAUSES - 1)]
+    }
+
+    /// For the lines.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Cause::Pages => "DirectStorage into pages",
+            Cause::Plain => "DirectStorage to plain addresses",
+            Cause::Copy => "copies of the title's done by the layer",
+            Cause::Back => "shader writes to buffers copied back",
+            Cause::Texels => "texels copied back",
+            Cause::Kernel => "reads through the kernel",
+            Cause::Mapped => "mapped or unmapped",
+        }
+    }
+}
+
 /// The stamp of an upload whose read has not begun: it reads when its
 /// list is submitted, and takes every write numbered by then.
 pub(crate) const NOT_READ: u64 = u64::MAX;
@@ -175,6 +229,18 @@ mod tests {
         assert!(n > before);
         assert!(!holds(before, n));
         assert!(holds(stamp(), n));
+    }
+
+    /// Every cause has a code of its own and a name for the lines.
+    #[test]
+    fn causes_are_told_apart() {
+        for (code, cause) in Cause::ALL.into_iter().enumerate() {
+            assert_eq!(cause as usize, code);
+            assert_eq!(Cause::of(code as u8), cause);
+        }
+        assert_eq!(Cause::of(200), Cause::Mapped);
+        let names: std::collections::BTreeSet<&str> = Cause::ALL.iter().map(|c| c.name()).collect();
+        assert_eq!(names.len(), CAUSES);
     }
 
     /// Pending ranges are found by any range that overlaps them, however

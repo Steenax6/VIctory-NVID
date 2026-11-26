@@ -194,6 +194,29 @@ opening cutscene). The line "writes behind
 the guards" counts the writes, the slots under them, the stale ones and
 the stale ones now.
 
+What the texture pass does is counted (no switch; lines every five
+seconds). "texture uploads by reason" says for every upload what made its
+slot due (the first upload of the memory, the slot's view written again,
+more of the memory mapped, a look that found it changed, and one row for
+each who told of the memory: DirectStorage into pages or to plain addresses,
+the layer's copies, texels and shader writes copied back, reads through the
+kernel, mappings) and what its read found against the memory's last upload,
+level by level: megabytes of levels that changed, that were the same and
+that were all zero, and the uploads none of whose levels had changed.
+"texture uploads as recorded" has the host copies made anew, the uploads of
+textures another texture's view starts inside of, the memories by how many
+times they went up and the addresses with several descriptions. "textures
+found changed by a look" splits those by what was known of their memory
+since the upload's read (a numbered write that made the slot stale, a tell
+that lay in the texture's span and was taken for another texture's, a store
+the guards saw, blocks nothing guards, nothing). "told to the texture pass"
+counts the tells by who told, "the texture pass per frame" is the pass's
+time by part, "the texture queue by what its slots wait for" the queue. And
+"textures the title fills that the card copied into" counts the uploads
+from the game's memory that were submitted after a copy on the card into the
+same texture (they overwrite what the card wrote: the suspect for the noise
+baked onto a head).
+
 At the game's Submit the addresses a read into physical pages will write
 are known; until the read is done the texture pass leaves a texture there
 for the next frame instead of uploading the bytes from before and again

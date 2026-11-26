@@ -3466,7 +3466,7 @@ fn late_copy(dst: usize, src: usize, len: usize) {
     // As a shader's write that lands: reads of the destination ahead of it
     // are checked against it, and its guards are opened.
     shaders_write(dst, &new);
-    crate::watch::writing(dst, len);
+    crate::watch::writing_as(dst, len, crate::writes::Cause::Copy);
     write_mapped(dst as *mut u8, new.as_ptr(), len);
     // Numbered for the texture pass once the bytes are there.
     crate::descriptor::host::title_copied(dst, len);
@@ -4411,7 +4411,12 @@ fn read_backs(list: &HostList) {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
-                    copy_mapped((*at as *mut u8).wrapping_add(line * pitch), from.add(line * row.next_multiple_of(256)), *row, true);
+                    copy_into_title(
+                        (*at as *mut u8).wrapping_add(line * pitch),
+                        from.add(line * row.next_multiple_of(256)),
+                        *row,
+                        crate::writes::Cause::Texels,
+                    );
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
@@ -8472,6 +8477,20 @@ fn fast_reads() -> bool {
 }
 
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_as(dst, src, len, title_dst.then_some(crate::writes::Cause::Copy));
+}
+
+/// [`copy_mapped`] into title memory, for a write that is not a copy of
+/// the title's: `cause` says what it is to those told of it
+/// (`crate::watch::writing_as`).
+pub(crate) fn copy_into_title(dst: *mut u8, src: *const u8, len: usize, cause: crate::writes::Cause) {
+    copy_mapped_as(dst, src, len, Some(cause));
+}
+
+/// [`copy_mapped`]; `title`: the destination is title memory, written for
+/// that cause.
+fn copy_mapped_as(dst: *mut u8, src: *const u8, len: usize, title: Option<crate::writes::Cause>) {
+    let title_dst = title.is_some();
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -8508,9 +8527,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
-    if title_dst {
+    if let Some(cause) = title {
         // The kernel writes the destination: it must not be guarded.
-        crate::watch::writing(dst as usize, len);
+        crate::watch::writing_as(dst as usize, len, cause);
     }
     // `VICTORY_USER_COPY` (on by default): the processor copies, and what
     // faults is left to the kernel's copy below, from where it faulted on.
@@ -9147,6 +9166,7 @@ impl Meter {
                 );
                 crate::draw::bake_writes_line(0);
                 crate::texture::card_written_line();
+                crate::census::lines(logged_frames);
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(
