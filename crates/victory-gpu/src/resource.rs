@@ -2839,6 +2839,13 @@ fn host_texture_as(
     texture.map(|t| (t, false))
 }
 
+/// Whether title texture `this` is one of a view the title placed in
+/// memory ([`texture_at`]), not a texture object of the title's.
+#[cfg(windows)]
+pub(crate) fn is_placed(this: This) -> bool {
+    !this.is_null() && resource(this).host.placed.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The host copy of title texture `this` if it is made and was made
 /// without memory of its own (`crate::tiles`); it is not made here.
 #[cfg(windows)]

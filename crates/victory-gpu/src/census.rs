@@ -67,7 +67,7 @@ fn row_name(row: usize) -> &'static str {
 
 /// What an upload's row counts: uploads; the bytes of their textures in
 /// title memory; the bytes staged (the host's layout, without the levels a
-/// texture leaves out); of the title bytes, those of levels whose bytes
+/// texture leaves out); of the title bytes read, those of levels whose bytes
 /// were other than at the memory's last upload (or uploaded for the first
 /// time), the same as then, and all zero (pages not there, or nothing
 /// written yet); uploads none of whose levels had changed, and their title
@@ -118,6 +118,10 @@ fn compare(memo: Option<&mut Memo>, parts: &[Part]) -> Found {
     let mut none = [0u64; PARTS];
     let last = memo.map_or(&mut none, |m| &mut m.parts);
     for (part, last) in parts.iter().zip(last.iter_mut()) {
+        // (A part that was not read keeps what is noted of it.)
+        if part.bytes == 0 {
+            continue;
+        }
         let digest = if part.zero { 0 } else { part.digest.max(1) };
         if part.zero {
             found.zero += part.bytes;
@@ -131,11 +135,11 @@ fn compare(memo: Option<&mut Memo>, parts: &[Part]) -> Found {
     found
 }
 
-/// An upload of the pass read the texture memory `[start, start + size)`
-/// for the reason `why`: `staged` bytes of staging buffer, and its parts
-/// as read (`None`: read without a digest; empty: nothing read). Counted
-/// in its row.
-pub(crate) fn read(why: u8, start: u64, size: u64, staged: u64, parts: Option<&[Part]>) {
+/// An upload of the pass read `bytes` bytes of the texture memory
+/// `[start, start + size)` for the reason `why`: `staged` bytes of staging
+/// buffer, and its parts as read (`None`: read without a digest; empty:
+/// nothing read; a part of no bytes was not read). Counted in its row.
+pub(crate) fn read(why: u8, start: u64, size: u64, bytes: u64, staged: u64, parts: Option<&[Part]>) {
     /// Memory noted at most; past it the entries of uploads longest ago go.
     const MOST: usize = 1 << 17;
     let frame = crate::frame::current();
@@ -161,7 +165,7 @@ pub(crate) fn read(why: u8, start: u64, size: u64, staged: u64, parts: Option<&[
             Found { before: before.is_some(), ..Found::default() }
         }
     };
-    drop_row(why, size, staged, parts, found);
+    drop_row(why, bytes, staged, parts, found);
 }
 
 /// [`read`]'s counting, after the memo.
@@ -205,28 +209,33 @@ pub(crate) const COPIES: usize = 5;
 pub(crate) const SLOTS: usize = 6;
 pub(crate) const BAKE: usize = 7;
 pub(crate) const NOTHING: usize = 8;
-/// Bytes of staging buffers filled with zeros for levels that are not the
-/// title's (`crate::texture` `Staging::detile`), of the pass's uploads.
-pub(crate) const NOT_HELD_BYTES: usize = 9;
 /// Uploads whose texture's span was none (no bytes, or an end below its
 /// start): asked about all the same, and nothing was inside.
-pub(crate) const NO_SPAN: usize = 10;
+pub(crate) const NO_SPAN: usize = 9;
 /// Since the start, of the uploads the pass recorded.
-pub(crate) static FLAGS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+pub(crate) static FLAGS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// What the uploads did level by level ([`BY_LEVEL`]'s places), every
 /// upload's, the pass's and those of textures read through tables: bytes
 /// of staging buffer detiled; bytes of levels not detiled because the host
 /// copy held them as their memory is; bytes copied to the card; uploads
 /// decided at a submission that copied something, and that copied nothing
-/// (`crate::texture::decide_uploads`).
+/// (`crate::texture::decide_uploads`); bytes of title memory read; bytes
+/// of it not read because they are not the title's (levels more detailed
+/// than any view shows, where another texture starts), and because their
+/// pages are not there; bytes of staging buffer zeroed for levels the
+/// title views whose pages are not there.
 pub(crate) const L_DETILED: usize = 0;
 pub(crate) const L_WITH_COPY: usize = 1;
 pub(crate) const L_COPIED: usize = 2;
 pub(crate) const L_SOME: usize = 3;
 pub(crate) const L_NONE: usize = 4;
+pub(crate) const L_READ: usize = 5;
+pub(crate) const L_LEFT: usize = 6;
+pub(crate) const L_AWAY: usize = 7;
+pub(crate) const L_ZEROED: usize = 8;
 /// Since the start.
-pub(crate) static BY_LEVEL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+pub(crate) static BY_LEVEL: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// The parts of the pass ([`PASS_US`]): taking what was told since the
 /// last pass; the queue's order; looks at uploaded textures (their
@@ -420,8 +429,8 @@ pub(crate) fn lines(frames: f64) {
         use std::fmt::Write;
         let _ = write!(
             rows,
-            "; {}: {} ({} MB of title memory, {} MB staged; levels changed {} MB, the same {} MB, zero {} MB; {} with no \
-             level changed {} MB; {} read without a digest, {} read nothing)",
+            "; {}: {} ({} MB of title memory read, {} MB their staging buffers; levels changed {} MB, the same {} MB, zero \
+             {} MB; {} with no level changed {} MB; {} read without a digest, {} read nothing)",
             row_name(row),
             c[0],
             mb(c[1]),
@@ -439,8 +448,9 @@ pub(crate) fn lines(frames: f64) {
         return;
     }
     tracing::info!(
-        "texture uploads by reason, since the start (counted when the upload reads): {} in all ({} MB of title memory, \
-         {} MB staged; levels changed {} MB, the same {} MB, zero {} MB; {} with no level changed {} MB){rows}",
+        "texture uploads by reason, since the start (counted when the upload reads): {} in all ({} MB of title memory \
+         read, {} MB their staging buffers; levels changed {} MB, the same {} MB, zero {} MB; {} with no level changed {} \
+         MB){rows}",
         all[0],
         mb(all[1]),
         mb(all[2]),
@@ -450,15 +460,15 @@ pub(crate) fn lines(frames: f64) {
         all[6],
         mb(all[7])
     );
-    let f: [u64; 11] = std::array::from_fn(|k| FLAGS[k].load(Relaxed));
+    let f: [u64; 10] = std::array::from_fn(|k| FLAGS[k].load(Relaxed));
     let t = times();
     let d: [u64; 4] = std::array::from_fn(|k| DESCRIPTIONS[k].load(Relaxed));
     tracing::info!(
         "texture uploads as recorded, since the start: {} with a host copy made anew after it was let go, {} with a first \
          host copy; {} of textures with another texture's view starting inside their span ({} MB of them from there on), \
          {} with one inside the part their own view holds; {} of memory with host copies of several descriptions, {} of \
-         spans several slots show; {} for bake draws; {} that staged nothing; {} of spans that were none; {} MB of \
-         staging filled with zeros for levels not the title's. Memories by times uploaded (textures/uploads): once {}/{}, twice {}/{}, to 4 {}/{}, to 8 \
+         spans several slots show; {} for bake draws; {} that staged nothing; {} of spans that were none. Memories by \
+         times uploaded (textures/uploads): once {}/{}, twice {}/{}, to 4 {}/{}, to 8 \
          {}/{}, to 16 {}/{}, to 32 {}/{}, more {}/{}. Placed textures: {} in all, {} addresses with several \
          descriptions (at most {} at one), {} of them with several host copies alive",
         f[ANEW],
@@ -471,7 +481,6 @@ pub(crate) fn lines(frames: f64) {
         f[BAKE],
         f[NOTHING],
         f[NO_SPAN],
-        mb(f[NOT_HELD_BYTES]),
         t[0].0,
         t[0].1,
         t[1].0,
@@ -491,11 +500,17 @@ pub(crate) fn lines(frames: f64) {
         d[2],
         d[3]
     );
-    let l: [u64; 5] = std::array::from_fn(|k| BY_LEVEL[k].load(Relaxed));
+    let l: [u64; 9] = std::array::from_fn(|k| BY_LEVEL[k].load(Relaxed));
     tracing::info!(
-        "texture uploads level by level, since the start (the pass's and those of textures read through tables): {} \
-         decided with levels to copy, {} with none (the host copy held every level as its memory is); {} MB detiled into \
-         staging, {} MB of levels not detiled because the host copy held them, {} MB copied to the card",
+        "texture uploads level by level, since the start (the pass's and those of textures read through tables): {} MB \
+         of title memory read, {} MB not read because it is not the title's (levels above the first one viewed, where \
+         another texture starts), {} MB not read because its pages are not there ({} MB of staging zeroed for those); {} \
+         uploads decided with levels to copy, {} with none (the host copy held every level as its memory is); {} MB \
+         detiled into staging, {} MB of levels not detiled because the host copy held them, {} MB copied to the card",
+        mb(l[L_READ]),
+        mb(l[L_LEFT]),
+        mb(l[L_AWAY]),
+        mb(l[L_ZEROED]),
         l[L_SOME],
         l[L_NONE],
         mb(l[L_DETILED]),
@@ -608,6 +623,11 @@ mod tests {
         // upload between held nothing there).
         assert_eq!(compare(Some(&mut memo), &[part(100, 5), zero]), Found { before: true, changed: 0, same: 100, zero: 400 });
         assert_eq!(compare(Some(&mut memo), &next), Found { before: true, changed: 400, same: 100, zero: 0 });
+        // A part that was not read (it is not the title's now) counts for
+        // nothing and keeps what was noted of it: read again with the same
+        // bytes, it is the same.
+        assert_eq!(compare(Some(&mut memo), &[part(100, 5), part(0, 0)]), Found { before: true, changed: 0, same: 100, zero: 0 });
+        assert_eq!(compare(Some(&mut memo), &next), Found { before: true, changed: 0, same: 500, zero: 0 });
     }
 
     /// Counting takes any code: one past the causes, the places or what
@@ -620,9 +640,9 @@ mod tests {
         tell(0, 99, 1);
         found(usize::MAX);
         let many = [part(1, 1); PARTS + 9];
-        read(255, u64::MAX, u64::MAX, u64::MAX, Some(&many));
-        read(RELOOK, u64::MAX, 0, 0, Some(&[]));
-        read(VIEW, 0, 0, 0, None);
+        read(255, u64::MAX, u64::MAX, u64::MAX, u64::MAX, Some(&many));
+        read(RELOOK, u64::MAX, 0, 0, 0, Some(&[]));
+        read(VIEW, 0, 0, u64::MAX, 0, None);
         assert!(FOUND[FOUND.len() - 1].load(Relaxed) >= 1);
         assert!(TELLS[CAUSES - 1][T_RANGES].load(Relaxed) >= 1);
     }

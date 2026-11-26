@@ -2421,9 +2421,11 @@ impl State {
             };
             // The number its read begins at, filled in at the list's
             // submission: a later write under it makes the slot stale.
+            let mut own = None;
             match crate::texture::picked(resource, why, placed_at.map_or(0, |p| p.2)) {
                 Some(picked) => {
                     let (start, size) = picked.memory;
+                    own = Some(picked.own);
                     host.texture_slot_stamp(index, picked.stamp, picked.asked);
                     // What else the upload is, as recorded.
                     let flag = |k: usize, n: u64| c::FLAGS[k].fetch_add(n, Ordering::Relaxed);
@@ -2447,6 +2449,14 @@ impl State {
             c::PASS_COUNTS[c::N_UPLOADS].fetch_add(1, Ordering::Relaxed);
             crate::texture::unstage(resource);
             clock.lap(c::P_STAGED);
+            // What the title holds of the texture, from the first level of
+            // the slot's view: the bytes the upload reads at most (counted
+            // against the frame's), and the bytes the looks go over. (Both
+            // took its full size: the looks then read other textures'
+            // memory past the levels the title holds, and found this one
+            // changed when those were.)
+            let bytes = own.map_or(bytes, |own| own.min(bytes));
+            let memory = memory.map(|(at, len)| (at, own.map_or(len, |own| own.min(len))));
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
