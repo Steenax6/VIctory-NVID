@@ -272,7 +272,8 @@ these are an NVIDIA card's.
 | `VICTORY_KBM=30:W*2,31:MouseX=400*0.5,33:MouseLeft` | play keys, mouse motion (counts over the hold) and wheel steps into the keyboard and mouse pad (diagnostics build) |
 | `VICTORY_LOG=victory_hle::modules::gameinput=debug` | log each pad state the game reads |
 | `VICTORY_TITLE_ASSERTS=<n>` | continue past up to `n` `int3` asserts in the game's code, where the first one ends the process; the check counts as passed, so what follows is undefined and the run is not one to trust |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight (diagnostics build; about 28 ms a frame here) |
+| `VICTORY_D3D12_DRED=light` / `=faults` | cheaper forms for long runs (diagnostics build; their cost is not measured yet): `light` keeps the breadcrumbs (which list stopped at which command, the pipelines it binds) without a marker text per command; `faults` keeps only the faulting address and the allocations named there. The report says the removal reason and whether the runtime gave a fault address and breadcrumbs |
 | `VICTORY_TITLE_DEBUGINFO=<seconds>` | the title writes the debug info block its crash handler attaches (frame, streaming requests, tile heap, entity pools, camera, mission) every that many seconds into the log, as `title debug info:` lines; its builder is known for the 1.0.2.1 executable, `VICTORY_TITLE_DEBUGINFO_RVA=<hex>` names it for another (diagnostics build; fxceless/victory-fork pull request #643) |
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built (objects can go missing meanwhile) |
 | `VICTORY_TABLED_SKIP_FRAMES=off` | upstream's 240-frame window for table-read descriptor slots; steenax uses 2 frames, since the window crashed at world entry (upstream pull request #827) |

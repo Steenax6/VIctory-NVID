@@ -438,15 +438,171 @@ pub(crate) fn removal_context() -> String {
     text
 }
 
+/// The card's memory at every look since [`video_memory_line`] last took
+/// them: the most of the card's own in use, the least its budget was, the
+/// most of the PC's shared memory in use, and the looks. A look is every
+/// asking of [`Host::video_memory`] (the texture queue's, the card copies')
+/// and one of our own at most every tenth of a second
+/// ([`Host::video_memory_look`]). The memory line is one look in five
+/// seconds: what the card held between two of them was not known.
+static VIDEO_PEAK: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// [`memory_counts`] as they were when [`video_memory_line`] was last said,
+/// and when that was ([`now_ms`]).
+static MEMORY_MARK: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Running totals for [`video_memory_line`] and [`removal_memory`]: the
+/// bytes of upload, shared and card buffers made since the start
+/// ([`MADE`]), the bytes of host textures alive, the bytes of host copies
+/// of textures let go since the start, and host copies of textures made
+/// since the start.
+fn memory_counts() -> [u64; 6] {
+    [
+        MADE[1].load(Ordering::Relaxed),
+        MADE[3].load(Ordering::Relaxed),
+        MADE[5].load(Ordering::Relaxed),
+        crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed),
+        crate::resource::KINDS[3].load(Ordering::Relaxed),
+        crate::resource::KINDS[6].load(Ordering::Relaxed),
+    ]
+}
+
+/// With the frame-rate line, about once a second: what the looks at the
+/// card's memory saw since the last such line ([`VIDEO_PEAK`], taken), and
+/// what was made in that time ([`memory_counts`], noted for the next line
+/// and for a removal).
+fn video_memory_line() {
+    let most = VIDEO_PEAK[0].swap(0, Ordering::Relaxed);
+    let least = VIDEO_PEAK[1].swap(u64::MAX, Ordering::Relaxed);
+    let shared = VIDEO_PEAK[2].swap(0, Ordering::Relaxed);
+    let looks = VIDEO_PEAK[3].swap(0, Ordering::Relaxed);
+    let now = memory_counts();
+    let then = [0, 1, 2, 3, 4, 5].map(|i| MEMORY_MARK[i].swap(now[i], Ordering::Relaxed));
+    let at = now_ms();
+    let before = MEMORY_MARK[6].swap(at, Ordering::Relaxed);
+    if looks == 0 {
+        return;
+    }
+    tracing::info!(
+        "video memory in the {} ms since the last such line, at {looks} looks: the card's own in use at most {} MB, its budget at least {} MB, \
+         the PC's shared in use at most {} MB; made in that time: upload buffers {} MB, shared buffers {} MB, card buffers {} MB, \
+         {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go",
+        at.saturating_sub(before),
+        most >> 20,
+        least >> 20,
+        shared >> 20,
+        now[0].saturating_sub(then[0]) >> 20,
+        now[1].saturating_sub(then[1]) >> 20,
+        now[2].saturating_sub(then[2]) >> 20,
+        now[5].saturating_sub(then[5]),
+        now[3] >> 20,
+        then[3] >> 20,
+        now[4].saturating_sub(then[4]) >> 20,
+    );
+}
+
+/// The memory side of a removal, for [`log_removal_context`]: the process's
+/// and the PC's memory at this moment, what the looks at the card's memory
+/// saw since the last [`video_memory_line`] ([`VIDEO_PEAK`], not taken),
+/// and what was made since that line. Atomics and two plain questions to
+/// the system: no lock of ours.
+fn removal_memory() -> String {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain data the call fills in.
+    let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    c.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    // SAFETY: plain data the call fills in.
+    let mut p: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+    p.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+    // SAFETY: a sized structure.
+    unsafe { K32GetPerformanceInfo(&mut p, p.cb) };
+    // The system counts in pages.
+    let pages = |n: usize| (n as u64 * p.PageSize as u64) >> 20;
+    let peak = [0, 1, 2, 3].map(|i| VIDEO_PEAK[i].load(Ordering::Relaxed));
+    let then = [0, 1, 2, 3, 4, 5, 6].map(|i| MEMORY_MARK[i].load(Ordering::Relaxed));
+    let now = memory_counts();
+    format!(
+        "the process: {} MB private (at most {} MB), {} MB of it in memory (at most {} MB); the PC: {} MB free of {} MB, {} MB committed of a limit of {} MB \
+         (at most {} MB), the kernel's own {} MB paged and {} MB not paged, {} handles; the card's memory at the {} looks since the last line of it: \
+         in use at most {} MB, the budget at least {} MB, the PC's shared in use at most {} MB; made in the {} ms since that line: upload buffers {} MB, \
+         shared buffers {} MB, card buffers {} MB, {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go",
+        c.PagefileUsage as u64 >> 20,
+        c.PeakPagefileUsage as u64 >> 20,
+        c.WorkingSetSize as u64 >> 20,
+        c.PeakWorkingSetSize as u64 >> 20,
+        pages(p.PhysicalAvailable),
+        pages(p.PhysicalTotal),
+        pages(p.CommitTotal),
+        pages(p.CommitLimit),
+        pages(p.CommitPeak),
+        pages(p.KernelPaged),
+        pages(p.KernelNonpaged),
+        p.HandleCount,
+        peak[3],
+        peak[0] >> 20,
+        if peak[1] == u64::MAX { 0 } else { peak[1] >> 20 },
+        peak[2] >> 20,
+        now_ms().saturating_sub(then[6]),
+        now[0].saturating_sub(then[0]) >> 20,
+        now[1].saturating_sub(then[1]) >> 20,
+        now[2].saturating_sub(then[2]) >> 20,
+        now[5].saturating_sub(then[5]),
+        now[3] >> 20,
+        then[3] >> 20,
+        now[4].saturating_sub(then[4]) >> 20,
+    )
+}
+
 /// Says [`removal_context`] in the log, once: called by whoever finds the
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !trail_on() || SAID.swap(true, Ordering::Relaxed) {
+    if SAID.swap(true, Ordering::Relaxed) {
         return;
     }
-    tracing::error!("when the host device went: {}", removal_context());
+    if trail_on() {
+        tracing::error!("when the host device went: {}", removal_context());
+    }
+    // The memory at this moment: the memory line is up to five seconds
+    // old, and a card or a PC out of memory would not be in it.
+    tracing::error!("memory when the host device went: {}", removal_memory());
+    if let Some(host) = host() {
+        match host.video_memory_groups() {
+            Some(_) => host.log_video_memory("where the removal was found"),
+            None => tracing::error!(
+                "video memory where the removal was found: the system gives no numbers (the adapter does not answer)"
+            ),
+        }
+    }
+    // With device-removed data on: the runtime's data too, unless a
+    // submission's own report has asked for it already. Only the places
+    // that wait for a submission asked; a removal found anywhere else (a
+    // view being made, a tile mapped) said none of it. Without the lookups
+    // in our own tables: whoever calls may hold their locks.
+    if dred_any()
+        && !DATA_SAID.load(Ordering::Relaxed)
+        && let Some(host) = host()
+    {
+        tracing::error!(
+            "device-removed data, asked where the removal was found{}",
+            host.removal_data_of(&[], false)
+        );
+    }
 }
+
+/// Whether [`Host::removal_data`] was asked for (once is enough for
+/// [`log_removal_context`]).
+static DATA_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -693,13 +849,23 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
+        if dred_any() {
+            let mode = dred_mode();
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                // `faults`: no breadcrumbs, only the faulting address.
+                if mode != Dred::Faults {
+                    dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                tracing::info!("device-removed data on: {}", mode.text());
+            } else {
+                tracing::warn!(
+                    "device-removed data was asked for ({}) and the runtime gave no settings for it: none will be kept",
+                    mode.text()
+                );
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -1408,14 +1574,71 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
-pub(crate) fn dred_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+/// The forms of device-removed data (`VICTORY_D3D12_DRED`, diagnostics
+/// builds). The full form costs about 28 ms a frame here (2026-11-25), so
+/// no long run carried it; the two others are meant for long runs. What
+/// they cost is not measured yet (fxceless/victory-fork 4cc775f57, a port of
+/// avatarmanz/VIctory-7900XTX 8a8ad35).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dred {
+    /// Not set.
+    Off,
+    /// Any value but the two below (`1`): breadcrumbs, the faulting
+    /// address, and a marker with its text before every noted command (the
+    /// report's "a list stopped at command N" says what that command ran).
+    Full,
+    /// `light`: breadcrumbs and the faulting address, no marker and no
+    /// text: the report says which list stopped at which command, and the
+    /// pipelines that list binds.
+    Light,
+    /// `faults`: the faulting address only (no breadcrumbs, so the runtime
+    /// adds nothing to the lists' commands).
+    Faults,
+}
+
+impl Dred {
+    /// For the log.
+    fn text(self) -> &'static str {
+        match self {
+            Dred::Off => "off",
+            Dred::Full => "full: breadcrumbs, page faults, a marker text per command",
+            Dred::Light => "light: breadcrumbs and page faults, no marker texts",
+            Dred::Faults => "faults: page faults only, no breadcrumbs",
+        }
+    }
+}
+
+/// The form of device-removed data asked for.
+pub(crate) fn dred_mode() -> Dred {
+    static MODE: OnceLock<Dred> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return Dred::Off;
+        }
+        match std::env::var_os("VICTORY_D3D12_DRED") {
+            None => Dred::Off,
+            Some(v) if v == "light" => Dred::Light,
+            Some(v) if v == "faults" => Dred::Faults,
+            Some(_) => Dred::Full,
+        }
     })
 }
+
+/// Whether device-removed data is on in its full form, the one in which
+/// every noted command gets a marker and a text (`HostList::note_op`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dred_on() -> bool {
+    dred_mode() == Dred::Full
+}
+
+/// Whether device-removed data is on in any form ([`Dred`]).
+pub(crate) fn dred_any() -> bool {
+    dred_mode() != Dred::Off
+}
+
+/// Host objects named since the start ([`name`]): one text and one
+/// `SetName` call each.
+static NAMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Indirect mesh dispatches since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
@@ -1476,11 +1699,18 @@ pub(crate) fn timing_on() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on, in any
+/// of its forms: the names are what a faulting address is read by).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
-    if dred_on()
+    if dred_any()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
+        // Counted, so that a log says what naming costs. Said at 4,096 and
+        // at every doubling after it.
+        let named = NAMED.fetch_add(1, Ordering::Relaxed) + 1;
+        if named >= 4096 && named.is_power_of_two() {
+            tracing::info!("device-removed data: {named} host objects named so far");
+        }
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
     }
@@ -6193,6 +6423,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        self.video_memory_look();
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -6515,20 +6746,60 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        self.removal_data_of(runs, true)
+    }
+
+    /// [`Host::removal_data`]; `tables`: whether a faulting address is also
+    /// looked up in our own tables (title memory copies, view heaps), which
+    /// takes their locks.
+    ///
+    /// With the data on ([`Dred`]) the report says each of its parts
+    /// whatever the runtime answered: why the device went, the page fault
+    /// (an address, none reported, or the call failed) and the breadcrumbs
+    /// (how many lists came back, none after asking again, or the call
+    /// failed), so that a report without a fault or breadcrumbs says
+    /// whether the runtime was asked in vain.
+    fn removal_data_of(&self, runs: &[&HostList], tables: bool) -> String {
+        DATA_SAID.store(true, Ordering::Relaxed);
+        let said = dred_any();
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
+            return if said {
+                "; device-removed data: this device has no interface for it".to_owned()
+            } else {
+                String::new()
+            };
         };
         let mut text = String::new();
         let mut fault_va = None;
+        if said {
+            // SAFETY: a plain query.
+            let reason = match unsafe { self.device.GetDeviceRemovedReason() } {
+                Ok(()) => "none, the device is not removed".to_owned(),
+                Err(e) => format!("{:#010X}", e.code().0),
+            };
+            text.push_str(&format!(
+                "; device-removed data ({}): removal reason {reason}; {} host objects named",
+                dred_mode().text(),
+                NAMED.load(Ordering::Relaxed)
+            ));
+        }
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
         unsafe {
-            if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            let fault = dred.GetPageFaultAllocationOutput1();
+            // Said either way: no address, or no answer at all.
+            match &fault {
+                Ok(f) if said && f.PageFaultVA == 0 => text.push_str("; page fault: no fault address reported"),
+                Err(e) if said => text.push_str(&format!("; page fault: the call failed ({e})")),
+                _ => {}
+            }
+            if let Ok(fault) = fault
                 && fault.PageFaultVA != 0
             {
                 let va = fault.PageFaultVA;
                 fault_va = Some(va);
                 text.push_str(&format!("; page fault at {va:#x}"));
+                let mut found = 0;
                 for (what, head) in [
                     ("inside", fault.pHeadExistingAllocationNode),
                     ("inside freed", fault.pHeadRecentFreedAllocationNode),
@@ -6547,21 +6818,42 @@ impl Host {
                         node = n.pNext;
                     }
                     if !names.is_empty() {
+                        found += names.len();
                         text.push_str(&format!("; {what} {names:?}"));
                     }
                 }
-                text.push_str(&crate::shadow::near(va));
-                text.push_str(&crate::descriptor::host::near_heaps(va));
+                if found == 0 {
+                    text.push_str("; inside no allocation the runtime lists, alive or freed lately");
+                }
+                if tables {
+                    text.push_str(&crate::shadow::near(va));
+                    text.push_str(&crate::descriptor::host::near_heaps(va));
+                }
+            }
+            // `faults` keeps no breadcrumbs: none are asked for.
+            if dred_mode() == Dred::Faults {
+                text.push_str("; breadcrumbs: not kept in this form");
+                return text;
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
-            let crumbs = match dred.GetAutoBreadcrumbsOutput() {
+            let mut crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&format!("; no breadcrumbs (the call failed: {e})"));
                     return text;
                 }
             };
+            // An empty answer right after the removal (fxceless run 277) is
+            // asked again for half a second before it is believed.
+            let mut asked = 0u32;
+            while said && crumbs.pHeadAutoBreadcrumbNode.is_null() && asked < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                asked += 1;
+                if let Ok(again) = dred.GetAutoBreadcrumbsOutput() {
+                    crumbs = again;
+                }
+            }
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
@@ -6571,6 +6863,14 @@ impl Host {
                 let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
+            }
+            if said {
+                let again = if asked > 0 { format!(", asked {asked} more times over {} ms", asked * 50) } else { String::new() };
+                if progress.is_empty() {
+                    text.push_str(&format!("; breadcrumbs: the runtime returned none (nodes 0{again})"));
+                } else {
+                    text.push_str(&format!("; breadcrumbs: data returned (nodes {}{again})", progress.len()));
+                }
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
             let mut plain = crumbs.pHeadAutoBreadcrumbNode;
@@ -6606,7 +6906,12 @@ impl Host {
                     let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
+                    }
+                    // A list that never started; and in `light`, where no
+                    // marker says what a command ran, every stopped list.
+                    if (done == 0 || dred_mode() == Dred::Light)
+                        && let Some(r) = run
+                    {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
@@ -8733,6 +9038,7 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
+            video_memory_line();
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
@@ -8945,7 +9251,19 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // What Present answers was thrown away: a removal it is the first
+            // to report then looked as if the next call found it. Said once
+            // (a status that is no error, as "occluded", is not).
+            let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if shown.is_err() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::error!(
+                        "Present answered {:#010x} (said once): the first call to report it, frame {frame}",
+                        shown.0 as u32
+                    );
+                });
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -9087,7 +9405,26 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
+        // For the line between the memory lines ([`video_memory_line`]).
+        VIDEO_PEAK[0].fetch_max(own.CurrentUsage, Ordering::Relaxed);
+        VIDEO_PEAK[1].fetch_min(own.Budget, Ordering::Relaxed);
+        VIDEO_PEAK[2].fetch_max(shared.CurrentUsage, Ordering::Relaxed);
+        VIDEO_PEAK[3].fetch_add(1, Ordering::Relaxed);
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// One look at the card's memory of our own, at most every tenth of a
+    /// second, before a submission is prepared: for [`VIDEO_PEAK`], and so
+    /// that a change of the budget is said within a tenth of a second
+    /// ([`Self::video_memory`]). Two plain questions to the system.
+    fn video_memory_look(&self) {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = now_ms();
+        let last = LAST.load(Ordering::Relaxed);
+        if now < last + 100 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let _ = self.video_memory();
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
