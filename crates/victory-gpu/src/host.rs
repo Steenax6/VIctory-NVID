@@ -8327,6 +8327,13 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
+            let [read, taken] = [0, 1].map(|i| crate::texture::PAGES_MISSING[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if read > 0.0 {
+                tracing::info!(
+                    "texture refreshes that read a texture with pages not there, per frame: {read:.1}, {taken:.1} of them took \
+                     what they read (the texture went up with zeros where its pages were missing)"
+                );
+            }
         }
         {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);

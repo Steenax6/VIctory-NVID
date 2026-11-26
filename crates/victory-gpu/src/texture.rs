@@ -436,6 +436,15 @@ fn no_wait() -> bool {
 /// left for the next refresh because a page was not there.
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame-rate line: refreshes that read a texture whose
+/// memory was not all mapped (pages not there read as zeros), and those of
+/// them that took what they read (it changed and was not all zeros), so
+/// that the texture went up with zeros where pages were missing. A texture
+/// streaming in is read so while only some of its mips are there; the
+/// second count rising where nothing streams is the fault of xmem's notice
+/// after the unmap (textures with holes, other ones each run).
+pub(crate) static PAGES_MISSING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
 /// refreshing the same texture), asking the write watch and the guards,
@@ -1200,6 +1209,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                PAGES_MISSING[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1208,6 +1218,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
+                PAGES_MISSING[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.detile(read);
                 true
             });
