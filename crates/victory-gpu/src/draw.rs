@@ -348,6 +348,26 @@ pub(crate) struct State {
     threads_x: Option<u32>,
     /// What the list's draws made ready so far.
     seen: Seen,
+    /// What a draw works its tables and user data out in.
+    scratch: Scratch,
+}
+
+/// The vectors a draw fills while it is bound and has no use for after
+/// (`State::tables`, `State::bind`): kept with the list, so that a draw
+/// allocates nothing for them (each was a new vector a draw and stage, some
+/// 40,000 allocations a frame in the first room).
+#[derive(Default)]
+struct Scratch {
+    /// The root parameters whose tables are made afresh, and of them the
+    /// ones that reach past the host heap.
+    fresh: Vec<u8>,
+    past: Vec<u8>,
+    /// The descriptors of a table that a constant or a half view picks.
+    selected: Vec<u32>,
+    /// The tables made afresh: root parameter, byte offset.
+    made: Vec<(u8, u32)>,
+    /// A stage's user data.
+    values: Vec<u32>,
 }
 
 /// What a list's draws have made ready so far, so that its next draw does
@@ -1833,7 +1853,9 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut values = std::mem::take(&mut self.scratch.values);
+                values.clear();
+                values.resize(dwords as usize, 0);
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1856,7 +1878,10 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+                self.scratch.values = values;
             }
+            // (Given back for the next stage and draw: `Scratch`.)
+            self.scratch.made = made;
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -3708,12 +3733,11 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        // (The vectors are the list's own, used again draw after draw:
+        // [`Scratch`].)
+        let mut fresh = std::mem::take(&mut self.scratch.fresh);
+        fresh.clear();
+        fresh.extend(used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv).map(|u| u.slot));
         // The view shown in place of the title's at dword `at` of the table
         // in root parameter `slot`, if the shader moves halves there and
         // the title's view is a 16-bit float or signed buffer view.
@@ -3757,7 +3781,8 @@ impl State {
         // title's slots there have no host slot of their own. Such a table
         // that cannot be made afresh drops the draw (`bind`): its title
         // offset would have the card read past the host heap.
-        let mut past = Vec::new();
+        let mut past = std::mem::take(&mut self.scratch.past);
+        past.clear();
         for u in used.iter().filter(tables) {
             if past.contains(&u.slot) {
                 continue;
@@ -3784,8 +3809,10 @@ impl State {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let mut made = std::mem::take(&mut self.scratch.made);
+        made.clear();
+        let mut selected = std::mem::take(&mut self.scratch.selected);
+        for &slot in &fresh {
             // A table not made afresh keeps the title's offset; one past the
             // host heap must not.
             let not_made = |made: &mut Vec<(u8, u32)>| {
@@ -3797,11 +3824,7 @@ impl State {
                 not_made(&mut made);
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            let entries = || used.iter().filter(tables).filter(move |u| u.slot == slot);
             let Some(heap) = self.heap_of(table) else {
                 not_made(&mut made);
                 continue;
@@ -3814,20 +3837,12 @@ impl State {
                 not_made(&mut made);
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            selected.clear();
+            selected.extend(indexed.iter().filter(|index| index.table_slot == slot).map(|index| {
+                let constant = self.user_value(compute, index.constant_slot, RootType::Constants, index.constant_dword);
+                // The shader adds i32 byte offsets and shifts by 5.
+                index.byte_offset.wrapping_add(constant << index.shift) / 32
+            }));
             // The descriptors the shader moves halves through are made too,
             // and the table reaches them: they may lie past the range starts
             // the entries give (a range of several views names only its
@@ -3835,8 +3850,7 @@ impl State {
             selected.extend(half.iter().filter(|&&(s, _)| s == slot).map(|&(_, at)| at / 8));
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
+            let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .max()
@@ -3855,14 +3869,14 @@ impl State {
             // a shader that reads them in the title's formats.)
             let key = (table, n, table_print(table, n, |k| half.contains(&(slot, k * 8))));
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(key) = crate::descriptor::key_at(handle) {
                         self.ready(list, u.kind, key, None);
                     }
                 }
-                for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                for &k in &selected {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3892,7 +3906,7 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 let record = crate::descriptor::key_at(table + u64::from(k) * 32);
                 match record.and_then(crate::descriptor::view_of) {
                     Some(View::Constant(address, size)) => {
@@ -3977,6 +3991,7 @@ impl State {
             }
             made.push((slot, first * 32));
         }
+        (self.scratch.fresh, self.scratch.past, self.scratch.selected) = (fresh, past, selected);
         made
     }
 
