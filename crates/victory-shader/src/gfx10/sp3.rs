@@ -781,4 +781,36 @@ mod tests {
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
     }
+
+    /// `v_cmpx` writes EXEC whatever its VOP3 VDST field or its SDWA SDST holds; a
+    /// plain compare in SDWA keeps the SDST it names.
+    #[test]
+    fn v_cmpx_writes_exec_in_vop3_and_sdwa() {
+        let dst = |words: &[u32], wave64: bool| {
+            let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            code.extend(0xBF81_0000u32.to_le_bytes());
+            let Fields::Valu(v) = decode(&code).unwrap()[0].fields(wave64) else {
+                panic!("not a VALU instruction");
+            };
+            v.dst
+        };
+        let exec = |wave64: bool| Some(Operand::Scalar { code: 126, dwords: 1 + u8::from(wave64) });
+        // VOP3 v_cmpx_lt_f32 with VDST 0 and with 0x7e
+        for words in [[0xD411_0100, 0x0001_E501], [0xD411_017E, 0x0001_E501]] {
+            for wave64 in [false, true] {
+                assert_eq!(dst(&words, wave64), exec(wave64));
+            }
+            assert_eq!(one(&words, false), "v_cmpx_lt_f32 exec_lo, abs(v1), 1.0");
+            assert_eq!(one(&words, true), "v_cmpx_lt_f32 exec, abs(v1), 1.0");
+        }
+        // SDWA v_cmpx_eq_f16 with SD set and SDST s6
+        let cmpx = [0x7DB4_04F9, 0x0600_8601];
+        for wave64 in [false, true] {
+            assert_eq!(dst(&cmpx, wave64), exec(wave64));
+        }
+        // SDWA v_cmp_eq_f16, the same fields: s6
+        let cmp = [0x7D94_04F9, 0x0600_8601];
+        assert_eq!(dst(&cmp, false), Some(Operand::Scalar { code: 6, dwords: 1 }));
+        assert_eq!(dst(&cmp, true), Some(Operand::Scalar { code: 6, dwords: 2 }));
+    }
 }
