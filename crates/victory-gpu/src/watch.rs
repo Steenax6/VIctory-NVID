@@ -550,7 +550,7 @@ fn watchable(ranges: &[(usize, usize)]) -> std::borrow::Cow<'_, [(usize, usize)]
     if !skip_views() || view_ask() {
         return std::borrow::Cow::Borrowed(ranges);
     }
-    let g = guards();
+    let g = guards(Holder::Look);
     std::borrow::Cow::Owned(ranges.iter().copied().filter(|r| !held(&g, r.0 / BLOCK)).collect())
 }
 
@@ -1040,7 +1040,7 @@ const _: () = assert!(BLOCK == PAGE && BLOCK / KERNEL_PAGE == 16);
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
 fn known_view(start: usize) -> bool {
-    !view_ask() && held(&guards(), start / BLOCK)
+    !view_ask() && held(&guards(Holder::Look), start / BLOCK)
 }
 
 /// `VICTORY_VIEW_ASK=1` or `VICTORY_GUARD_ASK=1` (see [`known_view`]).
@@ -1344,7 +1344,7 @@ fn guard_line(submission: u64) {
     let c: Vec<f64> = GUARD_CALLS.iter().map(|a| a.swap(0, Relaxed) as f64 / n).collect();
     let same = [0, 1].map(|i| crate::shadow::SENT_SAME[i].swap(0, Relaxed) as f64 / n);
     let (hot, runs, absent, partly) = {
-        let g = guards();
+        let g = guards(Holder::Look);
         (g.hot.len(), g.absent_runs.len(), g.absent.len(), g.dirty.len())
     };
     tracing::info!(
@@ -1390,8 +1390,87 @@ impl Guards {
     }
 }
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    crate::timeline::waited("L:guards", || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+/// Who takes the guards' lock: a hold is an event of `crate::timeline`
+/// under the holder's name ([`Held`]).
+#[derive(Clone, Copy, Debug)]
+enum Holder {
+    /// A check of a range ([`guard_fine`]): its walk over the blocks.
+    Check,
+    /// What a check undoes for the protections that failed ([`settle`]).
+    Settle,
+    /// A write of the title's that faulted ([`install`]'s handler).
+    Fault,
+    /// Blocks opened before a write through the kernel ([`writing_as`]).
+    Opening,
+    /// Blocks counted written after a write the guards do not see
+    /// ([`written_beside`], [`kernel_wrote`], [`title_memory_written`]).
+    Marking,
+    /// A view of the runtime's mapped ([`views_mapped`]).
+    Mapped,
+    /// Memory the runtime mapped or unmapped ([`title_memory_remapped`]).
+    Remapped,
+    /// A look that changes nothing ([`known_view`], [`watchable`],
+    /// [`seen_since`], [`guard_state`], the guards' line).
+    Look,
+}
+
+impl Holder {
+    /// The events of a hold of 0.2 ms and more, and of a thread's holds
+    /// summed.
+    fn events(self) -> (&'static str, &'static str) {
+        match self {
+            Holder::Check => ("H:check", "HS:check"),
+            Holder::Settle => ("H:settle", "HS:settle"),
+            Holder::Fault => ("H:fault", "HS:fault"),
+            Holder::Opening => ("H:opening", "HS:opening"),
+            Holder::Marking => ("H:marking", "HS:marking"),
+            Holder::Mapped => ("H:mapped", "HS:mapped"),
+            Holder::Remapped => ("H:remapped", "HS:remapped"),
+            Holder::Look => ("H:look", "HS:look"),
+        }
+    }
+}
+
+const _: () = assert!((Holder::Look as usize) < crate::timeline::HOLDERS);
+
+/// The guards, locked. While `crate::timeline` keeps events, letting go
+/// says how long they were held and by whom: the lock is the fault
+/// handler's on the title's threads, and a wait for it (`L:guards`) names
+/// no holder.
+struct Held {
+    guards: std::sync::MutexGuard<'static, Guards>,
+    by: Holder,
+    since: Option<std::time::Instant>,
+    /// A number of the holder's own for the event (the blocks a check
+    /// walked).
+    n: u64,
+}
+
+impl std::ops::Deref for Held {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.guards
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.guards
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let (long, sum) = self.by.events();
+        crate::timeline::held(self.by as usize, long, sum, self.since, self.n);
+    }
+}
+
+/// The guards' lock, taken by `by` (a wait of 0.2 ms or more for it is an
+/// event of `crate::timeline`, and so is the hold: [`Held`]).
+fn guards(by: Holder) -> Held {
+    let guards = crate::timeline::waited("L:guards", || GUARDS.lock().unwrap_or_else(|e| e.into_inner()));
+    Held { guards, by, since: crate::timeline::clock(), n: 0 }
 }
 
 /// [`guard_fine`] without the kernel pages: the pages written.
@@ -1423,14 +1502,15 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
     let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
     // One taking of the guards' lock for a range they hold (the lock is
     // also the fault handler's, on the title's threads).
-    let mut g = guards();
+    let mut g = guards(Holder::Check);
     if ask || !held(&g, start / BLOCK) {
         drop(g);
         if !is_view(start, end) {
             return None;
         }
-        g = guards();
+        g = guards(Holder::Check);
     }
+    g.n = (end.div_ceil(BLOCK) - start / BLOCK) as u64;
     // With this lock and the journal's (the caller's) nothing is counted
     // until the check is through: what it finds below is what these counts
     // stand for.
@@ -1597,7 +1677,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
     if defer && !later.is_empty() {
         let failed = later.apply();
         if !failed.is_empty() {
-            settle(&mut guards(), &failed, epoch);
+            settle(&mut guards(Holder::Settle), &failed, epoch);
         }
     }
     Some(written)
@@ -2507,7 +2587,7 @@ pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
     crate::read_census::disarm(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     {
-        let mut g = guards();
+        let mut g = guards(Holder::Opening);
         // Every block is opened under the guards' lock, so what the count
         // of opened blocks grows by here is this write's.
         #[cfg(feature = "diagnostics")]
@@ -2553,7 +2633,7 @@ pub fn kernel_wrote(at: usize, len: usize) {
     }
     let end = at.saturating_add(len);
     {
-        let mut g = guards();
+        let mut g = guards(Holder::Marking);
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
         KERNEL_WROTE[0].fetch_add(1, Relaxed);
         KERNEL_WROTE[1].fetch_add(len as u64, Relaxed);
@@ -2594,7 +2674,7 @@ pub(crate) fn kernel_line() {
 /// before the write would have noted the block clean with the old bytes.
 pub(crate) fn written_beside(at: usize, len: usize, cause: crate::writes::Cause) {
     {
-        let mut g = guards();
+        let mut g = guards(Holder::Marking);
         mark_with_views(&mut g, at, at.saturating_add(len));
     }
     // A placed texture there changes with no descriptor written.
@@ -2626,7 +2706,7 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     };
     let (mut written, mut open) = (0, 0);
     {
-        let g = guards();
+        let g = guards(Holder::Look);
         for block in first..last {
             if !g.protected.contains(&block) {
                 open += usize::from(!g.absent.contains(&block));
@@ -2738,7 +2818,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[3].fetch_add(1, Relaxed);
     }
     if pages {
-        let mut g = guards();
+        let mut g = guards(Holder::Marking);
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
         WRITTEN[2].fetch_add(guarded, Relaxed);
         if mode & 1 != 0 && guarded != 0 {
@@ -2761,7 +2841,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// What the guards hold of the block of `at`, in words (for the refresh
 /// check's warnings).
 pub(crate) fn guard_state(at: usize) -> &'static str {
-    let g = guards();
+    let g = guards(Holder::Look);
     let block = at / BLOCK;
     match (g.protected.contains(&block), g.clean.contains(&block)) {
         (true, true) => "guarded, not written since it was taken",
@@ -2785,7 +2865,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if ranges.is_empty() {
         return;
     }
-    let mut g = guards();
+    let mut g = guards(Holder::Mapped);
     for &(at, n) in &ranges {
         let end = at.saturating_add(n);
         if if mark_only() { mark_written(&mut g, at, end) } else { open_here(&mut g, at, end) } {
@@ -2861,7 +2941,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
+    let mut g = guards(Holder::Remapped);
     // What a copy knew of this memory is no longer so: counted with the
     // guards' lock held, as everything is that changes what a check finds.
     // Counted before the lock was taken, a refresh could look at the
@@ -2969,7 +3049,7 @@ fn install() {
             // block since this one faulted, and a copy may have guarded it
             // again since (then it is ours again, not read-only for some
             // other reason).
-            let mut g = guards();
+            let mut g = guards(Holder::Fault);
             if guard_pages() && open_tail(&mut g, at) {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -3637,7 +3717,7 @@ mod tests {
         // Far above anything mapped in a test: only the notes change.
         let b = (1usize << 46) / BLOCK;
         {
-            let mut g = guards();
+            let mut g = guards(Holder::Look);
             g.absent_for = 7;
             g.absent_runs.insert(b, b + 4);
             g.absent_runs.insert(b + 10, b + 11);
@@ -3645,7 +3725,7 @@ mod tests {
         }
         title_memory_remapped((b + 2) * BLOCK, BLOCK);
         title_memory_remapped((b + 29) * BLOCK, 2 * BLOCK);
-        let mut g = guards();
+        let mut g = guards(Holder::Look);
         assert_eq!(g.absent_until(b + 10, 7), Some(b + 11));
         // The runs are cut around the remapped blocks, not dropped.
         assert_eq!(g.absent_until(b + 1, 7), Some(b + 2));
@@ -3681,7 +3761,7 @@ mod tests {
         assert_eq!(guard_fine(view, view + BLOCK, None, &mut Look::default()), Some(vec![(block, FULL)]));
         // SAFETY: inside our view; the write faults and opens the tail.
         unsafe { ((view + 5 * KERNEL_PAGE + 8) as *mut u8).write_volatile(1) };
-        assert!(guards().protected.contains(&block), "the pages below stay guarded");
+        assert!(guards(Holder::Look).protected.contains(&block), "the pages below stay guarded");
         // SAFETY: as above, above the fault: open, no fault.
         unsafe { ((view + 9 * KERNEL_PAGE) as *mut u8).write_volatile(1) };
         // SAFETY: as above, below it: faults, opens from there on.
@@ -3719,7 +3799,7 @@ mod tests {
         {
             // As if opened by another thread and armed again by a check
             // that made its call afterwards.
-            let mut g = guards();
+            let mut g = guards(Holder::Look);
             g.protected.remove(&block);
             g.clean.remove(&block);
         }
@@ -3751,7 +3831,7 @@ mod tests {
         // Mapped anew, as the runtime tells it: nothing is known of it.
         title_memory_remapped(one, SIZE);
         crate::inplace::title_memory_view(one, SIZE, section, 0);
-        assert!(!guards().views.contains(&block));
+        assert!(!guards(Holder::Look).views.contains(&block));
         // The check's late call.
         let mut old = 0;
         // SAFETY: a block of our own view; only its protection changes.
@@ -3819,14 +3899,14 @@ mod tests {
         // submissions, then left open.
         let hot = HOT_TIMES as u64 - 1;
         for submission in 1..hot {
-            assert!(guards().protected.contains(&block), "armed after submission {submission}");
+            assert!(guards(Holder::Look).protected.contains(&block), "armed after submission {submission}");
             write();
             assert_eq!(guard(view, view + BLOCK, at(submission, true)), Some(page.clone()));
         }
-        assert!(guards().protected.contains(&block));
+        assert!(guards(Holder::Look).protected.contains(&block));
         write();
         assert_eq!(guard(view, view + BLOCK, at(hot, true)), Some(page.clone()));
-        assert!(!guards().protected.contains(&block) && guards().hot.contains_key(&block));
+        assert!(!guards(Holder::Look).protected.contains(&block) && guards(Holder::Look).hot.contains_key(&block));
         write();
         assert_eq!(guard(view, view + BLOCK, at(hot, true)), Some(Vec::new()), "once while the asking stands");
         assert_eq!(guard(view, view + BLOCK, at(hot + 1, true)), Some(page.clone()), "again in the next submission");
@@ -3834,7 +3914,7 @@ mod tests {
         assert_eq!(guard(view, view + BLOCK, at(hot + 1, false)), Some(page.clone()));
         // Its time up, it is guarded again.
         assert_eq!(guard(view, view + BLOCK, at(hot + 1 + HOT_FOR, true)), Some(page.clone()));
-        assert!(guards().protected.contains(&block) && !guards().hot.contains_key(&block));
+        assert!(guards(Holder::Look).protected.contains(&block) && !guards(Holder::Look).hot.contains_key(&block));
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, BLOCK);
@@ -3860,7 +3940,7 @@ mod tests {
         // SAFETY: our view; the write faults and opens the block.
         unsafe { ((view + 8) as *mut u8).write_volatile(1) };
         // Written: open (whole, or from the written kernel page on).
-        assert!(!guards().clean.contains(&(view / BLOCK)));
+        assert!(!guards(Holder::Look).clean.contains(&(view / BLOCK)));
         assert_eq!(known_view(view), views_known());
         assert_eq!(guard(view, view + BLOCK, None), Some(vec![view / PAGE]));
         title_memory_remapped(view, BLOCK);
