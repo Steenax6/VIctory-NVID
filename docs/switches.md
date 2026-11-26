@@ -131,8 +131,15 @@ between the refresh's look and its asking"). Reading the code for a
 writer the events miss found two places, both put right: a mapping's
 count was raised before the guards' lock was taken (a refresh between
 the two remembered the count and not the mapping), and a copy whose
-memory turned out not to be watched could be left out. Whether the 9
-finds were the check's own is what its next runs say; it is inferred.
+memory turned out not to be watched could be left out. The runs after
+that (s_y2_p_check, 205 s, and s_we_y2_check, 130 s) had 0 finds in
+every line, and 0 of the others too: so the 9 were not the check's own
+moment, as first supposed, but went with the event side as it is now
+(the mapping's count, or the ranges with absent blocks, which are asked
+once in 30 frames and whose finds at that asking were not told apart
+then). The line now counts those askings as well: the ones that found
+blocks that had been absent, which is what they are for, and the ones
+that found other bytes no event had announced, which must be 0 too.
 
 `VICTORY_LAND_TAKEN=1` (2026-11-26; off, not yet run; `=2` is its check):
 what shaders wrote into private title memory (which the kernel

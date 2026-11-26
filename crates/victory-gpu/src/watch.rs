@@ -301,7 +301,14 @@ impl Seen {
     /// nothing to ask. With absent blocks in it, only within the frames
     /// their lookup holds for.
     pub(crate) fn quiet(&self) -> bool {
-        self.from < self.to && events(self.from, self.to) == self.events && self.absent.is_none_or(|stretch| stretch == absent_stretch())
+        self.uncounted() && self.absent.is_none_or(|stretch| stretch == absent_stretch())
+    }
+
+    /// Whether nothing was counted in the range since it was brought up to
+    /// date, whatever the frames of its absent blocks' lookup say. (Not
+    /// for a range that is asked every time: counts say nothing of it.)
+    pub(crate) fn uncounted(&self) -> bool {
+        self.from < self.to && events(self.from, self.to) == self.events && self.absent != Some(EVERY_TIME)
     }
 }
 
@@ -315,16 +322,29 @@ pub(crate) struct Look {
     /// and (for view memory) the guards', before the asking took anything:
     /// nothing can be counted between this look and what the asking finds.
     pub(crate) quiet: bool,
+    /// Out: [`Seen::uncounted`] of `seen`, taken at the same moment.
+    pub(crate) uncounted: bool,
     /// Out: [`Seen::absent`] for the range asked.
     pub(crate) absent: Option<u64>,
     /// Out, for the check's warning: the first block the guards reported
     /// written, the kernel pages of it, and what it was to them.
     pub(crate) found: Option<(usize, u16, &'static str)>,
+    /// Out: whether the guards reported a block that was not one noted
+    /// absent and found there now (what has no event, and is looked for
+    /// once in [`absent_frames`] frames).
+    pub(crate) other: bool,
 }
 
 impl Look {
-    fn found(&mut self, block: usize, mask: u16, what: &'static str) {
+    fn found(&mut self, block: usize, mask: u16, what: &'static str, arrived: bool) {
         self.found.get_or_insert((block, mask, what));
+        self.other |= !arrived;
+    }
+
+    /// Looks at what the copy remembers, with the asking's locks held.
+    fn look(&mut self) {
+        self.quiet = self.seen.is_some_and(|seen| seen.quiet());
+        self.uncounted = self.seen.is_some_and(|seen| seen.uncounted());
     }
 }
 
@@ -334,10 +354,14 @@ impl Look {
 /// same) and nothing to copy; those of them that had bytes to copy all the
 /// same (the check's finds: an event that was not counted); those asked
 /// because something had happened; those asked because the range was not
-/// inside the one last brought up to date; and (the check) those that had
+/// inside the one last brought up to date; (the check) those that had
 /// nothing happened when the refresh looked, had something counted before
-/// the asking held its locks, and found bytes to copy.
-static EVENT_CHECKS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// the asking held its locks, and found bytes to copy; and those asked
+/// because the frames their absent blocks' lookup holds for had passed,
+/// with nothing counted, that found bytes to copy: in blocks that had been
+/// absent and nowhere else (what the turn is for), and elsewhere (bytes no
+/// event announced, which 1 takes that many frames late).
+static EVENT_CHECKS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// What a refresh of a range in view memory came to ([`event_checked`]).
 #[derive(Clone, Copy, Debug)]
@@ -350,15 +374,23 @@ pub(crate) struct Checked {
     /// The same with the asking's locks held ([`Look::quiet`]); as `quiet`
     /// where nothing was asked.
     pub(crate) quiet_locked: bool,
+    /// Whether nothing was counted there, with the asking's locks held and
+    /// whatever the frames of its absent blocks say ([`Look::uncounted`]).
+    pub(crate) uncounted: bool,
     /// The bytes the asking found to copy (`None`: it was left out).
     pub(crate) copied: Option<usize>,
 }
 
 /// A refresh of `[from, to)` of the copy `[start, start + len)` (`copy`)
-/// in view memory was looked at; `found`: [`Look::found`] of its asking.
-pub(crate) fn event_checked(c: Checked, copy: (u64, u64), from: usize, to: usize, found: Option<(usize, u16, &'static str)>) {
+/// in view memory was looked at; `look`: its asking's, if it asked.
+pub(crate) fn event_checked(c: Checked, copy: (u64, u64), from: usize, to: usize, look: Option<&Look>) {
     use std::sync::atomic::Ordering::Relaxed;
     let bytes = c.copied.is_some_and(|n| n > 0);
+    let found = look.and_then(|look| look.found);
+    // Whether all the guards reported were blocks that had been absent
+    // (and they reported some: bytes with nothing reported are a note in
+    // the journal).
+    let arrivals = found.is_some() && look.is_some_and(|look| !look.other);
     let place = match (c.inside, c.quiet, c.quiet_locked) {
         (false, _, _) => 3,
         (true, true, true) if bytes => 1,
@@ -366,10 +398,18 @@ pub(crate) fn event_checked(c: Checked, copy: (u64, u64), from: usize, to: usize
         // Counted between the look and the asking: 1 leaves this refresh
         // out and asks at the next.
         (true, true, false) if bytes => 4,
+        // Asked for its absent blocks' sake alone, and bytes were there.
+        (true, false, false) if bytes && c.uncounted => {
+            if arrivals {
+                5
+            } else {
+                6
+            }
+        }
         (true, _, _) => 2,
     };
     EVENT_CHECKS[place].fetch_add(1, Relaxed);
-    if place == 1 {
+    if place == 1 || place == 6 {
         static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if SAID.fetch_add(1, Relaxed) < 32 {
             let found = match found {
@@ -381,7 +421,12 @@ pub(crate) fn event_checked(c: Checked, copy: (u64, u64), from: usize, to: usize
                 range = format_args!("{from:#x}..{to:#x}"),
                 copied = c.copied.unwrap_or(0),
                 found,
-                "a refresh found bytes to copy where no event was counted since the range was last brought up to date (looked at with the asking's locks held): with VICTORY_REFRESH_EVENTS=1 the copy would have kept the bytes from before"
+                "a refresh found bytes to copy where no event was counted since the range was last brought up to date (looked at with the asking's locks held): with VICTORY_REFRESH_EVENTS=1 the copy would have kept the bytes from before{}",
+                if place == 6 {
+                    " until its absent blocks were looked up again (it was asked for their sake, and these are not those blocks)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -394,16 +439,20 @@ pub(crate) fn events_line(frames: f64) {
     if mode == 0 {
         return;
     }
-    let [quiet, wrong, happened, outside, between] = [0, 1, 2, 3, 4].map(|i| EVENT_CHECKS[i].swap(0, Relaxed));
+    let [quiet, wrong, happened, outside, between, arrived, late] = [0, 1, 2, 3, 4, 5, 6].map(|i| EVENT_CHECKS[i].swap(0, Relaxed));
     tracing::info!(
         "refreshes by event, of ranges in view memory, per frame (VICTORY_REFRESH_EVENTS={mode}): {:.0} with nothing happened since \
          the range was last brought up to date ({}); {:.0} asked because something had; {:.0} asked because the range was not \
          inside that one; since the last line {wrong} that the check found with bytes to copy and no event, looked at with the \
          asking's locks held (0 is what =1 needs), and {between} with bytes to copy whose event was counted between the \
-         refresh's look and its asking (=1 asks for those at the next refresh; the check's first form took them for finds)",
+         refresh's look and its asking (=1 asks for those at the next refresh; the check's first form took them for finds); \
+         of the ranges asked only because the frames their absent blocks' lookup holds for had passed, {arrived} found blocks \
+         that had been absent there with nothing told (what that asking is for) and {late} found other bytes no event had \
+         announced (0 is what =1 needs: it takes those up to VICTORY_ABSENT_FRAMES frames late, and never in a range with no \
+         absent block)",
         quiet as f64 / frames,
         if mode == 1 { "left out" } else { "asked all the same: the check" },
-        happened as f64 / frames,
+        (happened + arrived + late) as f64 / frames,
         outside as f64 / frames,
     );
 }
@@ -868,7 +917,7 @@ pub(crate) fn writes_fine_look(start: usize, end: usize, guarded: bool, look: &m
     // Where the kernel's write watch answers (here and below) no event
     // tells of a write: such a range is asked every time. The guards' own
     // look, with their lock too, replaces this one.
-    look.quiet = look.seen.is_some_and(|seen| seen.quiet());
+    look.look();
     look.absent = Some(EVERY_TIME);
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
@@ -1381,7 +1430,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
     // With this lock and the journal's (the caller's) nothing is counted
     // until the check is through: what it finds below is what these counts
     // stand for.
-    look.quiet = look.seen.is_some_and(|seen| seen.quiet());
+    look.look();
     look.absent = None;
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
@@ -1460,7 +1509,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
                         }
                         count(8);
                         written.push((block, FULL));
-                        look.found(block, FULL, "left open for a while (VICTORY_HOT_BLOCKS)");
+                        look.found(block, FULL, "left open for a while (VICTORY_HOT_BLOCKS)", false);
                     }
                     if let Some(from) = run.take() {
                         protect(&mut g, from, block, epoch);
@@ -1479,7 +1528,16 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
                 // the kernel pages that may have been written.
                 let mask = g.dirty.remove(&block).unwrap_or(FULL);
                 written.push((block, mask));
-                look.found(block, mask, "guarded and counted written (a fault, a write of ours, or guarded as another view of its pages)");
+                look.found(
+                    block,
+                    mask,
+                    if arrived {
+                        "noted absent, there now with nothing told of it, and guarded meanwhile as another view of its pages"
+                    } else {
+                        "guarded and counted written (a fault, a write of ours, or guarded as another view of its pages)"
+                    },
+                    arrived,
+                );
                 if defer {
                     if g.partly.remove(&block) {
                         later.rearm.push(block);
@@ -1499,6 +1557,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
                     } else {
                         "not guarded (opened, mapped anew, never taken, or not to be guarded)"
                     },
+                    arrived,
                 );
             }
             if rearmed {
@@ -4412,8 +4471,9 @@ mod tests {
         unsafe { ((two + BLOCK + 8) as *mut u8).write(1) };
         assert!(!seen.quiet());
         let look = ask(seen);
-        assert!(!look.quiet);
+        assert!(!look.quiet && !look.uncounted);
         assert_eq!(look.found.map(|f| f.0), Some((one + BLOCK) / BLOCK));
+        assert!(look.other, "a block that was there all along");
         // A range a copy never brought up to date holds nothing.
         assert!(!Seen::default().holds(one, one + SIZE) && !Seen::default().quiet());
         assert!(seen.holds(one + 8, one + SIZE) && !seen.holds(one, one + SIZE + 1));
@@ -4485,11 +4545,16 @@ mod tests {
         let held = |stretch: u64| Seen { absent: Some(stretch), ..Seen::before(far, far + BLOCK) };
         assert!((0..1000).any(|_| held(absent_stretch()).quiet()));
         assert!(!held(absent_stretch() + (1 << 40)).quiet());
+        // Past them nothing need have been counted: such a range is asked
+        // for its absent blocks' sake alone.
+        assert!((0..1000).any(|_| held(absent_stretch() + (1 << 40)).uncounted()));
+        assert!(!seen.uncounted(), "a range asked every time has no counts to go by");
         // Mapped with nothing told: the asking finds it, and says how.
         map(1);
         let (written, look) = ask();
         assert_eq!(written, vec![((p + BLOCK) / BLOCK, FULL)]);
         assert_eq!(look.found.map(|f| f.2), Some("noted absent, and there now with nothing told of it"));
+        assert!(!look.other, "nothing but the block that had been absent");
         assert_eq!(look.absent, None);
         title_memory_remapped(p, 2 * BLOCK);
         // SAFETY: the two views mapped above, and the section's handle.

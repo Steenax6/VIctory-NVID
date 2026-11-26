@@ -3982,14 +3982,14 @@ impl Shadow {
                 (seen, inside, inside && seen.quiet(), Seen::before(from, to))
             });
         if by_event == 1 && matches!(looked, Some((_, true, true, _))) {
-            let left_out = Checked { inside: true, quiet: true, quiet_locked: true, copied: None };
+            let left_out = Checked { inside: true, quiet: true, quiet_locked: true, uncounted: true, copied: None };
             crate::watch::event_checked(left_out, (self.start, self.len), from, to, None);
             return 0;
         }
         if watched {
-            // The check looks at the counts again with the asking's locks
-            // held: what the asking finds is then what they stand for.
-            let mut look = Look { seen: looked.filter(|_| by_event == 2).map(|l| l.0), ..Look::default() };
+            // The asking looks at the counts again with its locks held:
+            // what it finds is then what they stand for.
+            let mut look = Look { seen: looked.map(|l| l.0), ..Look::default() };
             let copied = if refresh_parts() || refresh_kernel_pages() {
                 crate::watch::writes_fine_look(from, to, true, &mut look).map(|(now, written)| self.copy_stale_fine(from, to, now, &written))
             } else {
@@ -3999,9 +3999,14 @@ impl Shadow {
             };
             if let Some(copied) = copied {
                 if let Some((_, inside, quiet, before)) = looked {
-                    let quiet_locked = if by_event == 2 { inside && look.quiet } else { quiet };
-                    let checked = Checked { inside, quiet, quiet_locked, copied: Some(copied) };
-                    crate::watch::event_checked(checked, (self.start, self.len), from, to, look.found);
+                    let checked = Checked {
+                        inside,
+                        quiet,
+                        quiet_locked: inside && look.quiet,
+                        uncounted: inside && look.uncounted,
+                        copied: Some(copied),
+                    };
+                    crate::watch::event_checked(checked, (self.start, self.len), from, to, Some(&look));
                     // The counts from before the asking: what the asking
                     // itself noted has this range asked once more.
                     let mut seen = self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
