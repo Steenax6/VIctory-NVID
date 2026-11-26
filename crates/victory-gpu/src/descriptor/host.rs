@@ -2846,7 +2846,7 @@ impl HostHeap {
                 // retire list's lock, which the recording threads stood in).
                 drop(old);
             } else {
-                crate::host::retire(old);
+                let_go(old);
             }
         }
     }
@@ -3307,6 +3307,71 @@ impl HostHeap {
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
+    }
+}
+
+thread_local! {
+    /// The host resources slots let go of on this thread while a
+    /// [`Together`] is alive there.
+    static LET_GO: std::cell::RefCell<Option<Vec<ID3D12Resource>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While one is alive on a thread, the host resources that slots made on
+/// that thread let go of ([`HostHeap::keep`]) are retired together when it
+/// goes, not each by itself.
+///
+/// A draw makes its tables' slots anew (some eight a draw, 60,000 a frame in
+/// the first room), and each slot retires what it showed before: one
+/// allocation and one turn at the retire list's lock each, the lock all
+/// recording threads and the pass over the heap share (6.5 ms a frame of the
+/// recording threads waiting for it, the profile of 2026-11-26). Retired
+/// together they wait for at least the submissions each would have waited
+/// for (`crate::host::retire` counts the ones started by then), and never
+/// longer than the call the `Together` lives in.
+pub(crate) struct Together(bool);
+
+impl Together {
+    pub(crate) fn begin() -> Together {
+        // Whether this one is the first alive on its thread: one begun
+        // inside another leaves the retiring to that one.
+        let first = LET_GO
+            .try_with(|held| {
+                let mut held = held.borrow_mut();
+                held.is_none() && {
+                    *held = Some(Vec::new());
+                    true
+                }
+            })
+            .unwrap_or(false);
+        Together(first)
+    }
+}
+
+impl Drop for Together {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let old = LET_GO.try_with(|held| held.borrow_mut().take()).ok().flatten();
+        if let Some(old) = old
+            && !old.is_empty()
+        {
+            crate::host::retire(old);
+        }
+    }
+}
+
+/// A slot no longer shows `old`: retired, by itself or with the others of
+/// the [`Together`] alive on this thread.
+fn let_go(old: ID3D12Resource) {
+    let mut old = Some(old);
+    let _ = LET_GO.try_with(|held| {
+        if let Some(together) = held.borrow_mut().as_mut() {
+            together.extend(old.take());
+        }
+    });
+    if let Some(old) = old {
+        crate::host::retire(old);
     }
 }
 
