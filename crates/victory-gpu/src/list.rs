@@ -715,6 +715,8 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
+    crate::timeline::ev("close", this as u64, 0);
+    #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
@@ -724,6 +726,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    crate::timeline::ev("reset", this as u64, 0);
     // What is recorded next is not the recording submitted before.
     #[cfg(windows)]
     crate::resubmit::forget(this);

@@ -5633,6 +5633,7 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let _span = crate::timeline::span("land>", "land<", items.len() as u64, 0);
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -5968,6 +5969,7 @@ impl Host {
             return;
         }
         late_threads();
+        let _span = crate::timeline::span("send>", "send<", order.len() as u64, 0);
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, true)

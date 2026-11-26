@@ -515,6 +515,7 @@ Diagnostics build: `cargo build --profile diag -p victory --features diagnostics
 | Switch | Effect |
 |---|---|
 | `VICTORY_CAPTURE=<dir>` + `VICTORY_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
+| `VICTORY_TIMELINE=<file>` (+ `VICTORY_TIMELINE_AFTER=<seconds>`, 130 unless told; `VICTORY_TIMELINE_FRAMES=<n>`, 8 unless told) | a few frames event by event (diagnostics build): one line per event with the milliseconds since the first of those presents, the thread, the event and two numbers of its own. Events: the present call and its return, each submission of the title and its signals, what the submitting thread sends and when it idles, what the landing thread lands, bottom-of-pipe writes and fences set, every list's reset and close, and the title's own waits and wake-ups (`WaitForSingleObject`, `SetEvent`, `ReleaseSemaphore`, served by the layer only with this switch). It shows what a frame waits for where the profile only shows who idles |
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build); the key bindings make them pad input |
 | `VICTORY_KBM=30:W*2,31:MouseX=400*0.5,33:MouseLeft` | play keys, mouse motion (counts over the hold) and wheel steps into the keyboard and mouse pad (diagnostics build) |
 | `VICTORY_LOG=victory_hle::modules::gameinput=debug` | log each pad state the game reads |

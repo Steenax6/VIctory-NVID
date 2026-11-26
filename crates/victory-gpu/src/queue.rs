@@ -514,6 +514,7 @@ fn worker() {
     loop {
         {
             let mut work = lock(&WORK.0);
+            let _span = (!*work).then(|| crate::timeline::span("idle>", "idle<", 0, 0));
             while !*work {
                 work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
             }
@@ -793,6 +794,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        let _span = crate::timeline::span("exec>", "exec<", this as u64, u64::from(count));
         crate::resubmit::submitted(this, lists);
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
@@ -888,6 +890,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     #[cfg(windows)]
+    crate::timeline::ev("signal", fence as u64, value);
+    #[cfg(windows)]
     crate::resubmit::signalled(this, fence, value);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
@@ -917,6 +921,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     #[cfg(windows)]
     if !this.is_null() {
         let now = crate::fence::completed(fence);
+        crate::timeline::ev("qwait", fence as u64, value);
         // Whether the title uses this at all (the first calls).
         {
             static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -994,6 +999,8 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
+        #[cfg(windows)]
+        crate::timeline::ev("bop", at as u64, value);
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
@@ -1037,6 +1044,10 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(windows)]
+    crate::timeline::present(FRAMES.load(Ordering::Relaxed) + 1);
+    #[cfg(windows)]
+    let _span = crate::timeline::span("present.", "present<", 0, 0);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::profile::frame();
     // Submissions sent to the card and not waited for are settled first,
@@ -1138,6 +1149,7 @@ extern "system" fn present(
             // wrong state, and the write-back undid the state it left
             // (Marvisak/VIctory pull request #3204).
             let shown = host.present(resource, frame);
+            crate::timeline::ev("shown", frame, 0);
             #[cfg(feature = "diagnostics")]
             blinks(frame, resource, 0x800, shown);
             #[cfg(not(feature = "diagnostics"))]

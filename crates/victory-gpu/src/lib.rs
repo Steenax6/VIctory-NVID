@@ -84,6 +84,8 @@ mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+pub mod timeline;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod writes;
