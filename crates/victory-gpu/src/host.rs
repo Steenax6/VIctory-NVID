@@ -6855,6 +6855,24 @@ impl HostList {
         }
     }
 
+    /// [`HostList::transition`] of a host copy a pass of ours holds itself
+    /// (the title's object may be gone): the state it was in, if not
+    /// `wanted` (legal for it).
+    pub(crate) fn transition_copy(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
+        let wanted = legal_state(&copy.texture, wanted);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, copy.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some(before)
+            }
+        }
+    }
+
     /// A draw or dispatch being prepared writes title texture `resource`
     /// through unordered access, by a view described by `words` (none: the
     /// default view): if it is of a kind copied back (`crate::texback`), the

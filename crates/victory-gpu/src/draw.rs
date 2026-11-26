@@ -1030,6 +1030,12 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        // The sky the stand-in for the indirect light may follow.
+        if let Some(&sky) = self.targets.first()
+            && p.stages.iter().any(|s| s.shader.ambient == Some(crate::ambient::Role::Sky))
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1175,7 +1181,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no host slots (none free, or past the host heap) is dropped");
@@ -2408,6 +2414,9 @@ impl State {
         if self.walker_held() {
             return;
         }
+        if self.idle_without_rays() {
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -2478,6 +2487,78 @@ impl State {
         // SAFETY (each piece): an open list with everything set.
         Self::run_pieces(list, true, Self::group_base_slot(p), x, |n| unsafe { list.list.Dispatch(n, y, z) });
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list, p);
+    }
+
+    /// Whether the bound program only serves rays that do not run and is
+    /// left out while the stand-in for their light is on
+    /// ([`crate::ambient::Role::ActivateRays`]).
+    fn idle_without_rays(&self) -> bool {
+        let idle = crate::ambient::on()
+            && crate::pipeline::has_ambient_role(self.pipeline as This, crate::ambient::Role::ActivateRays);
+        if idle {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!("ambient light: the program that activates the screen probes' rays is left out (no rays run)");
+            });
+        }
+        idle
+    }
+
+    /// After a dispatch of `p`: the stand-in for the indirect light, if `p`
+    /// is the program that resolves it or the reflections' last
+    /// ([`crate::ambient`]). Its pass binds a pipeline, root signature and
+    /// heap of its own: the next draw or dispatch sets the title's again.
+    fn ambient(&mut self, list: &HostList, p: &HostPipeline) {
+        use crate::ambient::Role;
+        let Some((stage, role)) = p
+            .stages
+            .first()
+            .and_then(|s| Some((s, s.shader.ambient.filter(|r| matches!(r, Role::Resolve | Role::Reflections))?)))
+        else {
+            return;
+        };
+        if !crate::ambient::on() {
+            return;
+        }
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let done = if role == Role::Reflections {
+            match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => {
+                    once!("ambient light: the reflections' program has no image where it was seen");
+                    false
+                }
+            }
+        } else {
+            match view(ResourceType::Uav, crate::ambient::LIGHT) {
+                Some(View::Unordered(r, ..)) if r != 0 => {
+                    let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+                        Some(View::Shader(d, _)) if d != 0 => Some(d as This),
+                        _ => None,
+                    };
+                    crate::ambient::replace(list, r as This, depth)
+                }
+                _ => {
+                    once!("ambient light: the resolve has no light image where it was seen");
+                    false
+                }
+            }
+        };
+        if done {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2870,11 +2951,19 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
@@ -2884,6 +2973,44 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and
+        // the title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            let twin = crate::descriptor::host::half_view(&view).is_some();
+            once!(
+                slot,
+                at,
+                twin,
+                view = ?view,
+                "a shader moves a buffer's 16-bit channels as unsigned integers (the first such view; twin: shown in the unsigned format of its layout)"
+            );
+            if twin {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own. Such a table
@@ -2960,6 +3087,11 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first).
+            selected.extend(half.iter().filter(|&&(s, _)| s == slot).map(|&(_, at)| at / 8));
             selected.sort_unstable();
             selected.dedup();
             let n = entries
@@ -2985,6 +3117,9 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    half.contains(&(slot, k * 8)).hash(&mut h);
                 }
                 (table, n, h.finish())
             };
@@ -3069,7 +3204,10 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -3348,7 +3486,7 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
-        if self.walker_held() {
+        if self.walker_held() || self.idle_without_rays() {
             return false;
         }
         const DRAW: u32 = 0;
@@ -3615,6 +3753,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.ambient(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

@@ -168,6 +168,31 @@ Ryzen 7 9800X3D (16 threads) with an RTX 4070 Ti, 14 cut the intro's time
 below 1 fps on an empty cache from 55 s to 6-12 s; 16 was no better than the
 default.
 
+## Light where no rays run
+
+`VICTORY_AMBIENT` (on by default; `=off`: the game's own output): the game
+fills its indirect light by tracing rays, which do not run while the
+structure builder is off, so whatever the sun does not reach directly is
+black. A small pass of ours replaces the screen probes' resolved light
+with a stand-in: a level times a warm white, shaded in creases and under
+objects from the scene's depth, which the game's lighting then applies
+with each surface's colours. The reflections, which without rays mirror
+the open sky indoors, are held to half of that light, and the program that
+asks the probes for rays is left out. The value is the level: unset 0.3
+(the level that came within 2 to 4 display-luma steps of console footage
+of the prison, Marvisak/VIctory pull request #2619; 0.6 looked balanced by
+eye on an RTX 4070, fxceless/victory-fork pull request #1093), a number of
+its own, or `sky` for a level that follows the sky the game draws (night
+to noon; Belobug/VIctory-Belobug-AMD). `VICTORY_AMBIENT_TINT=r,g,b`,
+`VICTORY_AMBIENT_SHADE=strength,radius,near,tan` (strength 0: no shading),
+`VICTORY_AMBIENT_REFLECT=most,least` (parts of the level; `0`: the
+reflections as the game has them) and `VICTORY_AMBIENT_SKY=gain,least,power`
+tune it; `VICTORY_AMBIENT_PROGRAMS=<hash>=resolve,...` names the programs
+for another build of the game. It is off whenever `VICTORY_BVH_BUILDER=1`.
+The log says "ambient light: stands in for the indirect light while no
+rays run" once with the level, then the reflections' and the left-out
+program's lines.
+
 ## Textures the game reads back
 
 `VICTORY_TEXTURE_BACK` (on by default): textures the game's shaders write

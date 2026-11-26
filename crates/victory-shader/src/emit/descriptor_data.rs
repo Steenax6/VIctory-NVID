@@ -5,7 +5,7 @@
 
 use super::{
     Attr, Bin, Fields, Inst, Lower, Operand, Reg, ResourceType, Role, Site, Source, UsedResource, V,
-    Val, Why,
+    Val, Why, host_kind,
 };
 
 impl<'a> Lower<'a> {
@@ -99,14 +99,24 @@ impl<'a> Lower<'a> {
                         5 => 7,
                         _ => return Err("an image dimension (cube or MSAA)"),
                     };
-                    ((kind | u, 0x409), Some(kind))
+                    // Declared 2D for a 1D (array), as `image` reads them.
+                    ((host_kind(kind) | u, 0x409), Some(kind))
                 }
                 Fields::Buffer { idxen, format, .. } => {
                     let stride = used.map_or(0, |u| u.stride);
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
-                        (10 | u, 0x409)
+                        // (Unsigned integers where the access moves halves:
+                        // `Self::places_read_as_halves`.)
+                        let halves = self
+                            .table_place(&Source::Loaded { load: site, first })
+                            .is_some_and(|p| {
+                                self.halves_only.contains(&p)
+                                    && (un.contains("_format_d16_")
+                                        || self.format_load_read_as_halves(ui))
+                            });
+                        (10 | u, if halves { 0x405 } else { 0x409 })
                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
                     {
                         (12 | u, stride)
@@ -216,7 +226,8 @@ impl<'a> Lower<'a> {
                 let (height, depth) = match kind {
                     1 => (one, one),
                     2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
+                    // The 2D array's layers (its third place).
+                    6 => (one, field(self, 2)),
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
