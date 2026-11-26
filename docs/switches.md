@@ -52,6 +52,7 @@ frame pressed for the game's next read.
 | `VICTORY_INDIRECT_HOIST`, `VICTORY_INDIRECT_HOIST_ALL` | single indirect records are clamped in their list's prelude, one pass for all records of a buffer, where no shader of the list has declared a write over them (some 1,900 of 4,700 a frame; each used to be a compute pass of ours between two draws) |
 | `VICTORY_INDIRECT_WINDOW_SIZES=16,64`, `VICTORY_INDIRECT_WINDOW_KEEP` | windows of records clamped ahead grow 64, 256, 1024 and outlive direct draws whose shaders store nothing |
 | `VICTORY_FILL_HOT`, `VICTORY_FILL_DIRECT`, `VICTORY_LATE_COPY` | only reads of the 64 KiB of title memory where shaders were seen to change bytes under a fill wait for flights (one such fill used to make every fill wait); constants there are bound from the buffer's host copy; a title buffer copy out of such memory is done when its submission lands |
+| `VICTORY_LATE_COPY_ORDER` (2026-11-26, not measured in the game yet; `0`: as before) | a title buffer copy done when its submission lands (`VICTORY_LATE_COPY`) keeps its place: if a later step of its submission touches its destination (a refresh of a host copy, a fill, a texture, another copy, a range given to shaders) it is made at the submission, behind the wait for the submissions its source needs, and a later submission that reads where such a copy is still to land waits for that landing. Before, those steps read the bytes from before the copy (Marvisak/VIctory pull request #2810 names the order). Both are waits `VICTORY_LATE_COPY` had removed; the line "title buffer copies out of memory shaders write" counts them, and `0` is there to measure what the order costs |
 | `VICTORY_CARD_CONSTANTS` (2026-11-26; in every run since, not measured on its own) | constant buffers of fresh descriptor tables that lie in a host copy in the card's memory are bound there, not filled into upload memory behind the flights (theinkbit/victory-lot9-next ffd04e130) |
 | `VICTORY_HEAP_SYNC_FAST`, `VICTORY_DESCRIPTOR_STRIPES` | descriptor records the title copies into its heap are found by the write watch's 4 KiB pages and mirrored in runs; slots have striped locks, so recording threads no longer stand behind that pass |
 | `VICTORY_SHADOW_CACHE` | recording threads remember which host copy an address range has |
@@ -63,6 +64,7 @@ frame pressed for the game's next read.
 | `VICTORY_PIPELINE_FIX`, `VICTORY_VIEW_RAW_OWN_COPY` | a pipeline the host refuses as the title described it is made again with its state put right (blending on integer targets and the like: the one mesh pipeline refused in the first room); a raw buffer view whose bytes do not start on 16 gets a copy of its own bytes instead of reading zeros |
 | `VICTORY_CARD_FINE`, `VICTORY_CARD_WIDE_HASH`, `VICTORY_CARD_SYNC_BATCH`, `VICTORY_MERGE_PAGES`, `VICTORY_FAST_MERGE`, `VICTORY_WIDE_COMPARE`, `VICTORY_BURY_ASIDE` | shader writes to copies in the card's memory are found per 4 KiB block (was 64 KiB), fetched as runs and merged where they differ; title bytes under flights go up a page at a time where shaders never wrote |
 | `VICTORY_EXCHANGE_PARITY` (2026-11-26; not yet measured in the game) | a 64-lane compute program run as two 32-lane host waves exchanges values through two pairs of group-memory dwords per console wave, taken in turn, so each exchange costs one group barrier instead of two (the second only kept the dwords from being rewritten before every thread had read them). Two more dwords of group memory per console wave. Changes translated shaders: the shader cache keys on it |
+| `VICTORY_MERGE_BLOCK_RUNS=32` (2026-11-26, not measured in the game yet; `0`: as before) | a 4 KiB block the title rewrites in more than 32 places while a submission sent ahead may write its buffer goes up as one run, and where a page still has more changed runs than a submission sends (`VICTORY_MERGE_RUNS`, 512) its fullest blocks do too: the submissions in the air are no longer waited for over it. That wait came once a frame in the first room, 12.5 ms of the submitting thread: the title's per-draw constants, rewritten in blocks a shader had once written, differ from the old ones in 42,700 runs of some six bytes a frame. Raising `VICTORY_MERGE_RUNS` instead turned the wait into 42,000 copies a frame and was no faster (74.6 against 78.6 ms a frame). The line "census, title bytes under flights' shader writes" of a diagnostics build counts the blocks sent so that a submission then in the air turned out to have written: 0 says the rule lost nothing |
 | `VICTORY_SYNC_BARRIER` (2026-11-26; in every run since, not measured on its own) | a pipeline sync in the title's list waits for every shader write before it (one unordered access barrier), where it did nothing: dispatches that read what the one before wrote no longer overlap it (avatarmanz/VIctory-7900XTX `0b5f191b8`, Marvisak/VIctory pull request #1228). The log names the first eight syncs; `=0` is there to measure what the barriers cost on the card |
 | `VICTORY_WAVE_LOCAL_FIRST` (2026-11-26; not yet measured in the game) | a 64-lane compute program whose only wave operations are the allocation idiom (the first lane reserves the wave's count on a counter, each lane takes the base plus the lanes below) runs each 32-lane host wave on its own, without group barriers, before the forms whose two host waves meet at barriers to exchange: each half reserving its own slots is exact. Not where a first-lane read takes a value that differs between lanes. A light-probe allocation program had 33 barriers and 3.7 ms of card time a frame for 272 instructions. `VICTORY_WAVE_WHY=1` prints `WAVE64-MEETINGS` and `WAVE64-LOCAL-FIRST` lines. Changes translated shaders: the shader cache keys on it |
 | `VICTORY_EARLY_DEPTH` (2026-11-26; not yet measured in the game) | a pixel program the console tests depth and stencil before (`[earlydepthstencil]`, `DEPTH_BEFORE_SHADER` in its `DB_SHADER_CONTROL`) gets the same order on the host (`ForceEarlyDepthStencil`): before, a host ran such a program for hidden pixels too where it writes views or discards, and kept those writes (Marvisak/VIctory pull request #2085). Part of the translation: a change re-translates every program |
@@ -80,6 +82,40 @@ of 74-78, the frame line's copies from 17.5 to 26 ms, the picture the same
 (fxceless/victory-fork c36971b measured 68.0 to 49.8 ms of card time a
 frame on an RTX 4070). A line with the frame-rate line says how many copies
 went where, by size.
+
+`VICTORY_LAND_BESIDE` (2026-11-26; on, `=0`: as before; the first room
+75.5 to 68.7 ms a frame, preparing 55.1 to 42.2 ms, copying back 36.0 to
+29.8 ms, the faces clean, and with `=2` no write of 2,580 a frame there
+and 3,856 a frame in the open world's bedroom that was not at the title's
+address):
+what shaders wrote goes into title memory through a view of the layer's
+own of the same pages, beside the guards, wherever the title's address is
+a view of physical pages; the guarded blocks under it count as written
+and stay read-only. Until now a landing opened every guarded block it
+wrote into and the block's next check guarded it again: in the first room
+all 781 guarded blocks opened a frame were opened by landings, none by
+the title, with 3.8 ms a frame of the landing thread and 4.6 ms of the
+submitting thread in changes of protection (census and profile of
+2026-11-26). `=2` also reads every such write back through the title's
+address and counts those that are not there. With it the line "landings
+beside the guards per frame" says how many writes went that way, and the
+census's "guarded blocks opened by the layer's own writes" should fall to
+nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
+pull request 3069; this tree's own code).
+
+`VICTORY_REFRESH_EVENTS` (2026-11-26; off, not run in the game yet): a
+copy in view memory is not asked about again while nothing happened in
+its memory since it was last brought up to date. What can make a guarded
+block count as written (a write that faults, one of ours that opens or
+marks it, a new mapping, a page the journal notes) raises a count for
+its 4 MiB of title memory, and a copy remembers the counts of the range
+it last brought up to date. `=2` is the check: every refresh is asked as
+before, and each one that `=1` would have left out and that found bytes
+to copy is counted and named ("a refresh found bytes to copy where no
+event was counted"); the line "refreshes by event" must say 0 of those
+in the prologue and at the open world's entry and in its bedroom before
+`=1` is used. Copies in private memory are asked as before: only the
+kernel knows what was written there.
 
 ## Pipelines
 
@@ -385,7 +421,14 @@ Diagnostics build: `cargo build --profile diag -p victory --features diagnostics
 | `VICTORY_MESH_LINK=0` | mesh programs over 32 KiB are not linked with their pixel program (upstream pull request #854) |
 | `VICTORY_CODE_IN_USE=0` | no measure of the shader code the host pipelines hold in the driver (on by default, release builds too, and cheap: one `GetCachedBlob` per pipeline where it is made). The periodic line `shader code of pipelines in use` gives the sum of the cached blobs' sizes of the pipelines bound at least once and not yet released, the most so far, and the sum of those made and never bound; a warning is logged once at 300, 400 and 450 MB. The blob is a proxy for the driver's machine code (it holds other state as well). NVIDIA drivers were measured elsewhere to remove the device at 512 MB of code in use (about 448 MB of blob in 262 pipelines at the point of removal) |
 | `VICTORY_GPU_TIMING=1` + `VICTORY_D3D12_DRED=1` | the card's time per command and per pass of ours (diagnostics build; submissions are waited for, so not for frame rate); `VICTORY_TIMING_LINES=<n>` lists that many commands |
+| `VICTORY_D3D12_ADAPTER=<n or text>` | the card the host device is made on. By default the one the system ranks first for performance (never a software adapter), where the runtime used to take the first one it lists (a processor's own graphics could come first); the log says at start `host adapter: <name> (vendor ..., .. MiB dedicated video memory)`. A number is the place in the system's ranking (0 is the default), text is part of an adapter's name (`rtx`); a value that names none is logged and ignored (Marvisak/VIctory pull request #3073) |
+| `VICTORY_TITLE_PRIORITIES=0` | the title's threads keep the priorities it sets. By default its idle and lowest threads (its streaming pager's among them) run below normal: at idle they ran once in four seconds or so while every processor was busy, and the loading that waits for them with them (Marvisak/VIctory pull request #2903; not measured here yet, so this is the switch for a comparison). The log names the first 16 such calls (`a title thread's idle or lowest priority is set below normal`) |
+| `VICTORY_CRASH_DUMP_DIR=<dir>` | on an unhandled exception, a full-memory minidump of the process (every thread, the exception named in it) is written to `<dir>\crash-<time>-<pid>.dmp`, and the crash log says where and how big. Opt-in: the dump is the size of the process (20 to 26 GB here) and holds the title's code and data, so it stays on this machine and takes room and time before the process ends (the log line gives both). A directory below the source tree, or inside any copy of it (a `.victory-root` above it), is refused and the crash log says so. dbghelp is loaded only then (Geckomacabre/vx-layer 707b75be0) |
+| `VICTORY_MAP_LEAN=1` | an experiment, off until measured in the world: mapping the title's physical pages asks the host only for what it needs. A view mapped where an unmap of exactly that range left its placeholder is mapped over it at once, without looking at or splitting placeholders (the host refuses and the range is split as before if the title joined it with others since); section pages already committed through another view are not committed again. Both save calls that wait for the process's address-space lock behind the GPU side's guards and the driver; 6.5 to 5.0 us a page without contention on the author's machine, the gain under the lock in the world is the fork's claim (200 to 400 us a page there), not measured here. Compare with and without in the frame line and the streaming of the first room (Marvisak/VIctory pull request #2916 from avatarmanz/VIctory-7900XTX 49d7126) |
+| `VICTORY_DSTORAGE_STAGING_MB=<n>` | at least `n` MiB of compressed bytes of DirectStorage requests in flight, where the title asks for the console's 32 MiB (the limit only counts, nothing is allocated for it; a request larger than it still runs alone). Unset: as the title asks. fxceless/victory-fork issue #1268 ran with 256 for loading (a cold world entry at 94.6 s, together with other changes, so its own share is not known; not measured here). The log says `dstorage: staging limit at least this` when it applies |
 | `VICTORY_WINDOW_MAX=1920x1080` | largest size of the game window; unset, it is fitted to the screen's work area. The game's render targets keep their size |
+
+`cargo xtask refusals <log>` says what a run lost and why, from its log (`%TEMP%\steenax.log` after `scripts\play.ps1`): the pipelines the host refused, grouped by shaders; the debug layer's reasons for them (only in a run with `VICTORY_D3D12_DEBUG=1`, diagnostics build); the shaders that do not translate; and, in a diagnostics build's log, the draws and dispatches dropped a frame for want of a host pipeline, by reason (Marvisak/VIctory pull request #2892).
 
 Two more lines come with the frame-rate line, without a switch (counters only, nothing waits):
 

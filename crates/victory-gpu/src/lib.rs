@@ -16,7 +16,11 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod adapter;
+#[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod beside;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -50,6 +54,8 @@ pub mod pipeline;
 mod placed;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod rawrange;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;

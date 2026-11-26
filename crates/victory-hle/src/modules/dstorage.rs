@@ -224,7 +224,7 @@ extern "system" fn create_queue(
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = staging_limit(u64::from(size));
     }
     S_OK
 }
@@ -337,6 +337,31 @@ const COST: [u64; 3] = [100, 10, 1];
 /// The console's default staging buffer.
 const STAGING: u64 = 32 << 20;
 
+/// The staging limit for a title that asks for `asked` bytes: that, but not
+/// less than `VICTORY_DSTORAGE_STAGING_MB` (unset: as asked). The limit only
+/// counts compressed bytes of requests in flight, none is allocated for it:
+/// a larger one lets more requests of a busy queue read at once, where the
+/// console's 32 MiB held them back (fxceless/victory-fork issue #1268 ran
+/// with 256).
+fn staging_limit(asked: u64) -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    let floor = *FLOOR.get_or_init(|| {
+        let floor = std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |mb| mb.saturating_mul(1 << 20));
+        if floor > 0 {
+            tracing::info!(floor, "dstorage: staging limit at least this (VICTORY_DSTORAGE_STAGING_MB)");
+        }
+        floor
+    });
+    staging_limit_with(asked, floor)
+}
+
+fn staging_limit_with(asked: u64, floor: u64) -> u64 {
+    asked.max(floor)
+}
+
 struct Lanes {
     lanes: HashMap<u64, Lane>,
     next_id: u64,
@@ -415,7 +440,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_limit(STAGING),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -1750,6 +1775,13 @@ mod tests {
         assert_eq!(started[1] + started[2], 300, "{started:?}");
         assert_eq!(started[0], 30, "{started:?}");
         assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
+    }
+
+    #[test]
+    fn the_staging_limit_has_a_floor() {
+        assert_eq!(staging_limit_with(STAGING, 0), STAGING, "unset: as the title asks");
+        assert_eq!(staging_limit_with(STAGING, 256 << 20), 256 << 20);
+        assert_eq!(staging_limit_with(512 << 20, 256 << 20), 512 << 20, "never below what is asked");
     }
 
     #[test]

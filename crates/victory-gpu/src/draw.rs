@@ -458,6 +458,13 @@ pub(crate) fn take_frame() -> Vec<String> {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
+
+/// The same count as it stands, not taken, and the draws run on the host
+/// so far: for the report of a removed device (`crate::host`), which asks
+/// whether the lists on the card ran with passes of the title's missing.
+pub(crate) fn dropped_now() -> (u64, u64) {
+    (DROPPED.load(Ordering::Relaxed), DRAWN.load(Ordering::Relaxed))
+}
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
@@ -476,6 +483,56 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Per host heap, by its address: the host copy and range each slot's
+/// buffer view reads, kept from pass to pass by the pass over the heap's
+/// buffer views (`heap_buffers`), and the passes made over that heap.
+type HeapRanges = crate::descriptor::slots::SlotMap<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+static HEAP_RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, HeapRanges)>>> =
+    std::sync::Mutex::new(None);
+/// The host heaps that went since the pass last looked ([`forget_heap_ranges`]).
+static HEAPS_GONE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// A host heap goes: what the pass over its buffer views kept for it goes
+/// too. The table is keyed by the heap's address and holds a reference to
+/// the host copy of every buffer a slot viewed: left there, the copies of a
+/// heap the title had released stayed in the card's memory for good, and a
+/// heap made later at the same address took the old one's ranges for its
+/// own until the pass next looked at every slot (each sixteenth)
+/// (fxceless/victory-fork pull request 1276 found it there).
+///
+/// The pass holds the table for its whole length, on a recording thread
+/// (some 20 ms a frame), and this is called wherever the title lets the
+/// heap go: the heap is noted, and taken out here only if the table is
+/// free; else by the pass, before it looks the next heap up.
+pub(crate) fn forget_heap_ranges(heap: &crate::descriptor::host::HostHeap) {
+    HEAPS_GONE.lock().unwrap_or_else(|e| e.into_inner()).push(std::ptr::from_ref(heap) as usize);
+    let gone = match HEAP_RANGES.try_lock() {
+        Ok(mut kept) => heaps_gone(&mut kept),
+        Err(std::sync::TryLockError::Poisoned(e)) => heaps_gone(&mut e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Vec::new(),
+    };
+    // (Let go with the table free again: a copy's last reference releases
+    // memory of the card.)
+    drop(gone);
+}
+
+/// Takes what is kept for the heaps that went out of `kept`.
+fn heaps_gone(kept: &mut Option<std::collections::HashMap<usize, (u64, HeapRanges)>>) -> Vec<HeapRanges> {
+    let gone = std::mem::take(&mut *HEAPS_GONE.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(kept) = kept.as_mut() else {
+        return Vec::new();
+    };
+    let ranges: Vec<HeapRanges> = gone.iter().filter_map(|heap| kept.remove(heap)).map(|(_, ranges)| ranges).collect();
+    let views: usize = ranges.iter().map(|r| r.len()).sum();
+    if views > 0 {
+        tracing::info!(
+            "{} view heaps went with {views} buffer views the pass over picked buffer views had kept the host copies of: let go",
+            ranges.len()
+        );
+    }
+    ranges
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1260,6 +1317,14 @@ impl State {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
+                // A builder stage that would read zeros where its pages are
+                // is a dropped stage: the builder stops instead of handing
+                // the title structures and results it never wrote
+                // (fxceless/victory-fork pull request #1265, issue #1257).
+                if !ready.whole && crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("title memory by address has no number left for another copy");
+                    return false;
+                }
                 Some(ready)
             } else {
                 None
@@ -1680,14 +1745,15 @@ impl State {
         // before its memory had a host copy is only made then.
         // (By slot with a multiply for a hash, not SipHash: the pass looks
         // at tens of thousands of slots a frame, on a recording thread.)
-        type Ranges = crate::descriptor::slots::SlotMap<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        // (Declared before the table's guard, so let go after it: what was
+        // kept for heaps that went, [`forget_heap_ranges`].)
+        let _gone: Vec<HeapRanges>;
+        let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        _gone = heaps_gone(&mut kept);
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::default()));
+            .or_insert_with(|| (0, HeapRanges::default()));
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
@@ -1840,7 +1906,7 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            shadow.refresh_as(list, *from, to - from, crate::shadow::ASKED_BY_PICKED);
         }
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
@@ -4384,6 +4450,40 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view heap that goes takes with it what the pass over picked buffer
+    /// views kept for it: the table's reference to each buffer's host copy
+    /// is let go, and nothing is left under the heap's address for a heap
+    /// made there later (fxceless/victory-fork pull request 1276).
+    #[test]
+    fn a_view_heap_that_goes_lets_go_of_what_the_pass_kept_for_it() {
+        use crate::descriptor::host::HostHeap;
+        if crate::host::host().is_none() {
+            return;
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let heap = Box::new(heap);
+        let key = std::ptr::from_ref(heap.as_ref()) as usize;
+        let memory = crate::resource::Memory::zeroed(4096, 4096).expect("a test buffer");
+        let start = memory.address();
+        crate::shadow::register(start as usize, start, 4096);
+        let copy = crate::shadow::find(start, 4096).expect("a host copy");
+        let table = || HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ranges = HeapRanges::default();
+        ranges.insert(0, (copy.clone(), start, start + 4096));
+        table().get_or_insert_with(Default::default).insert(key, (1, ranges));
+        let held = std::sync::Arc::strong_count(&copy);
+        drop(heap);
+        // (Had a pass of another test held the table just then, the heap
+        // was only noted: the next pass takes it out first, as here.)
+        let gone = heaps_gone(&mut table());
+        drop(gone);
+        assert!(!table().as_ref().is_some_and(|kept| kept.contains_key(&key)), "nothing is kept under the heap's address");
+        assert_eq!(std::sync::Arc::strong_count(&copy), held - 1, "the table's reference to the copy is let go");
+        crate::shadow::unregister(start as usize, start);
+    }
 
     /// A list binds a heap of each kind before its root signature: the
     /// title's where it has one, ours for a kind it binds none of, and never
