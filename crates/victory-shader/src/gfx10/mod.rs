@@ -208,6 +208,10 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
+            // `v_nop`, `v_pipeflush` and `v_clrexcp` take no source: their
+            // SRC0 field holds what the console compiler stored there (a
+            // shader hash), never a literal's or extension's marker.
+            0x3F if matches!((w >> 9) & 0xFF, 0x00 | 0x1B | 0x41) => (Encoding::Vop1, (w >> 9) & 0xFF, 1),
             0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
@@ -350,6 +354,24 @@ mod tests {
             .iter()
             .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
             .collect()
+    }
+
+    /// The VOP1s without a source are one dword whatever their SRC0 field holds: 0xFF
+    /// (a literal's marker) and 0xF9 (SDWA's) do not take the next instruction with them.
+    #[test]
+    fn vop1_without_sources_is_one_dword() {
+        for (word, name) in [
+            (0x7E00_00FF, "v_nop"),
+            (0x7E00_36FF, "v_pipeflush"),
+            (0x7E00_82F9, "v_clrexcp"),
+        ] {
+            assert_eq!(summary(&[word, S_ENDPGM]), [(0, 1, name), (4, 1, "s_endpgm")]);
+        }
+        // (a VOP1 with a source still takes its literal)
+        assert_eq!(
+            summary(&[0x7E00_02FF, 0x3F80_0000, S_ENDPGM]),
+            [(0, 2, "v_mov_b32"), (8, 1, "s_endpgm")]
+        );
     }
 
     #[test]

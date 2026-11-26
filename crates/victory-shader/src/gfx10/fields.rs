@@ -466,7 +466,8 @@ impl Instruction {
                         v.neg = (ext >> 20 & 1 | ext >> 27 & 2) as u8;
                         v.abs = (ext >> 21 & 1 | ext >> 28 & 2) as u8;
                         if compare {
-                            if ext >> 15 & 1 == 1 {
+                            // (`v_cmpx` has no SDST in SDWA: it writes EXEC)
+                            if ext >> 15 & 1 == 1 && !name.starts_with("v_cmpx") {
                                 v.dst = Some(scalar((ext >> 8 & 0x7F) as u8, lanes));
                             }
                             v.sdwa = Some(Sdwa {
@@ -589,7 +590,10 @@ impl Instruction {
                     }
                 }
                 let vdst = w0 & 0xFF;
-                v.dst = Some(if compare {
+                v.dst = Some(if name.starts_with("v_cmpx") {
+                    // GFX10's VOP3 `v_cmpx` writes EXEC and ignores VDST.
+                    scalar(EXEC, lanes)
+                } else if compare {
                     scalar(vdst as u8, lanes)
                 } else {
                     valu_dst(name, vdst, dst_n)

@@ -1095,6 +1095,40 @@ fn paired_lanes_loop_apart_and_meet_the_other_wave_at_the_barrier() {
     eprintln!("ran on the hardware device: two console waves, their loops and LDS as on the console");
 }
 
+/// One console wave whose lane 0 alone (the upper half has no lane in that arm) writes a dword
+/// of LDS after a chain of multiplies, as the water's transmission volumetrics give a group's
+/// one value to its lanes; past the join every lane reads it, with no barrier. On NVIDIA a
+/// fence alone let threads read before lane 0's thread had written (whole groups of the
+/// title's output zero, others each frame): the group of one host wave now waits there.
+/// Run 64 times, since a thread running ahead is a matter of timing.
+#[test]
+fn paired_lanes_read_what_one_lane_wrote_while_the_other_half_had_no_lane_there() {
+    let mut w = vec![
+        vop1(0x01, 1, k(0)),       // v_mov_b32 v1, 0: the dword every lane uses
+        vop1(0x01, 4, LIT),        // v_mov_b32 v4, 0x1234
+        0x1234,
+        vopc(0xC2, k(0), 0),       // v_cmp_eq_u32 vcc, 0, v0: lane 0
+        sop1(0x24, 12, VCC),       // s_and_saveexec_b64 s[12:13], vcc
+        sopp(0x08, 18),            // s_cbranch_execz past lane 0's arm
+    ];
+    for _ in 0..8 {
+        w.extend(vop3(0x169, 4, v(4), k(3))); // v_mul_lo_u32 v4, v4, 3
+    }
+    w.extend(ds(0x0D, 0, 1, 4, 0)); // ds_write_b32 v1, v4
+    w.push(sop1(0x04, EXEC, 12)); // s_mov_b64 exec, s[12:13]
+    w.extend(ds(0x36, 6, 1, 0, 0)); // ds_read_b32 v6, v1
+    w.extend(stores([6, 6, 6, 6]));
+    let shader = paired(&native_with(&w, true, 64, 256));
+    let value = 0x1234u32.wrapping_mul(3u32.pow(8));
+    let want = vec![value; 256];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..64 {
+        let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+        same_as_console(&got, &want);
+    }
+    eprintln!("ran on the hardware device: every lane read what lane 0 wrote, 64 times");
+}
+
 /// One console wave: `ds_bpermute_b32` from the mirror lane; a DPP row shift whose row mask
 /// leaves rows 0 and 3 alone (rows 2 and 3 are lanes 32-63: rows are counted in console lanes); a
 /// `ds_swizzle_b32` swapping the two 16-lane rows of each 32 lanes; `v_writelane_b32` of s0
@@ -1277,4 +1311,328 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     };
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
+}
+
+/// SCC of a mask operation read as data (`s_cselect_b32` after `s_and_b64 s[12:13], exec,
+/// vcc`): 1 where some lane of the console wave is below s0, else 0. Its SCC has no value
+/// of its own; it is the wave's "some lane has the bit" (`Lower::scc_some`), and a host of
+/// 32-lane waves asks both halves. (After codec-d/cool_fox 8cc31ab, codec_d.)
+#[test]
+fn an_scc_of_a_mask_operation_selects_by_the_whole_console_wave() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0x878C_6A7E, // s_and_b64 s[12:13], exec, vcc
+        0x8507_8081, // s_cselect_b32 s7, 1, 0
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for host_wave in [32, 64] {
+        let shader = lowered_on(&native, &p, &HashSet::new(), host_wave).unwrap_or_else(|e| panic!("{host_wave} lanes: {e}"));
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        if host_wave != 32 {
+            continue;
+        }
+        for (s0, want) in [(0, 0), (1, 1), (64, 1)] {
+            let Some(got) = on_the_card(&shader, [s0, 0]) else {
+                return;
+            };
+            assert_eq!(got, want, "s0 = {s0}");
+        }
+        // only lane 40 below: none of the first host wave's lanes
+        let shader_at = |words: &[u32]| {
+            let n = super::wave64_tests::native(words);
+            let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+            lowered_on(&n, &p, &HashSet::new(), 32).expect("lower")
+        };
+        let only_40 = shader_at(&[
+            0x7D84_0000, // v_cmp_eq_u32 vcc, s0, v0
+            0x878C_6A7E,
+            0x8507_8081,
+            0x7E00_0207,
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16,
+        ]);
+        if let Some(got) = on_the_card(&only_40, [40, 0]) {
+            assert_eq!(got, 1, "a lane of the other host wave");
+        }
+    }
+}
+
+/// An SGPR spilled to a lane of a VGPR that the program also uses as a vector (so not one
+/// `ir::unspill` makes scalar moves of) and read back in the same block, inside a per-lane
+/// branch: the read is the spilled SGPR, wherever the lane it names is (here in the other
+/// host wave of 32, or out of EXEC) and whatever the VGPR's other lanes hold. Before, a
+/// lane read where not every lane runs stopped the program on such a host.
+/// (After codec-d/cool_fox 8cc31ab, codec_d.)
+#[test]
+fn an_sgpr_restored_from_a_lane_in_its_block_is_the_sgpr() {
+    let words = [
+        0x7E12_0300, // v_mov_b32 v9, v0 (v9 a vector too: not only parked lanes)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0009, // s_cbranch_execz to the restore of EXEC
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xD761_0009,
+        0x0001_6606, // v_writelane_b32 v9, s6, 51
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xD760_0007,
+        0x0001_6709, // v_readlane_b32 s7, v9, 51
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    assert_eq!(res.restored_lanes.len(), 1);
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for s0 in [1, 40, 64] {
+        let Some(got) = on_the_card(&shader, [s0, 0xABCD]) else {
+            return;
+        };
+        assert_eq!(got, 0xABCD, "s0 = {s0}");
+    }
+}
+
+// ---- exchanges of two host waves, one group barrier each (`VICTORY_EXCHANGE_PARITY`) ----
+
+/// `native` lowered for a host of 32-lane waves with the exchanges' two pairs of dwords taken
+/// in turn (`parity`) or one pair and a second barrier, validated by `dxil.dll` when present;
+/// with the group barriers the lowering added.
+fn lowered_with_parity(native: &NativeProgram, parity: bool) -> (HostShader, u32) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let was = lower::TEST_EXCHANGE_PARITY.replace(Some(parity));
+    lower::TEST_SYNCS.set(0);
+    let shader = lowered(native, &p, &HashSet::new());
+    let syncs = lower::TEST_SYNCS.get();
+    lower::TEST_EXCHANGE_PARITY.set(was);
+    let shader = shader.expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    (shader, syncs)
+}
+
+/// Lanes 40, 5, 63 and 33 of v2 = 7 t read one after another (`v_readlane_b32`, each an
+/// exchange of the two host waves), their sum stored by every thread.
+fn four_lane_reads(threads: u32, lds: u32) -> NativeProgram {
+    let mut w = vec![];
+    w.extend(vop3(0x169, 2, v(0), k(7))); // v_mul_lo_u32 v2, v0, 7
+    for (s, lane) in [(14, 40), (15, 5), (16, 63), (17, 33)] {
+        w.extend(vop3(0x360, s, v(2), k(lane))); // v_readlane_b32 s<s>, v2, <lane>
+    }
+    w.extend([
+        sop2(0x00, 14, 14, 15), // s_add_u32 s14, s14, s15
+        sop2(0x00, 14, 14, 16), // s_add_u32 s14, s14, s16
+        sop2(0x00, 14, 14, 17), // s_add_u32 s14, s14, s17
+        vop1(0x01, 9, 14),      // v_mov_b32 v9, s14
+    ]);
+    w.extend(stores([9, 9, 9, 9]));
+    native_with(&w, true, threads, lds)
+}
+
+/// Each exchange of two host waves costs one group barrier, not two (besides the entry's,
+/// where the host waves take their console threads: `wave_base`).
+#[test]
+fn an_exchange_of_the_halves_costs_one_group_barrier() {
+    // (the largest group, with LDS up to the last granule that leaves room for the pairs)
+    for (threads, lds) in [(64, 0), (128, 0), (256, 0), (1024, 31 * 1024 + 512)] {
+        let native = four_lane_reads(threads, lds);
+        assert_eq!(lowered_with_parity(&native, false).1, 1 + 8, "{threads} threads, one pair");
+        assert_eq!(lowered_with_parity(&native, true).1, 1 + 4, "{threads} threads, two pairs");
+    }
+    // a group of 32 threads has no other half to exchange with
+    let native = four_lane_reads(32, 0);
+    assert_eq!(lowered_with_parity(&native, true).1, 1);
+}
+
+/// Lane reads of a straight run on the card, in both forms.
+#[test]
+fn lane_reads_one_after_another_are_the_consoles_with_one_barrier_each() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for threads in [64u32, 256] {
+        let native = four_lane_reads(threads, 0);
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|t| {
+                let base = t & !63;
+                let sum = [40, 5, 63, 33].iter().map(|l| 7 * (base + l)).sum::<u32>();
+                [sum; 4]
+            })
+            .collect();
+        for parity in [false, true] {
+            let (shader, _) = lowered_with_parity(&native, parity);
+            let Some(got) = run_paired(&shader, [0; 4], 4 * threads) else { return };
+            same_as_console(&got, &want);
+        }
+    }
+    eprintln!("ran on the hardware device: lane reads of both halves, with one and two barriers");
+}
+
+/// A group of two console waves (128 threads). v2 = 7 t; a loop the wave runs s0 times (at
+/// least once; its branch is on a scalar) adds 1 to v2 and lane 40's v2 to v4, one exchange a
+/// round, so the pair an exchange takes after the loop depends on the count; a branch on s1
+/// (the group's) around a read of lane 63 added to v4; past the join lane 5's v2. Each thread
+/// stores v2, v4 and lane 5's value.
+fn exchanges_in_a_loop_and_a_branch() -> NativeProgram {
+    let mut w = vec![];
+    w.extend(vop3(0x169, 2, v(0), k(7))); // v_mul_lo_u32 v2, v0, 7
+    w.extend([
+        vop1(0x01, 4, k(0)),    // v_mov_b32 v4, 0
+        sop1(0x03, 20, k(0)),   // s_mov_b32 s20, 0
+        vop2(0x25, 2, k(1), 2), // loop: v_add_nc_u32 v2, 1, v2
+    ]);
+    w.extend(vop3(0x360, 14, v(2), k(40))); // v_readlane_b32 s14, v2, 40
+    w.extend([
+        vop2(0x25, 4, 14, 4),     // v_add_nc_u32 v4, s14, v4
+        sop2(0x00, 20, 20, k(1)), // s_add_u32 s20, s20, 1
+        0xBF0A_0014,              // s_cmp_lt_u32 s20, s0
+        sopp(0x05, -7),           // s_cbranch_scc1 loop
+        0xBF06_8001,              // s_cmp_eq_u32 s1, 0
+        sopp(0x05, 3),            // s_cbranch_scc1 past the read of lane 63
+    ]);
+    w.extend(vop3(0x360, 15, v(2), k(63))); // v_readlane_b32 s15, v2, 63
+    w.push(vop2(0x25, 4, 15, 4)); // v_add_nc_u32 v4, s15, v4
+    w.extend(vop3(0x360, 16, v(2), k(5))); // v_readlane_b32 s16, v2, 5
+    w.push(vop1(0x01, 9, 16)); // v_mov_b32 v9, s16
+    w.extend(stores([2, 4, 9, 9]));
+    native_with(&w, true, 128, 0)
+}
+
+/// The console's results of [`exchanges_in_a_loop_and_a_branch`] for s0, s1.
+fn loop_and_branch_on_the_console(s0: u32, s1: u32) -> Vec<u32> {
+    let rounds = s0.max(1);
+    (0..128u32)
+        .flat_map(|t| {
+            let base = t & !63;
+            let lane = |l: u32| 7 * (base + l) + rounds;
+            let mut acc: u32 = (1..=rounds).map(|i| 7 * (base + 40) + i).sum();
+            if s1 != 0 {
+                acc += lane(63);
+            }
+            [7 * t + rounds, acc, lane(5), lane(5)]
+        })
+        .collect()
+}
+
+/// [`exchanges_in_a_loop_and_a_branch`] on the card, in both forms: with the pairs taken in
+/// turn, an odd count of rounds and the branch each move the pair the next exchange takes.
+#[test]
+fn exchanges_in_a_loop_and_around_a_branch_take_their_pairs_in_turn() {
+    let native = exchanges_in_a_loop_and_a_branch();
+    // one exchange in the loop, one in the branch, one past the join (and the entry's meeting)
+    let (_, two) = lowered_with_parity(&native, false);
+    let (_, one) = lowered_with_parity(&native, true);
+    assert_eq!((two, one), (1 + 6, 1 + 3));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for parity in [false, true] {
+        let (shader, _) = lowered_with_parity(&native, parity);
+        for s0 in [1u32, 2, 3, 6] {
+            for s1 in [0u32, 1] {
+                let Some(got) = run_paired(&shader, [s0, s1, 0, 0], 4 * 128) else { return };
+                same_as_console(&got, &loop_and_branch_on_the_console(s0, s1));
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: exchanges in a loop and a branch, both forms, two console waves");
+}
+
+// ---- each host wave on its own before the forms that meet (`VICTORY_WAVE_LOCAL_FIRST`) ----
+
+/// The allocation idiom in every lane of one console wave: the first lane adds the wave's count
+/// to a counter, each lane takes base + the lanes below (v6) and stores it; with
+/// `plain_first_lane`, also a first-lane read of the thread's index (v0) stored, which the
+/// upper host wave on its own would read in its lane 32 where the console reads lane 0.
+fn allocation_everywhere(plain_first_lane: bool) -> NativeProgram {
+    let mut w = vec![
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBE84_147E, // s_ff1_i32_b64 s4, exec
+        0xD765_0004,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v4, -1, 0
+        0xD766_0004,
+        0x0002_08C1, // v_mbcnt_hi_u32_b32 v4, -1, v4: the lane
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0x7DA4_0804, // v_cmpx_eq_u32 exec, s4, v4: the first lane
+        0xBE82_1002, // s_bcnt1_i32_b64 s2, s[2:3]: the count
+        0x7E0A_0202, // v_mov_b32 v5, s2
+        0x7E16_0280, // v_mov_b32 v11, 0
+        0xE0C8_5000,
+        0x8002_050B, // buffer_atomic_add v5, v11, s[8:11], 0 offen glc
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xD765_0004,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v4, exec_lo, 0
+        0xD766_0004,
+        0x0002_087F, // v_mbcnt_hi_u32_b32 v4, exec_hi, v4: the lanes below
+        0x7E0A_0505, // v_readfirstlane_b32 s5, v5: the base
+        0x4A0C_0805, // v_add_nc_u32 v6, s5, v4
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 6 << 8, // buffer_store_dword v6, off, s[8:11], 0
+    ];
+    if plain_first_lane {
+        w.extend([
+            0x7E1C_0500, // v_readfirstlane_b32 s14, v0: the first lane's index
+            0x7E0E_020E, // v_mov_b32 v7, s14
+            0x38 << 26 | 0x1C << 18 | 4,
+            0x80 << 24 | 2 << 16 | 7 << 8, // buffer_store_dword v7, off, s[8:11], 0 offset:4
+        ]);
+    }
+    native(&w)
+}
+
+/// A console wave64 program whose only wave operations are the allocation idiom translated as
+/// two host waves that exchange meets at group barriers; each host wave on its own meets only
+/// where the host waves are numbered and is exact for it. With the switch on, [`super::emit_forms`] takes that form;
+/// with `VICTORY_WAVE_LOCAL_FIRST=0` the one that meets, as before. A first-lane read of a value
+/// that differs between lanes keeps the program in the form that meets.
+#[test]
+fn the_allocation_idiom_takes_each_host_wave_on_its_own_before_the_forms_that_meet() {
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    for plain_first_lane in [false, true] {
+        let native = allocation_everywhere(plain_first_lane);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        assert_eq!(super::idiom::wave_local(&p, &st), Ok(()), "the idiom");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        lower::take_meetings();
+        let meeting = super::emit_program(&c, &native, &p, &st, &io, &res);
+        let met = lower::take_meetings();
+        let alone = lower::with_local_waves(|| super::emit_program(&c, &native, &p, &st, &io, &res));
+        let alone_met = lower::take_meetings();
+        let chosen = |on: bool| {
+            let first = super::TEST_LOCAL_FIRST.replace(Some(on));
+            let r = super::emit_forms(&c, &native, &p, &st, &io, &res);
+            super::TEST_LOCAL_FIRST.set(first);
+            r.expect("emit_forms")
+        };
+        let (on, off) = (chosen(true), chosen(false));
+        lower::TEST_HOST_WAVE.set(was);
+        let (meeting, alone) = (meeting.expect("the form that meets"), alone.expect("each host wave alone"));
+        assert_eq!((meeting.1, alone.1, on.1, off.1), (Some(32), Some(32), Some(32), Some(32)));
+        assert!(met > 0, "the form that meets has group barriers");
+        assert!(alone_met < met, "each host wave on its own meets less: {alone_met} against {met}");
+        assert!(off.0.dxil == meeting.0.dxil, "VICTORY_WAVE_LOCAL_FIRST=0: the form that meets");
+        if plain_first_lane {
+            assert!(on.0.dxil == meeting.0.dxil, "a first lane's own value read: the form that meets");
+        } else {
+            assert!(on.0.dxil == alone.0.dxil, "switch on: each host wave on its own");
+        }
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut on.0.dxil.clone()).expect("DXIL validation failed");
+        }
+    }
 }

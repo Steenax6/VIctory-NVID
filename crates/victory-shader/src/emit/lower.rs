@@ -104,7 +104,13 @@ pub(crate) struct Lowered {
     /// Whether its UAVs are globally coherent ([`crate::ir::orders_across_groups`]).
     #[cfg(test)]
     pub coherent: bool,
+    /// Whether depth and stencil are tested before it runs (`[earlydepthstencil]`).
+    #[cfg(test)]
+    pub early_depth: bool,
 }
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (bit 12, as AMD's register headers name it).
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -309,6 +315,11 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange`: each console wave has two pairs of dwords, taken in turn
+    /// ([`Self::exchange_slots`]), and an exchange needs one group barrier, not two.
+    parity: bool,
+    /// With `parity`: the thread's own variable saying which pair its next exchange takes.
+    turn: Option<V>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -360,10 +371,22 @@ struct Lower<'a> {
     /// The paired form: scalars each lane has its own of (a waterfall loop's first-lane reads
     /// and what is computed from them), on which no branch takes both lanes of a thread.
     lane_scalars: HashSet<Value>,
+    /// The paired form: the accesses of [`Self::paired_inst`] wait for the group, not only
+    /// fence ([`paired_lds_sync`]).
+    paired_lds_sync: bool,
     /// Linked for one pipeline ([`super::link`]): per input and output element, whether it
     /// is left out (empty when not linking).
     drop_in: Vec<bool>,
     drop_out: Vec<bool>,
+}
+
+/// The paired form, a group of one console wave: whether its LDS accesses wait for the group
+/// (a group barrier with the shared-memory fence) instead of only fencing. Every thread of the
+/// one host wave goes the wave's way, so every thread reaches each wait, unless a scalar is a
+/// lane's own (a waterfall loop: `lanes`, [`lane_scalars`]), where threads may part; then, or
+/// with `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]), the fence alone as before.
+fn paired_lds_sync(lanes: &HashSet<Value>) -> bool {
+    lanes.is_empty() && super::group_sync() != 0
 }
 
 /// What the lowering keeps per console lane, for the paired form ([`with_paired_lanes`]): each
@@ -641,7 +664,34 @@ fn lane_scalars(p: &Program, res: &Resources) -> HashSet<Value> {
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
 fn meeting_mode() -> u32 {
+    MEETINGS.set(MEETINGS.get() + 1);
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
+}
+
+/// How many group barriers the lowerings on this thread have added since the last call (the
+/// meetings of a console wave's host waves, [`meeting_mode`]), which it forgets: what a
+/// translated program pays for running a console wave as two host waves that meet.
+pub(super) fn take_meetings() -> u32 {
+    MEETINGS.take()
+}
+
+/// Whether every `v_readfirstlane_b32` of `p` that each host wave on its own
+/// ([`with_local_waves`]) would read in its own first lane reads what that lane holds in every
+/// lane of the console wave: a scalar, a value [`lane_uniform`] finds the same in every lane,
+/// or one `plain` does not name (`super::idiom::plain_first_lane_reads`: the reserved base,
+/// which each host wave's first lane reserved for its own lanes). The allocation idiom
+/// ([`super::idiom::wave_local`]) takes any other value as it is, which is exact only when no
+/// such read is of a value that differs between lanes: the upper host wave would read its
+/// lane 32's where the console reads lane 0's.
+pub(super) fn first_lane_reads_alike(p: &Program, st: &Structured, plain: &[Value]) -> bool {
+    if plain.is_empty() {
+        return true;
+    }
+    let Some(all) = all_lane_blocks(st) else {
+        return false;
+    };
+    let same = lane_uniform(p, st, &all);
+    plain.iter().all(|v| same.contains(v))
 }
 
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
@@ -767,6 +817,8 @@ pub fn set_host_max_wave(lanes: u32) {
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// See [`take_meetings`].
+    static MEETINGS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
@@ -787,10 +839,16 @@ thread_local! {
 /// console does (`structure::structure_wide`): the wave goes where some lane has to, and EXEC
 /// stays each lane's guard. So control flow is the same in every thread of a host wave, and
 /// the program's barriers are reached as on the console.
-// shortcut: D3D12 orders no groupshared accesses of two threads without a group barrier; the
-// host is taken to run a wave's threads in step where they all go the same way (as for the
-// console's 32-lane programs that share LDS within a wave), the fences only keeping its
-// compiler from moving one thread's accesses past each other.
+// D3D12 orders no groupshared accesses of two threads without a group barrier, and NVIDIA's
+// waves do not run their threads in step (each thread is scheduled on its own since Volta):
+// with only a fence, a thread read a dword another had not written yet. The water's
+// transmission volumetrics (`CS_TransmissionVolumetrics_Tiled`, one console wave a group)
+// left whole groups of their 1280x720 output zero, other groups each frame: black 8x8
+// squares on the water. Where the group is one console wave, and so one host wave whose
+// threads all go the same way, the accesses wait for the group ([`paired_lds_sync`]).
+// shortcut: in a group of several console waves the host waves do not go the same way and a
+// wait could stand for a wave that never comes; there the fences stay, and the threads of a
+// host wave are taken to run in step.
 pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
     let was = PAIRED.replace(true);
     let r = f();
@@ -882,6 +940,26 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether the two host waves of a console wave exchange through two pairs of dwords taken
+/// in turn, at one group barrier an exchange ([`Lower::exchange_halves`]); `VICTORY_EXCHANGE_PARITY=0`:
+/// one pair, rewritten only past a second barrier, as before.
+fn exchange_parity_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EXCHANGE_PARITY.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXCHANGE_PARITY").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`exchange_parity_on`], for its thread only.
+    pub(super) static TEST_EXCHANGE_PARITY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The group barriers the lowerings on this thread added ([`Lower::group_sync`]).
+    pub(super) static TEST_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -917,6 +995,14 @@ thread_local! {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+    // SCC of a mask operation read by an instruction (`s_cselect`, `s_addc`, a mask
+    // operation of its own): "some lane of the wave has the bit" (`Lower::scc_some`), which
+    // the whole console wave answers. A branch on it is the structure's, no data use.
+    if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
+        && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
+    {
+        return true;
+    }
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
@@ -1160,6 +1246,19 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
+        // A pixel program the console runs after the depth and stencil test
+        // (`DEPTH_BEFORE_SHADER`, what its compiler sets for `[earlydepthstencil]`) runs
+        // after it on the host too. Without the flag a host tests a program that writes
+        // views or discards after running it: it ran for hidden pixels and kept their
+        // writes, which the console never makes. Kept with a depth export as well: the
+        // console tests the rasterized depth first then too. (`VICTORY_EARLY_DEPTH=0`:
+        // as before, the host's order.)
+        if let StageIo::Ps { db_shader_control, .. } = &x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && super::early_depth()
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         s.coherent = crate::ir::orders_across_groups(
             p.blocks.iter().flat_map(|b| &b.insts).map(|i| (i.name(), i.fields.clone())),
         );
@@ -1181,10 +1280,14 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // with `exchange`: two pairs of exchange dwords a console wave (`Lower::parity`)
+        let mut parity = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // a program in host waves of the console's size whose group a host wave may tile
         let mut relabel: Option<u32> = None;
+        // the paired form with one console wave in the group: its host group is one host wave
+        let mut paired_alone = false;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
         if let StageIo::Cs(cs) = x.native.io
             && paired
@@ -1192,6 +1295,7 @@ impl<'a> Lower<'a> {
             // (`with_paired_lanes`) a host wave of 32 for each console wave of the group, its
             // threads in a row; the caller has checked that the console's waves are full
             let waves = cs.threads.iter().product::<u32>().div_ceil(64);
+            paired_alone = waves == 1;
             s.threads = Some([32 * waves, 1, 1]);
             s.lds_dwords = cs.lds_bytes() / 4;
             if waves > 1 {
@@ -1285,9 +1389,13 @@ impl<'a> Lower<'a> {
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
-                                // numbers go through two exchange dwords past the program's LDS
+                                // numbers go through two exchange dwords past the program's LDS;
+                                // two pairs of them taken in turn where they fit in the host's
+                                // 32 KiB beside `wave_base`'s counter ([`Self::exchange_slots`])
+                                let waves = group.div_ceil(64);
+                                parity = exchange_parity_on() && group > 32 && s.lds_dwords + 4 * waves < 8192;
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += if parity { 4 } else { 2 } * waves;
                             }
                         }
                     }
@@ -1430,6 +1538,8 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let lane_scalars = if paired { lane_scalars(p, x.res) } else { HashSet::new() };
+        let paired_lds_sync = paired_alone && paired_lds_sync(&lane_scalars);
         Lower {
             s,
             x,
@@ -1507,6 +1617,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            parity,
+            turn: None,
             halves,
             relabel,
             wave_base: None,
@@ -1545,7 +1657,8 @@ impl<'a> Lower<'a> {
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
-            lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
+            lane_scalars,
+            paired_lds_sync,
             drop_in,
             drop_out,
         }
@@ -2400,6 +2513,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             coherent: self.s.coherent,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3925,9 +4040,53 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        #[cfg(test)]
+        TEST_SYNCS.set(TEST_SYNCS.get() + 1);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// The first of the two dwords an exchange in `at` writes and reads, `pair` being
+    /// [`Self::exchange_pair`]'s. With `parity` each console wave has two pairs, and a thread
+    /// takes them in turn, by a variable of its own that each exchange flips: every thread of
+    /// the group runs `at` (an exchange stands only where every lane runs).
+    ///
+    /// Why one barrier an exchange is then enough. The two host waves of a console wave run
+    /// the same exchanges in the same order (they meet at each; only lane branches, which
+    /// hold none, send their threads different ways), so their variables agree and both take
+    /// pair k mod 2 for their k-th exchange. A group barrier lets no thread past before every
+    /// thread of the group has reached as many barriers, whichever. A thread writes pair
+    /// k mod 2 again at exchange k + 2, past the barrier of exchange k + 1; the other half
+    /// reached that barrier only after its reads of exchange k, which follow its barrier of
+    /// exchange k with no barrier between. Other console waves have their own pairs.
+    fn exchange_slots(&mut self, at: usize, pair: V) -> V {
+        if !self.parity {
+            return pair;
+        }
+        let turn = match self.turn {
+            Some(t) => t,
+            None => {
+                let z = self.s.m.i32(0);
+                let t = self.s.m.private_global("exchange.turn", z);
+                self.turn = Some(t);
+                t
+            }
+        };
+        // 0 or 2: the offset of the pair this exchange takes
+        let now = self.s.m.load(at, turn);
+        let two = self.s.m.i32(2);
+        let next = self.s.m.bin(at, Bin::Xor, now, two);
+        self.s.m.store(at, turn, next);
+        self.s.m.bin(at, Bin::Add, pair, now)
+    }
+
+    /// After an exchange's reads in `at`: without `parity` the dwords are written again only
+    /// after every thread read them, a second group barrier.
+    fn exchange_done(&mut self, at: usize) {
+        if !self.parity {
+            self.group_sync(at);
+        }
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -3952,6 +4111,7 @@ impl<'a> Lower<'a> {
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
+        let pair = self.exchange_slots(at, pair);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -3966,13 +4126,13 @@ impl<'a> Lower<'a> {
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
-        // the slots are written again only after every thread read them
-        self.group_sync(at);
+        self.exchange_done(at);
         (lo, hi)
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// block): a group of several console waves has a pair for each (two with `parity`,
+    /// [`Self::exchange_slots`]).
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -3981,7 +4141,7 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
+        let one = self.s.m.i32(if self.parity { 2 } else { 1 });
         let twice = self.s.m.bin(e, Bin::Shl, wave, one);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
@@ -5245,7 +5405,8 @@ impl<'a> Lower<'a> {
         {
             let write = !name.starts_with("ds_read");
             if write || self.lds_last != Some(false) {
-                let (mode, void) = (self.s.m.i32(8), self.s.t.void);
+                let mode = if self.paired_lds_sync { meeting_mode() } else { 8 };
+                let (mode, void) = (self.s.m.i32(mode), self.s.t.void);
                 self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
             }
             self.lds_last = Some(write);
@@ -5964,6 +6125,13 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        // SCC of a mask operation, which has no value of its own (the operation is lowered as
+        // the structure's): whether some lane of the console wave has its bit of the result.
+        if self.x.st.scc_some.contains_key(&v) && matches!(self.vals.get(&v), None | Some(Val::Missing(_))) {
+            let x = self.scc_some(v)?;
+            self.vals.insert(v, Val::Bit(x));
+            return Ok(x);
+        }
         match self.get(v)? {
             Val::Bit(x) => Ok(x),
             _ => Err("SCC without a value"),
@@ -7026,6 +7194,15 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(&moved) = self.x.res.restored_lanes.get(&(b, i)) {
+            // A lane the same block set to a scalar earlier (`resource::Resources::restored_lanes`):
+            // that scalar, whatever the other lanes hold and wherever they are.
+            let word = match moved {
+                crate::resource::Moved::Value(v) => self.i32_of(v)?,
+                crate::resource::Moved::Const(k) => self.s.m.i32(k),
+            };
+            return self.write_i(inst, word, None);
+        }
         if self.x.res.waterfall.compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).
@@ -7216,27 +7393,35 @@ impl<'a> Lower<'a> {
             return r;
         }
         match name {
-            "v_mad_u64_u32" => {
-                // a * b + c, c and the result 64 bits wide; the carry out
-                // of the sum is this lane's bit of the mask it names.
+            "v_mad_u64_u32" | "v_mad_i64_i32" => {
+                // a * b + c, c and the result 64 bits wide (a and b signed in
+                // the second); the carry out of the unsigned sum is this lane's
+                // bit of the mask it names. The signed form's mask is not
+                // modelled: read, it stops the program.
+                if v.clamp || v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let signed = name == "v_mad_i64_i32";
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let x = self.src64(inst, 2)?;
                 let i64t = self.s.m.int(64);
                 self.s.flags |= flags::INT64;
-                let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
-                let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                let ext = if signed { Cast::SExt } else { Cast::ZExt };
+                let a = self.s.m.cast(c, ext, a, i64t);
+                let b = self.s.m.cast(c, ext, b, i64t);
                 let product = self.s.m.bin(c, Bin::Mul, a, b);
                 let r = self.s.m.bin(c, Bin::Add, product, x);
-                let carry = self.s.m.cmp(c, pred::IULT, r, x);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 64-bit result");
                 };
                 let (lo, hi) = self.split64(r);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
-                if let Some(Operand::Scalar { code, .. }) = v.carry
+                if !signed
+                    && let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
+                    let carry = self.s.m.cmp(c, pred::IULT, r, x);
                     self.lane_bits.insert(w, carry);
                 }
                 for &(_, w) in &inst.writes {
@@ -7956,6 +8141,8 @@ impl<'a> Lower<'a> {
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
+                    // (every thread takes its turn, before the lane's own store)
+                    let k = self.exchange_slots(self.cur, k);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -7965,7 +8152,7 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    self.exchange_done(c2);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -8102,8 +8289,13 @@ impl<'a> Lower<'a> {
                 let x = crate::resource::inline(k).ok_or("a special operand")?;
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
+            // A literal for a signed 64-bit operand sign-extends (AMD's ISA, literal
+            // expansion to 64 bits): `v_ashrrev_i64`'s value, `v_mad_i64_i32`'s addend.
+            Operand::Literal(x) if inst.name().ends_with("_i64") || inst.name() == "v_mad_i64_i32" => {
+                Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
+            }
             _ => {
-                // Literals and the null register: zero-extended.
+                // Other literals and the null register: zero-extended.
                 let x = self.operand(inst, &op)?;
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }

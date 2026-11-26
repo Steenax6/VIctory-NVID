@@ -155,6 +155,11 @@ pub struct Resources {
     /// Every `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: where
     /// its nodes are.
     pub bvh: Vec<(Site, BvhNodes)>,
+    /// Each `v_readlane_b32` of a lane that `v_writelane_b32` set to an SGPR
+    /// (or a constant) earlier in the same block: the value it reads back
+    /// (spilled SGPRs, a reduction's scratch). What the VGPR's other lanes
+    /// hold does not matter to it, nor where they are.
+    pub(crate) restored_lanes: std::collections::HashMap<Site, Moved>,
 }
 
 /// Where a ray-tracing node test ([`crate::bvh`]) reads its nodes. Its
@@ -224,9 +229,12 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
+            if let Some(value) = t.restored(inst, Some(b)) {
+                out.restored_lanes.insert(site, value);
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -234,7 +242,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -411,8 +419,8 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// The block of the access being traced ([`Self::live`]).
-    at: std::cell::Cell<Option<usize>>,
+    /// The access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -514,7 +522,7 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let new = match copy_source(inst, k).or_else(|| self.restored(inst, None)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -1113,8 +1121,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, the instruction at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1122,9 +1130,21 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that reach the access and run it read the descriptor.
+        let mut known = self.lanes.map(|l| self.running(l, at)).unwrap_or_default();
         self.classify(&words, &mut Vec::new(), &mut known)
+    }
+
+    /// What holds in every lane that runs the instruction at `at`: it reaches the block,
+    /// and for a vector instruction its EXEC bit is set there ([`Structured::guards`]).
+    /// A lane that comes to a join by a way where the instruction's guard is clear (a skip
+    /// taken when no lane is left for the code it jumps over) never runs it.
+    fn running(&self, lanes: &Structured, at: Site) -> Known {
+        let mut known = vec![(lanes.reach[at.0], true)];
+        if let Some(&Some(guard)) = lanes.guards.get(at.0).and_then(|g| g.get(at.1)) {
+            known.push((guard, true));
+        }
+        known
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1269,13 +1289,13 @@ impl<'a> Tracer<'a> {
         }
     }
 
-    /// `t` as the lanes that reach the access being traced hold it: through
+    /// `t` as the lanes that run the access being traced hold it: through
     /// joins they can have entered by one edge only ([`Self::only_edge`]).
     fn live(&self, mut t: Term) -> Term {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        let mut known = self.running(lanes, at);
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -2245,16 +2265,20 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+/// What a lane of a VGPR holds where an SGPR was spilled to it ([`Resources::restored_lanes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
 }
 
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
-    /// lane, found by following the VGPR's `v_writelane_b32` writes.
-    fn restored(&self, inst: &Inst) -> Option<Moved> {
+    /// lane, found by following the VGPR's `v_writelane_b32` writes; with
+    /// `block`, only where they are all in that block (no join between).
+    /// Not for a lane select past the wave: the hardware's is not the lane
+    /// it names, so it could not be matched with the writes'.
+    fn restored(&self, inst: &Inst, block: Option<usize>) -> Option<Moved> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
@@ -2264,22 +2288,37 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane).filter(|&l| l < self.wave())?;
+        self.spilled(inst.read(Reg::V(reg))?, lane, block, &mut Vec::new())
             .ok()
             .flatten()
     }
 
+    fn wave(&self) -> u32 {
+        if self.p.wave64 { 64 } else { 32 }
+    }
+
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
+    /// `seen` (already being resolved), `Err` if not a spilled SGPR (or with
+    /// `block`, if written outside that block or joined).
+    fn spilled(
+        &self,
+        v: Value,
+        lane: u32,
+        block: Option<usize>,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Moved>, ()> {
         if let Some((b, i)) = self.phis[v.0 as usize] {
+            if block.is_some() {
+                return Err(());
+            }
             if seen.contains(&v) {
                 return Ok(None);
             }
             seen.push(v);
             let mut found = None;
             for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
+                if let Some(m) = self.spilled(a, lane, block, seen)? {
                     if found.is_some_and(|f| f != m) {
                         return Err(());
                     }
@@ -2288,7 +2327,11 @@ impl Tracer<'_> {
             }
             return Ok(found);
         }
-        let inst = self.def(v).ok_or(())?;
+        let site = self.defs[v.0 as usize].ok_or(())?;
+        if block.is_some_and(|b| site.0 != b) {
+            return Err(());
+        }
+        let inst = self.inst(site);
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
@@ -2298,8 +2341,10 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        // (a write past the wave may be to any lane)
+        let written = lane_of(*at).filter(|&l| l < self.wave()).ok_or(())?;
+        if written != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, block, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {
@@ -3844,5 +3889,69 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// A lane read back where the block wrote it is what was written; a lane select past
+    /// the wave (35 of 32) is not taken for the lane it names, neither to read nor as a
+    /// write to another lane, so lane 3 is not traced through it.
+    /// (After codec-d/cool_fox 8cc31ab, codec_d.)
+    #[test]
+    fn lanes_read_back_in_their_block_and_selects_past_the_wave() {
+        const WRITE_5_TO_3: [u32; 2] = [0xD761_0009, 0x0001_0685]; // v_writelane_b32 v9, 5, 3
+        const WRITE_9_TO_35: [u32; 2] = [0xD761_0009, 0x0001_4689]; // v_writelane_b32 v9, 9, 35
+        const READ_3: [u32; 2] = [0xD760_0008, 0x0001_0709]; // v_readlane_b32 s8, v9, 3
+        let restored = |words: &[[u32; 2]]| {
+            let mut code: Vec<u32> = words.iter().flatten().copied().collect();
+            code.push(S_ENDPGM);
+            let r = track_words(&code, &[], HwStage::Cs);
+            r.restored_lanes.get(&(0, words.len() - 1)).copied()
+        };
+        assert_eq!(restored(&[WRITE_5_TO_3, READ_3]), Some(Moved::Const(5)));
+        assert_eq!(restored(&[WRITE_5_TO_3, WRITE_9_TO_35, READ_3]), None);
+        assert_eq!(restored(&[WRITE_5_TO_3, [0xD760_0008, 0x0001_4709]]), None, "a read of lane 35");
+    }
+
+    /// Lanes failing the compare leave EXEC and skip to the join (`s_cbranch_execz`)
+    /// without the immediate sampler set in the skipped code. The join's sample runs under
+    /// EXEC, so only lanes that came through the code that set it run it: the sampler is
+    /// that constant. (After codec-d/cool_fox f4b48ad, codec_d: in the form "without
+    /// early-outs" a compute program on 32-lane hosts was dropped for this.)
+    #[test]
+    fn a_guarded_access_reads_the_descriptor_of_the_ways_its_lanes_run() {
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004, // s_cbranch_execz to the join (4 dwords on)
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        let join = p.blocks.len() - 1;
+        let sample = p.blocks[join].insts.iter().position(|i| i.name() == "image_sample_lz").unwrap();
+        assert!(structured.guards[join][sample].is_some(), "the join's sample runs under EXEC");
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "{:?}",
+            r.descriptors
+        );
     }
 }

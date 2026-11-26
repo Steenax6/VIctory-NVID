@@ -100,6 +100,11 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    try_build_cs(body, threads, lds_bytes).expect("lower")
+}
+
+/// [`build_cs`], with the lowering's refusal as the error.
+fn try_build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -168,8 +173,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    })?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -191,7 +195,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -2736,4 +2740,54 @@ fn a_format_load_read_as_halves_loads_the_integer() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// VOP3B `op vdst, sdst, src0, src1, src2` with `clamp` and `omod`.
+const fn vop3b(op: u16, vdst: u8, sdst: u8, clamp: bool, omod: u8, src: [u16; 3]) -> [u32; 2] {
+    [
+        0x35 << 26 | (op as u32 & 0x3FF) << 16 | (clamp as u32) << 15 | (sdst as u32 & 0x7F) << 8 | vdst as u32,
+        (omod as u32 & 3) << 27 | (src[0] as u32 & 0x1FF) | (src[1] as u32 & 0x1FF) << 9 | (src[2] as u32 & 0x1FF) << 18,
+    ]
+}
+
+/// `v_mad_i64_i32` multiplies signed and adds a signed 64-bit addend, a literal one
+/// sign-extended; `v_mad_u64_u32` and it refuse the output modifiers they have no
+/// lowering of. (After Marvisak/VIctory PR #3082, RVZO6.)
+#[test]
+fn v_mad_i64_i32_is_signed_and_the_64_bit_mads_refuse_modifiers() {
+    const MAD_U64_U32: u16 = 0x176;
+    const MAD_I64_I32: u16 = 0x177;
+    for op in [MAD_U64_U32, MAD_I64_I32] {
+        for (clamp, omod) in [(true, 0), (false, 1), (true, 2)] {
+            let mad = vop3b(op, 6, 12, clamp, omod, [vgpr(1), vgpr(2), vgpr(3)]);
+            let r = try_build_cs(&[mad[0], mad[1], vop1(0x001, 0, vgpr(6))], 1, 0);
+            assert!(
+                matches!(r, Err(crate::ShaderError::Unsupported { what: "integer output modifiers", .. })),
+                "{op:#x} clamp {clamp} omod {omod}: {:?}",
+                r.err()
+            );
+        }
+    }
+    let cases: [(i32, i32); 5] = [(0, 0), (10, 20), (-10, 20), (i32::MIN, -1), (i32::MAX, 2)];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b)| [a as u32, b as u32, 0, 0]).collect();
+    // the addend a literal, -100
+    let mad = vop3b(MAD_I64_I32, 6, 12, false, 0, [vgpr(1), vgpr(2), 255]);
+    for (dword, from) in [(0, 6), (1, 7)] {
+        let shader = build_valu_cs(&[mad[0], mad[1], -100i32 as u32, vop1(0x001, 0, vgpr(from))]);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let (a, b) = cases[i];
+            let want = (i64::from(a) * i64::from(b) - 100) >> (32 * dword);
+            assert_eq!(got, want as u32, "{backend}: dword {dword} of {a} * {b} - 100");
+        });
+    }
+    // the addend a register pair: (v3, v4)
+    let mad = vop3b(MAD_I64_I32, 6, 12, false, 0, [vgpr(1), vgpr(2), vgpr(3)]);
+    let shader = build_valu_cs(&[mad[0], mad[1], vop1(0x001, 0, vgpr(7))]);
+    let pairs: [(i32, i32, i64); 3] = [(-3, 7, 5), (i32::MIN, i32::MIN, -1), (-1, 1, 1 << 40)];
+    let inputs: Vec<[u32; 4]> = pairs.iter().map(|&(a, b, c)| [a as u32, b as u32, c as u32, (c >> 32) as u32]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (a, b, c) = pairs[i];
+        let want = (i64::from(a) * i64::from(b)).wrapping_add(c) >> 32;
+        assert_eq!(got, want as u32, "{backend}: high dword of {a} * {b} + {c}");
+    });
 }

@@ -183,6 +183,39 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether a pixel program the console tests depth and stencil before
+/// (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`) gets DXIL's
+/// `ForceEarlyDepthStencil`, so that the host does not run it for pixels the
+/// test hides. `VICTORY_EARLY_DEPTH`:
+/// - unset or `1`: yes, as the console orders them.
+/// - `0`: no; the host decides (a program writing views or discarding then
+///   runs before the test), as before. For comparing pictures and card time.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn early_depth() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EARLY_DEPTH").ok().as_deref().map(str::trim) != Some("0"))
+}
+
+/// Whether a console wave64 compute program on a host of 32-lane waves takes the form in which
+/// each host wave runs on its own before the forms whose host waves meet at group barriers,
+/// where that form is exact ([`emit_forms`]). `VICTORY_WAVE_LOCAL_FIRST=0`: the forms that
+/// meet first, as before. Part of the translation: the shader cache keys on it.
+fn local_first_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LOCAL_FIRST.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_WAVE_LOCAL_FIRST").is_none_or(|v| v != "0")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`local_first_on`], for its thread only.
+    pub(super) static TEST_LOCAL_FIRST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
@@ -227,6 +260,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(early_depth()));
     out
 }
 
@@ -520,7 +554,43 @@ fn emit_forms(
     }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    lower::take_meetings();
     let original = emit_program(c, native, p, st, io, res);
+    let met = lower::take_meetings();
+    // A console wave64 compute program on a host of 32-lane waves that translated as host waves
+    // which meet at group barriers (one or two for every value the halves exchange): where its
+    // wave operations are the allocation idiom ([`idiom::wave_local`]) and its first-lane reads
+    // read what every lane holds ([`lower::first_lane_reads_alike`]), each host wave on its own
+    // is exact as well and meets only where it numbers its host waves. A light-probe program that reserves its register
+    // allocations has no barrier on the console and had 33 here, 3.7 ms of the card a frame for
+    // 272 instructions. (`VICTORY_WAVE_LOCAL_FIRST=0`: the forms that meet first, as before.)
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    if met > 0 && original.is_ok() && why {
+        eprintln!("WAVE64-MEETINGS {met} in the program as it is");
+    }
+    let local_first = native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && local_first_on()
+        && std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
+    let local_exact = |p: &ir::Program, st: &structure::Structured| {
+        idiom::plain_first_lane_reads(p, st).is_ok_and(|plain| lower::first_lane_reads_alike(p, st, &plain))
+    };
+    if local_first && met > 0 && matches!(&original, Ok((_, wave)) if *wave != Some(64)) && local_exact(p, st) {
+        let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+        let meets = lower::take_meetings();
+        if why {
+            match &local {
+                Ok((_, wave)) => eprintln!("WAVE64-LOCAL-FIRST instead of {met} meetings: wave {wave:?}, {meets} meetings"),
+                Err(e) => eprintln!("WAVE64-LOCAL-FIRST instead of {met} meetings: {e}"),
+            }
+        }
+        // (fewer, not none: both forms number their host waves at one meeting on entry,
+        // `Lower::wave_base`)
+        if meets < met && matches!(&local, Ok((_, wave)) if *wave != Some(64)) {
+            return local;
+        }
+    }
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -535,7 +605,6 @@ fn emit_forms(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
-        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
@@ -577,6 +646,26 @@ fn emit_forms(
             ("without early-outs", form(ir::without_early_outs(p))),
             ("without skips", form(ir::without_skips(p, false))),
         ];
+        // Before the forms below, which translate such a program as two host waves that meet
+        // at group barriers: each host wave on its own where that is exact (`local_exact`),
+        // which meets nowhere. The program as it is first: this form needs no block every lane
+        // runs.
+        if local_first && local_on && !exact_only {
+            let firsts = std::iter::once(("the program as it is", Some((p, st, io, res))))
+                .chain(forms.iter().map(|(name, f)| (*name, f.as_ref().map(|(p, st, io, res)| (p, st, io, res)))));
+            for (name, f) in firsts {
+                if let Some((p, st, io, res)) = f
+                    && idiom(p, st)
+                    && local_exact(p, st)
+                {
+                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("local waves (idiom), {name}, before the forms that meet"), &local);
+                    if done(&local) {
+                        return local;
+                    }
+                }
+            }
+        }
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
@@ -2265,6 +2354,60 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// A pixel program the console tests depth before (`DEPTH_BEFORE_SHADER`, bit 12 of
+    /// `DB_SHADER_CONTROL`) is `[earlydepthstencil]` on the host; one without the bit is
+    /// not, whatever the Z order bits next to it say. (After Marvisak/VIctory PR #2085,
+    /// 0xkn0wh3r3.)
+    #[test]
+    fn pixel_programs_tested_before_they_run_force_early_depth() {
+        let words = [
+            0xF800_1890, 0x0000_0000, // exp null off, off, off, off done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let lowered = |db_shader_control: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: Vec::new(),
+                used: Vec::new(),
+                io: StageIo::Ps {
+                    inputs: Vec::new(),
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .unwrap()
+        };
+        assert!(early_depth(), "VICTORY_EARLY_DEPTH=0 in the test environment");
+        // with early Z then late Z (bits 4-5) as the console pairs it
+        let early = lowered(1 << 12 | 1 << 4);
+        assert!(early.early_depth);
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut early.dxil.clone()).unwrap();
+        }
+        assert!(!lowered(1 << 4).early_depth);
+        assert!(!lowered(0).early_depth);
     }
 
     /// Quad permutations in pixel programs read through quad operations
