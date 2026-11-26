@@ -188,13 +188,18 @@ them again ahead of every bake draw (`VICTORY_BAKE_WRITES`, some 25,000
 uploads a run): the head was baked with noise as before, and a character's
 body came apart in the run that did it, so that is gone.
 
-`VICTORY_PAGE_WRITES` (unset or `guards`: the guarded blocks under such a
+`VICTORY_PAGE_WRITES` (unset, `1` or `all`: the guarded blocks under such a
 write are opened, so host copies of buffers and of textures read through
-tables take its bytes; `0`: not; `slots`, `1` or `all`: the stale slots are
-also due at once at every pass, about 120 uploads a second more in the
-opening cutscene). The line "writes behind
-the guards" counts the writes, the slots under them, the stale ones and
-the stale ones now.
+tables take its bytes, and the stale slots are due at once at every pass;
+`guards`: the first alone, as it was by default while every upload brought
+a whole texture; `slots`: the second alone; `0`: neither). A write, and a
+mapping, is taken for the slots the spans of the views name (a texture
+ends where the next view starts) and also for a slot whose view holds its
+bytes though another view starts between: the first bytes of the texture,
+up to the end of the level the view starts at. The line "writes behind the
+guards" counts the writes, the slots under them, the stale ones, the stale
+ones now, the slots that took a tell by what their view holds, and the
+slots the spans named whose view held none of the tell.
 
 What the texture pass does is counted (no switch; lines every five
 seconds). "texture uploads by reason" says for every upload what made its
@@ -213,7 +218,49 @@ since the upload's read (a numbered write that made the slot stale, a tell
 that lay in the texture's span and was taken for another texture's, a store
 the guards saw, blocks nothing guards, nothing). "told to the texture pass"
 counts the tells by who told, "the texture pass per frame" is the pass's
-time by part, "the texture queue by what its slots wait for" the queue.
+time by part, "the texture queue by what its slots wait for" the queue
+(and how many slots its index by due frame did not hold when it was
+compared with a walk over all of them: 0, or a pass was handed too few).
+
+A texture goes up level by level. Its memory is told apart at its levels
+(the block of the smallest ones, then each level), and of each part the
+upload asks three things: is it the game's (every level a view shows; a
+more detailed one only where no other texture starts before its end), are
+its pages there, and does the host copy hold it as it is (what the host
+copy holds is noted with it). Only a part that is the game's, is there and
+is other than what the host copy holds is detiled and copied; one that is
+not the game's is not read at all, and one whose pages are not there is
+zeros on the host, once. "texture uploads level by level" has the
+megabytes read, not read for either reason, detiled, not detiled because
+the host copy held them, and copied, and the uploads that copied nothing.
+It also has what would show a level gone black: the levels that went up as
+zeros because nothing of them was there and how many of those got their
+bytes since (a level with only some pages there takes the bytes that are
+there), and the times a level a view may show was left with nothing on the
+host when an upload was decided though other levels of its texture were
+brought (0: none may be; the first eight are said in a warning with the
+texture's memory).
+The megabytes in "texture uploads by reason" are those read.
+
+A texture draws read through tables keeps its staging buffer and is
+checked at every submission that samples it. The check reads its memory
+when the guards saw a write or the runtime told of a mapping; at its first
+three checks; on its turn every eighth frame, once in that frame (the hash
+for what the guards do not see); and at every check while it is taken for
+one written behind its guards, which ends after 64 checks that found it
+unchanged. A texture with pages missing, and one made level by level of
+which the game does not hold every level, is read again 30 frames after a
+read at the earliest unless a write is seen or a mapping told. "textures
+read through tables, MB of title memory their checks read per frame" has
+those megabytes by why the check read.
+
+Whether a write would have been known without the read is counted too, to
+decide if the reads of unchanged textures can go: "what the journal, the
+guards and the write watch knew of the parts of textures an upload of the
+pass read again" has, by the upload's reason, the parts changed with
+nothing seen (must be 0 before anything is left unread on their word), the
+parts changed and seen, and for one upload in sixteen the megabytes of
+unchanged parts with nothing seen (what leaving them unread would save).
 
 For a texture both the game and the card write (the game's bake compresses
 its result on the card and copies it, level by level, into textures it also

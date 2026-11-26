@@ -104,7 +104,7 @@ pub(crate) fn bake_writes_line(frame: u64) {
         reads_under_pending = crate::texture::READ_UNDER_PENDING.load(Ordering::Relaxed),
         "bake sources, since the start: {bakes} bake draws with a texture pass, {stale_bakes} of them with slots \
          stale by the writes' numbers ({stale} such slots in all, {by_storage} by DirectStorage, {by_copy} by copies \
-         of the title's; read before the write ended, left as they were); {pending} slots under a read still to \
+         of the title's; read before the write ended and not uploaded again yet); {pending} slots under a read still to \
          finish uploaded at a bake"
     );
 }
@@ -2425,9 +2425,15 @@ impl State {
             };
             // The number its read begins at, filled in at the list's
             // submission: a later write under it makes the slot stale.
+            let mut own = None;
             match crate::texture::picked(resource, why, placed_at.map_or(0, |p| p.2)) {
                 Some(picked) => {
                     let (start, size) = picked.memory;
+                    own = Some(picked.own);
+                    // A tell of written or mapped memory that lies in
+                    // what its view holds is for the slot, whatever view
+                    // starts between.
+                    host.texture_slot_holds(index, start, picked.own.min(size));
                     host.texture_slot_stamp(index, picked.stamp, picked.asked);
                     // What else the upload is, as recorded.
                     let flag = |k: usize, n: u64| c::FLAGS[k].fetch_add(n, Ordering::Relaxed);
@@ -2451,6 +2457,14 @@ impl State {
             c::PASS_COUNTS[c::N_UPLOADS].fetch_add(1, Ordering::Relaxed);
             crate::texture::unstage(resource);
             clock.lap(c::P_STAGED);
+            // What the title holds of the texture, from the first level of
+            // the slot's view: the bytes the upload reads at most (counted
+            // against the frame's), and the bytes the looks go over. (Both
+            // took its full size: the looks then read other textures'
+            // memory past the levels the title holds, and found this one
+            // changed when those were.)
+            let bytes = own.map_or(bytes, |own| own.min(bytes));
+            let memory = memory.map(|(at, len)| (at, own.map_or(len, |own| own.min(len))));
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {

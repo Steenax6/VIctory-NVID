@@ -1166,6 +1166,10 @@ pub(crate) struct HostTexture {
     /// texture's memory (`crate::texture::CardState`): uploads from title
     /// memory leave that alone.
     pub(crate) card: crate::texture::CardState,
+    /// What it holds of each part of the texture's memory
+    /// (`crate::texture::Sent`): uploads bring the levels it lacks. Shared
+    /// with the texture's staging buffer.
+    pub(crate) sent: std::sync::Arc<crate::texture::Sent>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -2445,6 +2449,7 @@ impl HostTexture {
             reuse: None,
             spilled: false,
             card: crate::texture::CardState::default(),
+            sent: Default::default(),
         }
     }
 
@@ -2468,6 +2473,7 @@ impl HostTexture {
             reuse: Some(reuse),
             spilled: false,
             card: crate::texture::CardState::default(),
+            sent: Default::default(),
         }
     }
 }
@@ -2831,6 +2837,13 @@ fn host_texture_as(
         });
     }
     texture.map(|t| (t, false))
+}
+
+/// Whether title texture `this` is one of a view the title placed in
+/// memory ([`texture_at`]), not a texture object of the title's.
+#[cfg(windows)]
+pub(crate) fn is_placed(this: This) -> bool {
+    !this.is_null() && resource(this).host.placed.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -3353,9 +3366,12 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 /// The placed textures by address ([`PLACED_TEXTURES`]), for the count of
 /// `crate::census`: textures in all; addresses with textures of several
 /// descriptions; the most at one address; and such addresses with several
-/// host copies alive now. One walk of the table under its lock (some
-/// 65,000 entries after two minutes: a fraction of a millisecond), asked
-/// once a second; the host copies are asked after it.
+/// host copies alive now. One walk of the table under its lock, asked
+/// every five seconds; the host copies are asked after it, by a look at
+/// whether each texture has one. (They were asked through [`copy_state`],
+/// which works out a texture's footprint when it has none: 40,000 of
+/// those every second, on a thread that records the frame, were most of
+/// what the pass's line calls the queue's order, 1.8 ms a frame.)
 #[cfg(windows)]
 pub(crate) fn placed_descriptions() -> [u64; 4] {
     let mut several: Vec<Vec<usize>> = Vec::new();
@@ -3381,9 +3397,8 @@ pub(crate) fn placed_descriptions() -> [u64; 4] {
             several.push(run);
         }
     }
-    let alive = |textures: &Vec<usize>| {
-        textures.iter().filter(|&&t| copy_state(t as This).is_some_and(|state| state.0 == 2)).count() > 1
-    };
+    let has_copy = |t: &&usize| resource(**t as This).host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let alive = |textures: &Vec<usize>| textures.iter().filter(has_copy).count() > 1;
     [all, several.len() as u64, most, several.iter().filter(|t| alive(t)).count() as u64]
 }
 
@@ -4443,9 +4458,92 @@ mod tests {
         host.execute(&[&again, &again2]);
         assert_eq!((texel(view, 0), texel(late, 0)), (green, green));
         assert!(counts()[9] >= fed_before + 2, "the views fed from the card are counted");
+
+        // An upload brings the levels whose bytes the host copy lacks, and
+        // no others. (Level 0 of the host copy is painted here behind the
+        // layer's back, by a copy on the card that nothing notes: an
+        // upload that copied the level again would put the title's colour
+        // back.)
+        let big = |colour: [u8; 4]| -> This {
+            let mut t = null;
+            let desc = ResourceDesc { layout: 1, ..texture(256, 256, 28, 9) };
+            assert_eq!(create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut t), S_OK);
+            fill(t, colour);
+            t
+        };
+        // Fills level `n` of a texture's title memory with one colour.
+        let level = |t: This, n: usize, colour: [u8; 4]| {
+            let layout = texture_layout(&resource(t).desc).unwrap().planes[0].layout.clone();
+            let (memory, _) = texture_memory(t).unwrap();
+            let from = layout.mips[n].offset as usize;
+            let to = if n == 0 { layout.size as usize } else { layout.mips[n - 1].offset as usize };
+            // SAFETY: the level's bytes of the texture's own committed memory.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(memory.cast_mut().add(from), to - from) };
+            for texel in bytes.chunks_exact_mut(4) {
+                texel.copy_from_slice(&colour);
+            }
+        };
+        let holds = |t: This| -> Vec<u64> {
+            let copy = host_copy(t).unwrap();
+            (0..crate::census::PARTS).map(|part| copy.sent.key(part)).collect()
+        };
+        let (mips, paint) = (big(red), big(green));
+        let (first, source_first) = (reads(mips), reads(paint));
+        host.execute(&[&first, &source_first]);
+        assert_eq!((texel(mips, 0), texel(mips, 1), texel(mips, 8)), (red, red, red));
+        let held = holds(mips);
+        assert!(held.iter().filter(|&&key| key != 0).count() >= 2, "what the host copy holds is noted level by level");
+        let behind = {
+            let list = host.new_list().unwrap();
+            let (to, from) = (host_resource(mips).unwrap(), host_resource(paint).unwrap());
+            crate::list::ensure_state(&list, mips, COPY_DEST);
+            crate::list::ensure_state(&list, paint, COPY_SOURCE);
+            // SAFETY: an open list, live textures in the copy states.
+            unsafe {
+                let of = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                list.list.CopyTextureRegion(&of(to), 0, 0, 0, &of(from), None);
+            }
+            list.close();
+            list
+        };
+        host.execute(&[&behind]);
+        assert_eq!(texel(mips, 0), green);
+        // Nothing written: nothing is copied.
+        let again = reads(mips);
+        host.execute(&[&again]);
+        assert_eq!(texel(mips, 0), green, "an upload with no level changed copied a level");
+        assert_eq!(holds(mips), held);
+        // The title writes level 1: it goes up, and it alone.
+        level(mips, 1, blue);
+        let again = reads(mips);
+        host.execute(&[&again]);
+        assert_eq!((texel(mips, 1), texel(mips, 0), texel(mips, 2)), (blue, green, red), "the level written, and it alone");
+        // Then level 0.
+        level(mips, 0, blue);
+        let again = reads(mips);
+        host.execute(&[&again]);
+        assert_eq!((texel(mips, 0), texel(mips, 1), texel(mips, 2)), (blue, blue, red));
+        // The card writes level 1, and this time it is noted: the level
+        // is the card's, whatever the host copy held of title memory there;
+        // the title's bytes come back when it writes them.
+        let copy = copies(mips, paint, Some(1));
+        host.execute(&[&copy]);
+        let later = reads(mips);
+        host.execute(&[&later]);
+        assert_eq!((texel(mips, 1), texel(mips, 0)), (green, blue), "the level the card wrote last");
+        level(mips, 1, red);
+        let (once, twice) = (reads(mips), reads(mips));
+        host.execute(&[&once]);
+        host.execute(&[&twice]);
+        assert_eq!((texel(mips, 1), texel(mips, 0)), (red, blue), "the title wrote the level after the card");
+        assert_eq!(counts()[2], before[2], "nothing copied from title memory over what the card wrote last");
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-        for t in [t, s, t2, s2, t3, s3, levels, source, never, source2, halves, left, right, object] {
+        for t in [t, s, t2, s2, t3, s3, levels, source, never, source2, halves, left, right, object, mips, paint] {
             resource_release(t);
         }
     }
