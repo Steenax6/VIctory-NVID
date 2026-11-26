@@ -177,8 +177,11 @@ impl Sent {
     fn card_wrote(&self, memory: &Where, subs: u64) {
         for sub in (0..memory.total.min(64)).filter(|&sub| subs & memory.bit(sub) != 0) {
             let part = memory.part_of_level.get((sub % memory.levels) as usize).copied().unwrap_or(0);
-            if let Some(key) = self.0.get(usize::from(part)) {
-                key.store(0, std::sync::atomic::Ordering::Relaxed);
+            if let Some(key) = self.0.get(usize::from(part))
+                && key.swap(0, std::sync::atomic::Ordering::Relaxed) == 1
+            {
+                // (Zeros no more: the card's bytes.)
+                crate::census::BY_LEVEL[crate::census::L_ZERO_FILLED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -188,11 +191,11 @@ impl Sent {
 /// ([`Staging::refresh_parts`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PartIs {
-    /// The title's, and its pages are there: read, and its levels on the
-    /// host brought up to date.
+    /// The title's, and pages of it are there: read (a page that is not
+    /// there as zeros), and its levels on the host brought up to date.
     Read,
-    /// The title's, and not all of its pages are there: its levels are
-    /// zeros on the host until they come.
+    /// The title's, and none of its pages is there: its levels are zeros
+    /// on the host until some come.
     Zeros,
     /// Not the title's: neither read nor written on the host.
     Left,
@@ -207,8 +210,8 @@ enum PartIs {
 /// starts: the title holds a texture from the first level it views it
 /// from, and what lies past that level's bytes is then another texture's.
 /// Only a texture the title placed (`placed`) is so cut short; one of its
-/// texture objects is all its own. `there`: whether all the part's pages
-/// are there, asked only of a part that is the title's.
+/// texture objects is all its own. `there`: whether any of the part's
+/// pages is there, asked only of a part that is the title's.
 fn part_is(placed: bool, of_part: u32, end: u64, [first, limit]: [u64; 2], there: impl FnOnce() -> bool) -> PartIs {
     let viewed = reaches(of_part, first);
     if placed && !viewed && end > limit {
@@ -2571,15 +2574,31 @@ impl Staging {
         self.judged[1].store(judged[1], Relaxed);
         let on_demand = self.on_demand.then(|| self.held_levels(judged));
         let mut is = [PartIs::Left; c::PARTS];
-        let (mut held, mut left, mut away, mut out) = (0u32, 0u64, 0u64, 0u64);
+        // The parts read through the kernel: the title's, with some of
+        // their pages there and some not. Such a part is not zeros: a level
+        // takes the bytes that are there. (For one refresh's worth of
+        // commits a part with a page missing was all zeros on the host:
+        // the texture's memory by the layout ends in padding the title
+        // need not map, and the level before it then stayed black for
+        // good. The read of the whole texture through the kernel, which
+        // this replaces, took what was there.)
+        let mut through = [false; c::PARTS];
+        let (mut held, mut left, mut away, mut out, mut partly) = (0u32, 0u64, 0u64, 0u64, 0u64);
         for k in 0..n {
             let ((from, to), of_part) = (parts[k], self.place.levels_of_part[k]);
             is[k] = match on_demand {
                 Some(levels) if of_part & levels != 0 => PartIs::Read,
                 Some(_) => PartIs::Left,
-                None => part_is(self.placed, of_part, to as u64, judged, || {
-                    !in_place || committed(self.memory.wrapping_add(from), to - from)
-                }),
+                None => {
+                    let at = self.memory.wrapping_add(from);
+                    let mut whole = true;
+                    let state = part_is(self.placed, of_part, to as u64, judged, || {
+                        whole = !in_place || committed(at, to - from);
+                        whole || some_there(at, to - from)
+                    });
+                    through[k] = state == PartIs::Read && !whole;
+                    state
+                }
             };
             match is[k] {
                 PartIs::Left => left += (to - from) as u64,
@@ -2587,7 +2606,10 @@ impl Staging {
                     away += (to - from) as u64;
                     held |= of_part;
                 }
-                PartIs::Read => held |= on_demand.map_or(of_part, |levels| of_part & levels),
+                PartIs::Read => {
+                    held |= on_demand.map_or(of_part, |levels| of_part & levels);
+                    partly += if through[k] { (to - from) as u64 } else { 0 };
+                }
             }
             // Every level of it is left out of the host copy, and so of
             // the staging buffer (a texture made without its most detailed
@@ -2597,23 +2619,26 @@ impl Staging {
             // quarters of such a texture's bytes or more, and the uploads
             // read 91.2 GB of title memory for 47.5 GB of staging.
             if is[k] != PartIs::Left && !reaches(of_part, u64::from(self.first)) {
-                is[k] = PartIs::Left;
+                (is[k], through[k]) = (PartIs::Left, false);
                 out += (to - from) as u64;
             }
         }
         self.detiled.store(held, Relaxed);
         if in_place {
             // Its views are clamped to the first level from which every
-            // level has its pages (`Staging::note_levels_there`).
-            let part_of = |level: u32| usize::from(self.place.part_of_level.get(level as usize).copied().unwrap_or(0));
-            let away = |level: &u32| is[part_of(*level).min(c::PARTS - 1)] == PartIs::Zeros;
-            self.note_shown_from((0..self.mips.min(32)).rev().find(away).map_or(0, |level| level + 1));
+            // level has all its texels' pages (`Staging::note_levels_there`),
+            // asked by the texels, as before, and only when a part of the
+            // title's has pages missing. A level left alone is no view's.
+            let incomplete = (0..n).any(|k| through[k] || is[k] == PartIs::Zeros);
+            let alone = (0..n).filter(|&k| is[k] == PartIs::Left).fold(0, |all, k| all | self.place.levels_of_part[k]);
+            self.note_shown_from(if incomplete { self.first_level_there(alone) } else { 0 });
         }
         let by_level = &c::BY_LEVEL;
         by_level[c::L_LEFT].fetch_add(left, Relaxed);
         by_level[c::L_AWAY].fetch_add(away, Relaxed);
         by_level[c::L_OUT].fetch_add(out, Relaxed);
-        if away > 0 {
+        by_level[c::L_PARTLY].fetch_add(partly, Relaxed);
+        if away + partly > 0 {
             PAGES_MISSING[0].fetch_add(1, Relaxed);
         }
         let size = self.layout.size as usize;
@@ -2628,9 +2653,9 @@ impl Staging {
             (d, c::Part { bytes: bytes.len() as u64, digest: d, zero: count && all_zero(bytes) })
         };
         let reading = |k: usize| is[k] == PartIs::Read;
-        if in_place {
-            for k in (0..n).filter(|&k| reading(k)) {
-                let (from, to) = parts[k];
+        if in_place && (0..n).all(|k| reading(k) && !through[k]) {
+            // All of the texture is there: read where it lies.
+            for (k, &(from, to)) in parts.iter().enumerate().take(n) {
                 // SAFETY: the part's pages are all there (asked above), and
                 // stay while the caller holds title memory still.
                 let bytes = unsafe { std::slice::from_raw_parts(self.memory.add(from), to - from) };
@@ -2638,14 +2663,32 @@ impl Staging {
                 read += to - from;
             }
             let levels = self.stage_keys(&digests, &is, held);
-            if levels != 0 && (0..n).all(reading) {
+            if levels != 0 {
                 // SAFETY: as above, every part of it.
                 self.detile_levels(unsafe { std::slice::from_raw_parts(self.memory, size) }, levels, &is);
-            } else if levels != 0 {
-                // Not all of the texture is there to be read: the parts
-                // to detile are copied out, each to its own place.
-                with_read(size, |buffer| {
-                    for k in (0..n).filter(|&k| reading(k) && self.place.levels_of_part[k] & levels != 0) {
+            }
+        } else if in_place {
+            // Not all of the texture is there to be read where it lies. A
+            // part all of whose pages are there is read in place; one with
+            // pages missing is read through the kernel, which stands them
+            // (zeros for those pages, the bytes of the others). The parts
+            // to detile are then all in the buffer, each at its own place.
+            with_read(size, |buffer| {
+                for k in (0..n).filter(|&k| reading(k)) {
+                    let (from, to) = parts[k];
+                    let bytes: &[u8] = if through[k] {
+                        crate::host::copy_mapped(buffer[from..to].as_mut_ptr(), self.memory.wrapping_add(from), to - from, false);
+                        &buffer[from..to]
+                    } else {
+                        // SAFETY: as above.
+                        unsafe { std::slice::from_raw_parts(self.memory.add(from), to - from) }
+                    };
+                    (digests[k], census[k]) = taken(bytes);
+                    read += to - from;
+                }
+                let levels = self.stage_keys(&digests, &is, held);
+                if levels != 0 {
+                    for k in (0..n).filter(|&k| reading(k) && !through[k] && self.place.levels_of_part[k] & levels != 0) {
                         let (from, to) = parts[k];
                         // SAFETY: as above; the buffer holds `size` bytes,
                         // and the part lies inside them.
@@ -2654,8 +2697,8 @@ impl Staging {
                         }
                     }
                     self.detile_levels(buffer, levels, &is);
-                });
-            }
+                }
+            });
         } else {
             with_read(size, |buffer| {
                 for k in (0..n).filter(|&k| reading(k)) {
@@ -2764,7 +2807,15 @@ impl Staging {
             let key = self.staged[k].load(Relaxed);
             let need = if of_part & held == 0 { 0 } else { self.subresources(of_part & held) };
             if key != 0 && need != 0 && need & !subs == 0 {
-                sent.0[k].store(key, Relaxed);
+                // A part that is zeros on the host because nothing of it
+                // was there, and one that got its bytes after that: counted.
+                let before = sent.0[k].swap(key, Relaxed);
+                let by_level = &crate::census::BY_LEVEL;
+                if key == 1 && before != 1 {
+                    by_level[crate::census::L_ZERO_PARTS].fetch_add(1, Relaxed);
+                } else if key != 1 && before == 1 {
+                    by_level[crate::census::L_ZERO_FILLED].fetch_add(1, Relaxed);
+                }
                 sent.1[k].store(self.asked.load(std::sync::atomic::Ordering::SeqCst), Relaxed);
             }
         }
@@ -2869,7 +2920,7 @@ impl Staging {
         if self.on_demand || self.mips < 2 {
             return;
         }
-        self.note_shown_from(if mapped { 0 } else { self.first_level_there() });
+        self.note_shown_from(if mapped { 0 } else { self.first_level_there(0) });
     }
 
     /// [`Staging::note_levels_there`], given the first level from which
@@ -2899,8 +2950,9 @@ impl Staging {
 
     /// The first level from which every level of every layer has all its
     /// pages ([`Staging::note_levels_there`]); the level count if even the
-    /// last has not.
-    fn first_level_there(&self) -> u32 {
+    /// last has not. `taken`: levels taken as there without asking (a bit a
+    /// level).
+    fn first_level_there(&self, taken: u32) -> u32 {
         let layout = &self.layout;
         let n = u64::from(layout.desc.element_bytes);
         let slices = layout.slices.max(1);
@@ -2920,7 +2972,7 @@ impl Staging {
             })
         };
         let mut first = self.mips;
-        while first > 0 && there(first - 1) {
+        while first > 0 && (1u32.checked_shl(first - 1).is_some_and(|bit| taken & bit != 0) || there(first - 1)) {
             first -= 1;
         }
         first
@@ -3291,6 +3343,27 @@ pub(crate) fn blocks_remapped(at: usize, len: usize) {
     }
 }
 
+/// Whether any of `[at, at + len)` is there, by 64 KiB block as
+/// [`mapped_bytes`] asks it (one page of each block, the answer kept until
+/// the runtime maps the block anew). For a part of a texture not all of
+/// whose pages are there: something of it, or nothing.
+fn some_there(at: *const u8, len: usize) -> bool {
+    const BLOCK: usize = 64 << 10;
+    let start = at as usize;
+    let end = start.saturating_add(len);
+    let mut block = start & !(BLOCK - 1);
+    while block < end {
+        if block_there(block, block.max(start)) {
+            return true;
+        }
+        let Some(next) = block.checked_add(BLOCK) else {
+            break;
+        };
+        block = next;
+    }
+    false
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
@@ -3530,14 +3603,40 @@ mod remap_tests {
             let host_texture = crate::resource::host_resource(resource)?;
             Some((resource, super::staging(resource, host_texture)?))
         });
+        // What is there holds one byte value all over.
+        // SAFETY: the two runs committed above.
+        unsafe { std::ptr::write_bytes(base.cast::<u8>(), 0x5a, 2 * RUN) };
+        // (As the runtime says when it maps memory: what was known of
+        // these blocks, from a test before at this address, is asked anew.)
+        super::blocks_remapped(base as usize, 6 * RUN);
         if let Some((resource, staging)) = made {
             staging.refresh();
             assert_eq!(super::levels_shown_from(resource), Some(1), "level 0's pages are not there");
+            // Level 0 starts in the second run and reaches past it: its
+            // first rows are there and its last are not. It is not zeros
+            // for that: the rows that are there go up as they are, the
+            // others as zeros (a level with a page missing was zeros all
+            // over, and stayed so when the page was one the title never
+            // maps).
+            let level = |n: usize, row: usize| {
+                let footprint = staging.footprints[n];
+                let at = footprint.Offset as usize + row * footprint.Footprint.RowPitch as usize;
+                // SAFETY: inside the mapped staging buffer, which lives as
+                // long as `staging`.
+                unsafe { std::slice::from_raw_parts(staging.data.add(at), 16).to_vec() }
+            };
+            assert_eq!(level(0, 0), [0x5a; 16], "the rows of level 0 that are there");
+            assert_eq!(level(0, 31), [0x5a; 16]);
+            assert_eq!(level(0, 200), [0; 16], "the rows whose pages are not there");
+            assert_eq!(level(1, 0), [0x5a; 16], "a level all there");
+            assert!(staging.staged[usize::from(staging.place.part_of_level[0])].load(std::sync::atomic::Ordering::Relaxed) > 1);
             // SAFETY: the whole reservation above.
             assert!(!unsafe { VirtualAlloc(base, 6 * RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
             super::remapped(base as usize, 6 * RUN);
+            super::blocks_remapped(base as usize, 6 * RUN);
             staging.refresh();
             assert_eq!(super::levels_shown_from(resource), None, "all there: no clamp");
+            assert_eq!(level(0, 0), [0x5a; 16], "what was there is there still");
         }
         // SAFETY: the reservation above, released once.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
