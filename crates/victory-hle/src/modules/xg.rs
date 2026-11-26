@@ -471,6 +471,16 @@ const TILE: u64 = 64 << 10;
 /// every slice in turn. With a tail the console's library lists two slices
 /// at most and zeroes all but the first; so do we (the title reads slice 0
 /// only).
+///
+/// Microsoft's offline PC library (xg_xs.dll) answers arrays with a tail
+/// otherwise: by D3D12 subresource number (mip + slice * mips), packed
+/// mips zeroed, the second slice's standard mips at their own numbers
+/// (FQY55kai/ZJOU-VICTORY 1f0fe1d96, 36955eeaa, fb021f72f). The run with
+/// those rules had the first room dark, the three runs since without them
+/// lit (the title asks for arrays of 2 to 64 slices with a tail, always
+/// from subresource 0 with room for 16): what the title needs is this
+/// answer, not the PC library's. For textures of one slice the two agree
+/// but for zeroed entries past the count.
 extern "system" fn tiling(
     this: This,
     tiles: *mut u32,
@@ -769,6 +779,47 @@ mod tests {
             ),
             E_FAIL
         );
+        assert_eq!(release(c), 0);
+    }
+
+    /// An array with a mip tail, as the title needs it (not as Microsoft's
+    /// PC library lists it, see `tiling`): slice 0's standard mips, then
+    /// slice 1's zeroed, counted together; nothing past them.
+    #[test]
+    fn tiling_of_an_array_with_a_tail_lists_two_slices() {
+        let mut d = desc(256, 256, 7, 28, 0x10a);
+        d.depth_or_array = 32;
+        let c = create(&d);
+        let marker = || SubresourceTiling {
+            width: 7,
+            height: 7,
+            depth: 7,
+            start: 7,
+        };
+        let mut subs: Vec<SubresourceTiling> = (0..16).map(|_| marker()).collect();
+        let (mut n, null) = (16u32, std::ptr::null_mut::<u8>());
+        let mut packed = PackedMips {
+            standard: 0,
+            packed: 0,
+            tiles: 0,
+            start: 0,
+        };
+        let tiling: extern "system" fn(
+            This,
+            *mut u32,
+            *mut PackedMips,
+            *mut [u32; 3],
+            *mut u32,
+            u32,
+            *mut SubresourceTiling,
+        ) -> HRESULT = slot(c, 10);
+        let hr = tiling(c, null.cast(), &mut packed, null.cast(), &mut n, 0, subs.as_mut_ptr());
+        let s = usize::from(packed.standard);
+        assert!(s > 0 && s < 7, "a tail: {s} standard mips");
+        assert_eq!((hr, n as usize), (S_OK, 2 * s));
+        assert!(subs[..s].iter().all(|t| t.depth == 1));
+        assert!(subs[s..2 * s].iter().all(|t| (t.width, t.height, t.depth, t.start) == (0, 0, 0, 0)));
+        assert!(subs[2 * s..].iter().all(|t| t.start == 7), "nothing written past the count");
         assert_eq!(release(c), 0);
     }
 
