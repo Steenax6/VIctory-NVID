@@ -11264,6 +11264,14 @@ impl<'a> Lower<'a> {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
+            // The structure builder's programs (a spilled user-data table) loop over their
+            // structures: copies whose threads step by the dispatch's width over a structure's
+            // nodes, climbs from a leaf to the root, walks of a node list to its end; their
+            // trip counts grow with the structures, which 4,096 does not bound. (Their one
+            // wait on another group's flag stops itself at 256 rounds.) They run only while
+            // the whole builder does (`VICTORY_BVH_BUILDER=1`).
+            // shortcut: cut at 65,536, the compute limit before it was lowered for the others.
+            LOOP_LIMIT if crate::spill::is_spilled(self.x.native) => 1 << 16,
             LOOP_LIMIT => 1 << 12,
             named => named,
         };
