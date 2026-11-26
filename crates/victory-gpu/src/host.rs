@@ -8461,7 +8461,7 @@ impl HostList {
     }
 
     /// At its submission: the host textures this list holds that the title
-    /// released before (`crate::released`), each once, counted as held by a
+    /// or the sweep let go before (`crate::released`), each once, counted as held by a
     /// state of the list or by a keep alone.
     fn count_released(&self) {
         use windows::core::Interface;
@@ -8470,9 +8470,9 @@ impl HostList {
             let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
             for (_, _, copy) in states.values() {
                 if seen.insert(copy.texture.as_raw() as usize)
-                    && let Some(frame) = crate::released::released(&copy.texture)
+                    && let Some(gone) = crate::released::released(&copy.texture)
                 {
-                    crate::released::found(&copy.texture, frame, false);
+                    crate::released::found(&copy.texture, gone, false);
                 }
             }
             states.values().map(|entry| entry.2.texture.as_raw() as usize).collect()
@@ -8483,8 +8483,8 @@ impl HostList {
             if held.contains(&at) || !seen.insert(at) {
                 continue;
             }
-            if let Some(frame) = crate::released::released(&texture) {
-                crate::released::found(&texture, frame, true);
+            if let Some(gone) = crate::released::released(&texture) {
+                crate::released::found(&texture, gone, true);
             }
         }
     }

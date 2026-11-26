@@ -38,24 +38,64 @@ static FIRST: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// How many are named.
 const NAMED: usize = 8;
 
-/// The title released the texture whose host object is `texture`.
-pub(crate) fn mark(texture: &ID3D12Resource) {
-    let frame = crate::frame::current();
-    // SAFETY: plain private data of a live object, 8 bytes read from a local.
-    let _ = unsafe { texture.SetPrivateData(&RELEASED, 8, Some(std::ptr::from_ref(&frame).cast())) };
+/// Who let a host texture go while lists may still name it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Path {
+    /// The title released its texture (`Drop for Resource`).
+    Title = 1,
+    /// The layer's sweep let the host copy of a texture the title fills go
+    /// while the title's texture lives (`resource::let_go_idle`): its next
+    /// use makes a new host copy.
+    Sweep = 2,
 }
 
-/// The frame `texture` was released in, if the title released it.
-pub(crate) fn released(texture: &ID3D12Resource) -> Option<u64> {
-    let (mut frame, mut size) = (0u64, 8u32);
+impl Path {
+    fn of(code: u64) -> Option<Path> {
+        match code {
+            1 => Some(Path::Title),
+            2 => Some(Path::Sweep),
+            _ => None,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Path::Title => "the title released it",
+            Path::Sweep => "the sweep let its host copy go",
+        }
+    }
+}
+
+/// `texture` (a host object) is let go by `path`: marked with the frame
+/// and the path.
+pub(crate) fn mark(texture: &ID3D12Resource, path: Path) {
+    let data = [crate::frame::current(), path as u64];
+    // SAFETY: plain private data of a live object, 16 bytes read from a local.
+    let _ = unsafe { texture.SetPrivateData(&RELEASED, 16, Some(data.as_ptr().cast())) };
+}
+
+/// `texture` is kept to be another title texture's host copy (reserved
+/// textures reused): its mark goes, so the next owner's lists are not
+/// counted for the last one's.
+pub(crate) fn unmark(texture: &ID3D12Resource) {
+    // SAFETY: plain private data of a live object; no data removes it.
+    let _ = unsafe { texture.SetPrivateData(&RELEASED, 0, None) };
+}
+
+/// The frame `texture` was let go in and by which path, if it was.
+pub(crate) fn released(texture: &ID3D12Resource) -> Option<(u64, Path)> {
+    let (mut data, mut size) = ([0u64; 2], 16u32);
     // SAFETY: at most `size` bytes are written into the local.
-    unsafe { texture.GetPrivateData(&RELEASED, &mut size, Some(std::ptr::from_mut(&mut frame).cast())) }.ok()?;
-    (size == 8).then_some(frame)
+    unsafe { texture.GetPrivateData(&RELEASED, &mut size, Some(data.as_mut_ptr().cast())) }.ok()?;
+    if size != 16 {
+        return None;
+    }
+    Some((data[0], Path::of(data[1])?))
 }
 
-/// At a submission: a list holds `texture`, which the title released in
-/// frame `frame`; `kept_only`: held by a keep alone, no state of the list.
-pub(crate) fn found(texture: &ID3D12Resource, frame: u64, kept_only: bool) {
+/// At a submission: a list holds `texture`, which `path` let go in frame
+/// `frame`; `kept_only`: held by a keep alone, no state of the list.
+pub(crate) fn found(texture: &ID3D12Resource, (frame, path): (u64, Path), kept_only: bool) {
     let i = usize::from(kept_only);
     for c in &COUNTS {
         c[i].fetch_add(1, Ordering::Relaxed);
@@ -65,11 +105,12 @@ pub(crate) fn found(texture: &ID3D12Resource, frame: u64, kept_only: bool) {
         // SAFETY: a plain query of a live object.
         let desc = unsafe { texture.GetDesc() };
         first.push(format!(
-            "{}x{}x{} format {} released in frame {frame}, submitted in frame {}{}",
+            "{}x{}x{} format {} let go in frame {frame} ({}), submitted in frame {}{}",
             desc.Width,
             desc.Height,
             desc.DepthOrArraySize,
             desc.Format.0,
+            path.text(),
             crate::frame::current(),
             if kept_only { ", held by the keep alone" } else { ", held by a state of the list" }
         ));
@@ -85,7 +126,7 @@ pub(crate) fn line() {
     let now = COUNTS[1].each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     let first = FIRST.lock().unwrap_or_else(|e| e.into_inner());
     tracing::info!(
-        "lists submitted with a texture the title had released before: since the start {} held by a state of the list and {} by a keep alone \
+        "lists submitted with a host texture let go before (by the title or the sweep): since the start {} held by a state of the list and {} by a keep alone \
          (without it freed before the list ran); since the last line {} and {}; the first: {}",
         total[0],
         total[1],
@@ -151,9 +192,9 @@ mod tests {
         // What a list holds: another reference to the same host object.
         let held = texture.clone();
         assert_eq!(super::released(&held), None);
-        super::mark(&texture);
+        super::mark(&texture, super::Path::Sweep);
         drop(texture);
-        assert_eq!(super::released(&held), Some(crate::frame::current()));
+        assert_eq!(super::released(&held), Some((crate::frame::current(), super::Path::Sweep)));
         drop(held);
         // A texture made after it (maybe at the same address) is not marked.
         assert_eq!(super::released(&target(&device)), None);

@@ -2278,6 +2278,8 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            // A list that still names it is counted at its submission.
+            crate::released::mark(&host.texture, crate::released::Path::Sweep);
             r.host.gone.store(true, Relaxed);
             r.host.unheld.store(0, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
@@ -2508,6 +2510,7 @@ impl Drop for HostTexture {
             && tiled.unmap_all(&self.texture)
         {
             drop(tiled);
+            crate::released::unmark(&self.texture);
             keep_reserved(key, self.texture.clone(), self.state.load(Relaxed));
         }
     }
@@ -3113,9 +3116,9 @@ impl Drop for Resource {
         // texture's colour twin).
         if let Some((host, twin)) = made {
             // Lists that hold it past this are counted at their submission.
-            crate::released::mark(&host.texture);
+            crate::released::mark(&host.texture, crate::released::Path::Title);
             if let Some(twin) = &twin {
-                crate::released::mark(&twin.colour.texture);
+                crate::released::mark(&twin.colour.texture, crate::released::Path::Title);
             }
             crate::host::retire(host);
             if let Some(twin) = twin {
