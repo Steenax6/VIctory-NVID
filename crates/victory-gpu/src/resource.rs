@@ -3397,6 +3397,10 @@ pub(crate) fn placed_copies(address: u64) -> usize {
 /// texture that owns the memory).
 #[cfg(windows)]
 pub(crate) fn placed_within(address: u64, bytes: u64, this: This) -> u64 {
+    // (No bytes: nothing inside; the end never lies below the start.)
+    if bytes == 0 {
+        return 0;
+    }
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     map.range((address, [0; 14])..(address.saturating_add(bytes), [0; 14]))
         .filter(|&(_, &texture)| texture != this as usize)

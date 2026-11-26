@@ -208,8 +208,11 @@ pub(crate) const NOTHING: usize = 8;
 /// Bytes of staging buffers filled with zeros for levels that are not the
 /// title's (`crate::texture` `Staging::detile`), of the pass's uploads.
 pub(crate) const NOT_HELD_BYTES: usize = 9;
+/// Uploads whose texture's span was none (no bytes, or an end below its
+/// start): asked about all the same, and nothing was inside.
+pub(crate) const NO_SPAN: usize = 10;
 /// Since the start, of the uploads the pass recorded.
-pub(crate) static FLAGS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+pub(crate) static FLAGS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// The parts of the pass ([`PASS_US`]): taking what was told since the
 /// last pass; the queue's order; looks at uploaded textures (their
@@ -318,6 +321,22 @@ pub(crate) const T_READ_AFTER: usize = 3;
 pub(crate) const T_HIDDEN: usize = 4;
 pub(crate) static TELLS: [[AtomicU64; 5]; CAUSES] = [const { [const { AtomicU64::new(0) }; 5] }; CAUSES];
 
+/// Counts `n` at `place` of the tells of the cause coded `cause`. A code
+/// past the causes counts under the last and a place past the row is
+/// dropped: these are called where the title's commands are recorded and
+/// where the runtime maps memory, and must not be able to panic.
+pub(crate) fn tell(cause: u8, place: usize, n: u64) {
+    if let Some(count) = TELLS[usize::from(cause).min(CAUSES - 1)].get(place) {
+        count.fetch_add(n, Relaxed);
+    }
+}
+
+/// Counts a texture a look found changed under what was known of its
+/// memory (a place of [`FOUND`]; one past them counts under the last).
+pub(crate) fn found(known: usize) {
+    FOUND[known.min(FOUND.len() - 1)].fetch_add(1, Relaxed);
+}
+
 /// The queue by what its slots wait for, as a pass last counted them
 /// (`crate::descriptor::host::HostHeap::texture_queue_kinds`): never
 /// looked at and due; never looked at, due later (a table's slot lately,
@@ -417,15 +436,15 @@ pub(crate) fn lines(frames: f64) {
         all[6],
         mb(all[7])
     );
-    let f: [u64; 10] = std::array::from_fn(|k| FLAGS[k].load(Relaxed));
+    let f: [u64; 11] = std::array::from_fn(|k| FLAGS[k].load(Relaxed));
     let t = times();
     let d: [u64; 4] = std::array::from_fn(|k| DESCRIPTIONS[k].load(Relaxed));
     tracing::info!(
         "texture uploads as recorded, since the start: {} with a host copy made anew after it was let go, {} with a first \
          host copy; {} of textures with another texture's view starting inside their span ({} MB of them from there on), \
          {} with one inside the part their own view holds; {} of memory with host copies of several descriptions, {} of \
-         spans several slots show; {} for bake draws; {} that staged nothing; {} MB of staging filled with zeros for \
-         levels not the title's. Memories by times uploaded (textures/uploads): once {}/{}, twice {}/{}, to 4 {}/{}, to 8 \
+         spans several slots show; {} for bake draws; {} that staged nothing; {} of spans that were none; {} MB of \
+         staging filled with zeros for levels not the title's. Memories by times uploaded (textures/uploads): once {}/{}, twice {}/{}, to 4 {}/{}, to 8 \
          {}/{}, to 16 {}/{}, to 32 {}/{}, more {}/{}. Placed textures: {} in all, {} addresses with several \
          descriptions (at most {} at one), {} of them with several host copies alive",
         f[ANEW],
@@ -437,6 +456,7 @@ pub(crate) fn lines(frames: f64) {
         f[SLOTS],
         f[BAKE],
         f[NOTHING],
+        f[NO_SPAN],
         mb(f[NOT_HELD_BYTES]),
         t[0].0,
         t[0].1,
@@ -563,6 +583,23 @@ mod tests {
         // upload between held nothing there).
         assert_eq!(compare(Some(&mut memo), &[part(100, 5), zero]), Found { before: true, changed: 0, same: 100, zero: 400 });
         assert_eq!(compare(Some(&mut memo), &next), Found { before: true, changed: 400, same: 100, zero: 0 });
+    }
+
+    /// Counting takes any code: one past the causes, the places or what
+    /// can be known counts under the last or is dropped, and a read of no
+    /// parts, of more parts than are told apart or of no bytes is counted
+    /// as any other.
+    #[test]
+    fn counting_takes_any_code() {
+        tell(255, T_RANGES, 1);
+        tell(0, 99, 1);
+        found(usize::MAX);
+        let many = [part(1, 1); PARTS + 9];
+        read(255, u64::MAX, u64::MAX, u64::MAX, Some(&many));
+        read(RELOOK, u64::MAX, 0, 0, Some(&[]));
+        read(VIEW, 0, 0, 0, None);
+        assert!(FOUND[FOUND.len() - 1].load(Relaxed) >= 1);
+        assert!(TELLS[CAUSES - 1][T_RANGES].load(Relaxed) >= 1);
     }
 
     /// A reason code past the table counts in its last row, and the codes

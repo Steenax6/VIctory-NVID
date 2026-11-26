@@ -299,7 +299,10 @@ impl Spans {
             .next_back()
             .filter(|(_, span)| span.0 > start)
             .map(|(at, _)| *at);
-        before.into_iter().chain(self.by_start.range(start..end).map(|(at, _)| *at)).collect()
+        // (A range whose end lies below its start has nothing inside; the
+        // map's own lookup panics on one.)
+        let inside = (start < end).then(|| self.by_start.range(start..end).map(|(at, _)| *at));
+        before.into_iter().chain(inside.into_iter().flatten()).collect()
     }
 
     /// Slot `index` holds a view of a texture in `[start, end)`. `newer`:
@@ -420,7 +423,18 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        // A span no longer than its first block has nothing past that
+        // block: a texture of a few texels (a 1x1 one takes 16 bytes), a
+        // view of no bytes, a start at the top of the address space, an end
+        // below the start. The map's lookup panics when the range's start
+        // lies above its end, and the texture pass asks this of every
+        // texture it uploads (`HostHeap::texture_span_others`): on a thread
+        // that records the title's commands that ends the process.
+        let from = start.saturating_add(HEAD);
+        if from >= end {
+            return None;
+        }
+        self.by_start.range(from..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -577,7 +591,7 @@ fn written(at: usize, len: usize, by: Cause) -> u64 {
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    crate::census::TELLS[usize::from(by)][crate::census::T_RANGES].fetch_add(1, Relaxed);
+    crate::census::tell(by, crate::census::T_RANGES, 1);
     let number = crate::writes::next();
     // Joined with the one before of the same kind: the whole range carries
     // the newer number (an upload that read between the two is uploaded
@@ -666,7 +680,7 @@ pub(crate) fn remapped(at: usize, len: usize, cause: Cause) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    crate::census::TELLS[usize::from(cause)][crate::census::T_RANGES].fetch_add(1, Relaxed);
+    crate::census::tell(cause, crate::census::T_RANGES, 1);
     let number = crate::writes::next();
     // Pages are mapped one after the other.
     if let Some(last) = ranges.last_mut()
@@ -1708,7 +1722,7 @@ impl HostHeap {
         newest(&mut slots);
         newest(&mut over);
         for &(_, _, cause) in &slots {
-            crate::census::TELLS[usize::from(cause)][crate::census::T_HELD].fetch_add(1, Relaxed);
+            crate::census::tell(cause, crate::census::T_HELD, 1);
         }
         slots.retain(|&(slot, ..)| !self.tabled_lately(slot, frame));
         over.retain(|&(slot, ..)| !self.tabled_lately(slot, frame) && slots.binary_search_by_key(&slot, |s| s.0).is_err());
@@ -1716,12 +1730,11 @@ impl HostHeap {
         {
             let stamps = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
             for &(slot, number, cause) in &slots {
-                let tells = &crate::census::TELLS[usize::from(cause)];
-                tells[crate::census::T_DUE].fetch_add(1, Relaxed);
+                crate::census::tell(cause, crate::census::T_DUE, 1);
                 let read_after = stamps
                     .get(&slot)
                     .is_some_and(|stamp| crate::writes::holds(stamp.load(std::sync::atomic::Ordering::SeqCst), number));
-                tells[crate::census::T_READ_AFTER].fetch_add(u64::from(read_after), Relaxed);
+                crate::census::tell(cause, crate::census::T_READ_AFTER, u64::from(read_after));
             }
         }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
@@ -1737,7 +1750,7 @@ impl HostHeap {
     /// texture's. Those the pass uploaded before the tell are noted
     /// (`hidden`) until uploaded again, and counted when first noted.
     fn note_hidden(&self, over: &[(u32, u64, u8)]) {
-        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        use std::sync::atomic::Ordering::SeqCst;
         if over.is_empty() {
             return;
         }
@@ -1753,7 +1766,7 @@ impl HostHeap {
         let mut hidden = self.hidden.lock().unwrap_or_else(|e| e.into_inner());
         for (slot, cause) in before {
             if hidden.insert(slot, cause).is_none() {
-                crate::census::TELLS[usize::from(cause)][crate::census::T_HIDDEN].fetch_add(1, Relaxed);
+                crate::census::tell(cause, crate::census::T_HIDDEN, 1);
             }
         }
     }
@@ -1822,7 +1835,7 @@ impl HostHeap {
         self.note_hidden(&over);
         PAGE_WRITES[2].fetch_add(needs.len() as u64, Relaxed);
         for &(_, _, by) in &needs {
-            crate::census::TELLS[usize::from(by)][crate::census::T_HELD].fetch_add(1, Relaxed);
+            crate::census::tell(by, crate::census::T_HELD, 1);
         }
         // Read before the write: the stamp of its last upload is older.
         let stale: Vec<(u32, u8)> = {
@@ -1838,7 +1851,7 @@ impl HostHeap {
         PAGE_WRITES[3].fetch_add(stale.len() as u64, Relaxed);
         COPY_WRITES[2].fetch_add(stale.iter().filter(|s| s.1 == Cause::Copy as u8).count() as u64, Relaxed);
         for &(_, by) in &stale {
-            crate::census::TELLS[usize::from(by)][crate::census::T_DUE].fetch_add(1, Relaxed);
+            crate::census::tell(by, crate::census::T_DUE, 1);
         }
         let mut noted = self.stale.lock().unwrap_or_else(|e| e.into_inner());
         noted.extend(stale.iter().copied());
@@ -1869,7 +1882,7 @@ impl HostHeap {
         let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
         let null = away.iter().filter(|slot| placed.by_slot.get(slot) == Some(&0)).count() as u64;
         kinds[3] += null;
-        kinds[4] -= null;
+        kinds[4] = kinds[4].saturating_sub(null);
         kinds
     }
 
@@ -1877,7 +1890,12 @@ impl HostHeap {
     /// holds its first `own` bytes: where the first other texture's view
     /// starts inside the span (past its first block), whether that is
     /// inside the part the view holds, and how many slots show the span.
+    /// A span that is none (no bytes, or an end below its start) is
+    /// counted (`crate::census::FLAGS`) and has nothing inside.
     pub(crate) fn texture_span_others(&self, start: u64, end: u64, own: u64) -> (Option<u64>, bool, usize) {
+        if end <= start {
+            crate::census::FLAGS[crate::census::NO_SPAN].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
         let inner = placed.next_start(start, end);
         (inner, inner.is_some_and(|at| at < start.saturating_add(own)), placed.slots_at(start).len())
@@ -6221,6 +6239,83 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(spans.note(3, big + 0x10_0000, big + 0x18_0000, true), [2]);
         assert_eq!(spans.classed.len(), spans.by_start.len());
         assert_eq!(spans.slots_over(big + 0x17_0000, big + 0x17_1000), [3]);
+    }
+
+    /// No lookup over the spans panics on a range that is none or lies at
+    /// an end of the address space: the texture pass asks them of every
+    /// texture it uploads and of every range it is told, on threads that
+    /// record the title's commands. (`next_start` did, for every texture
+    /// shorter than its first block: the map's range lookup panics when the
+    /// start lies above the end.)
+    #[test]
+    fn lookups_over_the_spans_take_any_range() {
+        let mut spans = Spans::default();
+        let at = 0x2000_0000u64;
+        // A texture of 16 bytes (1x1), one of a block, one at address 0 and
+        // one that ends at the top of the address space.
+        assert!(spans.note(1, at, at + 16, true).is_empty());
+        assert!(spans.note(2, at + 0x10_0000, at + 0x10_1000, true).is_empty());
+        assert!(spans.note(3, 0, 0x4_0000, true).is_empty());
+        assert!(spans.note(4, u64::MAX - 0x2_0000, u64::MAX, true).is_empty());
+        // A view of no bytes, and one whose end lies below its start, are
+        // no span.
+        assert!(spans.note(5, at + 0x20_0000, at + 0x20_0000, true).is_empty());
+        assert!(spans.note(6, at + 0x30_0000, at + 0x2f_0000, true).is_empty());
+        let ranges = [
+            (at, at + 16),                       // shorter than the first block
+            (at, at),                            // no bytes
+            (at + 16, at),                       // an end below the start
+            (0, 0),                              // address 0, no bytes
+            (0, 16),                             // address 0
+            (0, u64::MAX),                       // everything
+            (u64::MAX - 8, u64::MAX),            // the top of the address space
+            (u64::MAX, u64::MAX),
+            (u64::MAX, 0),
+            (at + 0x10_0000, at + 0x10_1000),    // exactly a block
+            (at + 0x10_0000, at + 0x10_1001),
+        ];
+        for (start, end) in ranges {
+            let _ = spans.next_start(start, end);
+            let _ = spans.slots_over(start, end);
+            let _ = spans.slots_holding(start, end);
+            let _ = spans.slots_in(start, end);
+            let _ = spans.overlapping(start, end);
+            let _ = spans.would_stale(9, start, end, true);
+        }
+        // What they say of the ones that are none: nothing.
+        assert_eq!(spans.next_start(at, at + 16), None);
+        assert_eq!(spans.next_start(at + 16, at), None);
+        assert_eq!(spans.next_start(u64::MAX, u64::MAX), None);
+        assert_eq!(spans.slots_over(at + 16, at), [] as [u32; 0]);
+        assert_eq!(spans.slots_in(at + 8, at + 8), [1]);
+        assert_eq!(spans.slots_in(at + 16, at + 16), [] as [u32; 0]);
+        // And of real ones what they said before: the texture inside the
+        // one at address 0 past its first block, and everything over all.
+        assert!(spans.note(7, 0x2_0000, 0x3_0000, true).is_empty());
+        assert_eq!(spans.next_start(0, 0x4_0000), Some(0x2_0000));
+        let mut all = spans.slots_over(0, u64::MAX);
+        all.sort_unstable();
+        assert_eq!(all, [1, 2, 3, 4, 7]);
+    }
+
+    /// The heap's questions for the census take the same ranges, and count
+    /// the span that is none.
+    #[test]
+    fn the_census_questions_take_any_range() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let at = 0x7fe8_0000_0000u64;
+        let before = crate::census::FLAGS[crate::census::NO_SPAN].load(Relaxed);
+        for (start, end, own) in [(at, at + 16, 16), (at, at, 0), (at + 16, at, 16), (0, 0, 0), (u64::MAX, u64::MAX, u64::MAX), (0, u64::MAX, 1)] {
+            let (inner, held, _) = heap.texture_span_others(start, end, own);
+            assert!(!held || inner.is_some());
+            let _ = heap.texture_slot_found(1, start, end.wrapping_sub(start));
+        }
+        assert!(crate::census::FLAGS[crate::census::NO_SPAN].load(Relaxed) >= before + 4);
+        let _ = heap.texture_queue_kinds(0);
+        assert_eq!(heap.slots_written_under(&[(at + 16, at, 1, 200), (u64::MAX, u64::MAX, 2, 0)], 1), [] as [u32; 0]);
     }
 
     /// The queue says what each slot waits for, and what made it due

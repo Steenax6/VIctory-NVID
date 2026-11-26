@@ -1963,7 +1963,10 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     if start >= end {
         return (false, 0, 0);
     }
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // (No more than 4 GiB of it: no texture is longer, and a range that is
+    // nonsense must not keep a recording thread walking.)
+    let first = start / BLOCK;
+    let last = end.div_ceil(BLOCK).min(first.saturating_add(1 << 16));
     let noted = asked != 0 && {
         let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
         j.written.range(first..last).any(|(_, w)| w.at > asked)
@@ -2688,6 +2691,14 @@ mod tests {
         assert_eq!(seen_since(at, at + 3 * BLOCK, 0), (false, 0, 3));
         assert_eq!(seen_since(at + 1, at + BLOCK + 1, 5), (false, 0, 2));
         assert_eq!(seen_since(at, at, 0), (false, 0, 0));
+        // A range that is none, address 0 and the top of the address space.
+        assert_eq!(seen_since(at + BLOCK, at, 7), (false, 0, 0));
+        assert_eq!(seen_since(0, 0, 0), (false, 0, 0));
+        assert_eq!(seen_since(0, 1, 0).1, 0);
+        assert_eq!(seen_since(usize::MAX, usize::MAX, 0), (false, 0, 0));
+        assert_eq!(seen_since(usize::MAX - 1, usize::MAX, u64::MAX).1, 0);
+        // All of the address space: looked at for 4 GiB of it, no longer.
+        assert_eq!(seen_since(0, usize::MAX, 0), (false, 0, 1 << 16));
         assert!(asked_now() <= asked_now());
     }
     use windows_sys::Win32::System::Memory::{

@@ -2222,7 +2222,7 @@ impl State {
                 // What was known of its memory since the upload read it.
                 relook = true;
                 let known = host.texture_slot_found(index, at, len);
-                c::FOUND[known].fetch_add(1, Ordering::Relaxed);
+                c::found(known);
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
@@ -2432,7 +2432,7 @@ impl State {
                         let (inner, held, slots) = host.texture_span_others(start, start.saturating_add(size), picked.own);
                         if let Some(inner) = inner {
                             flag(c::INNER, 1);
-                            flag(c::INNER_BYTES, (start + size).saturating_sub(inner));
+                            flag(c::INNER_BYTES, start.saturating_add(size).saturating_sub(inner));
                             flag(c::INNER_HELD, u64::from(held));
                         }
                         flag(c::SLOTS, u64::from(slots > 1));

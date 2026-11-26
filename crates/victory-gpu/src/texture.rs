@@ -128,7 +128,8 @@ fn memory_parts(size: u64, slices: u32, offsets: &[u64]) -> Vec<(usize, usize)> 
     cuts.extend([0, size]);
     cuts.sort_unstable();
     cuts.dedup();
-    if slices != 1 || cuts.len() - 1 > crate::census::PARTS {
+    // (Never none: a texture of no bytes is one part of none.)
+    if slices != 1 || cuts.len() < 2 || cuts.len() - 1 > crate::census::PARTS {
         return vec![(0, size)];
     }
     cuts.windows(2).map(|w| (w[0], w[1])).collect()
@@ -898,7 +899,7 @@ fn upload_recorded(resource: This) {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.range(..=address)
             .next_back()
-            .filter(|(start, d)| address < **start + d.0 && d.5 != resource as usize)
+            .filter(|(start, d)| address < start.saturating_add(d.0) && d.5 != resource as usize)
             .map(|(start, d)| (*start, *d))
     };
     if let Some((start, (bytes, width, height, _, format, written))) = hit {
@@ -1782,7 +1783,7 @@ impl Staging {
         if count {
             crate::census::read((why - 1) as u8, self.memory as u64, self.layout.size, self.bytes, Some(&read[..n]));
         }
-        if n == 1 { digest(tiled) } else { digest(&folded[..16 * n]) }
+        if n <= 1 { digest(tiled) } else { digest(&folded[..16 * n]) }
     }
 
     /// The bytes from the start of the texture's memory that the levels
@@ -2586,6 +2587,11 @@ mod digest_tests {
         assert_eq!(super::memory_parts(0x3000, 1, &[0, 0x2000, 0x9000]), [(0, 0x2000), (0x2000, 0x3000)]);
         let many: Vec<u64> = (1..=20).map(|k| k * 0x1000).collect();
         assert_eq!(super::memory_parts(0x20_0000, 1, &many), [(0, 0x20_0000)]);
+        // No bytes, no slices, offsets at the top of the address space: one
+        // part, never none.
+        assert_eq!(super::memory_parts(0, 1, &[]), [(0, 0)]);
+        assert_eq!(super::memory_parts(0, 0, &[0, u64::MAX]), [(0, 0)]);
+        assert_eq!(super::memory_parts(0x1000, 1, &[u64::MAX, 0x800]), [(0, 0x800), (0x800, 0x1000)]);
         assert!(super::all_zero(&[0u8; 37]) && !super::all_zero(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]));
     }
 
