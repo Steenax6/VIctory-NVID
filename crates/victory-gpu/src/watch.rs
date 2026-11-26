@@ -658,12 +658,21 @@ pub(crate) fn ask_once_end() {
     }
 }
 
-/// We wrote title memory `[at, at + len)` while a submission's one asking
-/// stands (the title's buffer copies, done at submission): its pages count
-/// as written after that asking, so the refreshes that follow copy them.
+/// We wrote title memory `[at, at + len)` (the title's buffer copies, done
+/// at submission): its pages count as written from now on, so the
+/// refreshes that follow copy them.
+///
+/// Whether or not a submission's one asking stands. The copy clears the
+/// kernel's written bits of its destination ([`forgot`]), so this note is
+/// all that tells of it: it was made only while an asking stood, and a
+/// copy made after a step that ended the asking, or in a submission that
+/// asked the kernel about nothing, was told to nobody. A host copy of its
+/// destination that was brought up to date later kept the bytes from
+/// before it, and with them whatever the title had written into the same
+/// 4 KiB pages since the last asking.
 pub(crate) fn wrote(at: usize, len: usize) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
+    if len == 0 {
         return;
     }
     j.asked += 1;
@@ -673,7 +682,9 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // copy that takes it (copied at `now`, written at `now + 1`): copied
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
-    j.ahead_asked = now;
+    if j.kept {
+        j.ahead_asked = now;
+    }
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         note(&mut j.written, page, now, FULL);
     }
@@ -3341,6 +3352,33 @@ mod tests {
         let (third, again) = writes_fine(start, end, false).expect("watched");
         assert!(third > second);
         assert_eq!(again, found);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A write of ours whose kernel bits were dropped ([`forgot`], as a
+    /// title buffer copy made at submission drops them) is told to the
+    /// journal whether or not a submission's asking stands: the next
+    /// asking names its page, written after the asking before.
+    #[test]
+    fn a_write_of_ours_is_noted_with_no_asking_standing() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 2 * PAGE);
+        forget(start, end);
+        let (first, found) = writes_fine(start, end, false).expect("watched");
+        assert_eq!(found, []);
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
+        forgot(p + PAGE + 8, 1);
+        wrote(p + PAGE + 8, 1);
+        let (_, found) = writes_fine(start, end, false).expect("watched");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, p / PAGE + 1);
+        assert!(found[0].1.at > first && found[0].1.mask == FULL);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
