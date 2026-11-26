@@ -48,16 +48,19 @@ impl<'a> Lower<'a> {
         };
         // 1D and 1D arrays are read as 2D ones one texel high, as the host
         // makes their textures and views ([`host_kind`]): the addresses are
-        // read as 1D and get y = 0 (`flat_to_2d`), the slice moving to the
-        // third place. Level, bias, comparison, gradients and offsets keep
-        // the console's 1D order.
+        // read as 1D and get a y (`flat_to_2d`), the slice moving to the
+        // third place. Loads and atomics read row 0; samples and gathers the
+        // middle of that row (0.5), since at y = 0 a linear filter mixes the
+        // row with what the sampler's V addressing puts above it (a border's
+        // colour, or the row itself again with wrap). Level, bias,
+        // comparison, gradients and offsets keep the console's 1D order.
         let flat = kind == 1 || kind == 6;
-        let flat_to_2d = |cs: &mut [V], zero: V| {
+        let flat_to_2d = |cs: &mut [V], y: V| {
             if kind == 6 {
                 cs[2] = cs[1];
             }
             if flat {
-                cs[1] = zero;
+                cs[1] = y;
             }
         };
         // Address VGPRs in order.
@@ -383,9 +386,9 @@ impl<'a> Lower<'a> {
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
                 }
             }
-            flat_to_2d(&mut cs, self.s.m.f32(0));
+            flat_to_2d(&mut cs, self.s.m.f32(0.5f32.to_bits()));
             // The coordinates the host's level of detail comes from: a 1D
-            // one's y (0) too.
+            // one's y (constant) too.
             let host_spatial = spatial + usize::from(flat);
             if op == 81 {
                 // The clamped then the unclamped level of detail.
