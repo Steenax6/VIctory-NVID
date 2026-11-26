@@ -3814,8 +3814,6 @@ impl Shadow {
                         } else {
                             (joined_over(changed_runs(title, held), merge_gap()), Vec::new(), Vec::new())
                         };
-                        #[cfg(feature = "diagnostics")]
-                        crate::copystat::buffers::under_page(runs.len());
                         if runs.len() > *runs_left {
                             #[cfg(feature = "diagnostics")]
                             crate::copystat::buffers::gave_up(crate::copystat::buffers::RUN_CAP, self.start, self.len, lo, runs.len(), *runs_left);
@@ -4340,10 +4338,11 @@ impl Shadow {
             (first..=last).map(|g| bits.get(g / 64).is_some_and(|w| w & (1 << (g % 64)) != 0)).collect()
         };
         let (exact, joined) = page_runs(pos, title, held, merge_gap(), |g| marks.get(g - first).copied().unwrap_or(true));
-        // For the census: the exact runs block by block (a run is counted
-        // with the block it starts in).
+        // For the census: the page's exact runs as found, and block by
+        // block (a run is counted with the block it starts in).
         #[cfg(feature = "diagnostics")]
         {
+            crate::copystat::buffers::under_page(self.start, self.len, start.saturating_add(at), exact.len());
             let mut runs = exact.iter().map(|r| (pos + r.0) / BLOCK).peekable();
             while let Some(block) = runs.next() {
                 let mut n = 1;

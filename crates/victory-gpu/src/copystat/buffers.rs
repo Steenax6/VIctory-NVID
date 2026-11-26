@@ -350,16 +350,28 @@ fn run_class(runs: usize) -> usize {
 }
 
 /// Since the last line: pages looked at under flights' writes by the exact
-/// runs found on them, and those runs; 4 KiB blocks a compare ever flagged
-/// by the runs in them, and those runs.
+/// runs found on them (before any block of theirs is taken whole), and
+/// those runs; 4 KiB blocks a compare ever flagged by the runs in them, and
+/// those runs.
 static UNDER_PAGES: [[AtomicU64; 2]; RUN_CLASSES.len() + 1] = [const { [const { AtomicU64::new(0) }; 2] }; RUN_CLASSES.len() + 1];
 static UNDER_BLOCKS: [[AtomicU64; 2]; RUN_CLASSES.len() + 1] = [const { [const { AtomicU64::new(0) }; 2] }; RUN_CLASSES.len() + 1];
 
-/// A page looked at under flights' writes had `runs` exact changed runs.
-pub(crate) fn under_page(runs: usize) {
+/// Since the last line: the page with the most exact runs (the copy's
+/// start and length, the page's address, the runs).
+static BUSIEST: Mutex<Option<(u64, u64, usize, usize)>> = Mutex::new(None);
+/// The runs of [`BUSIEST`], for a look without its lock.
+static BUSIEST_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// A stretch of the page at `page`, of the copy `[start, start + len)`,
+/// looked at under flights' writes had `runs` exact changed runs.
+pub(crate) fn under_page(start: u64, len: u64, page: usize, runs: usize) {
     if let Some(class) = UNDER_PAGES.get(run_class(runs)) {
         class[0].fetch_add(1, Relaxed);
         class[1].fetch_add(runs as u64, Relaxed);
+    }
+    if runs as u64 > BUSIEST_RUNS.load(Relaxed) {
+        BUSIEST_RUNS.store(runs as u64, Relaxed);
+        *BUSIEST.lock().unwrap_or_else(|e| e.into_inner()) = Some((start, len, page, runs));
     }
 }
 
@@ -488,10 +500,16 @@ pub(crate) fn lines(frames: f64) {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    BUSIEST_RUNS.store(0, Relaxed);
+    let busiest = match BUSIEST.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some((start, len, page, runs)) => format!("{runs} runs at {page:#x} of copy {start:#x}+{len:#x}"),
+        None => "none".to_owned(),
+    };
     tracing::info!(
         "census, title bytes under flights' shader writes per frame: flights left to be settled {}; pages looked at by their \
-         exact changed runs: {}; blocks a compare ever flagged, by the runs in them: {}; at landings {:.1} flagged blocks \
-         looked at, {:.2} of them had taken a joined run while their flight was in the air (a shader's bytes there may be lost)",
+         exact changed runs as found: {} (the most on one since the last line: {busiest}); blocks a compare ever flagged, by \
+         the runs in them: {}; at landings {:.1} flagged blocks looked at, {:.2} of them had taken a joined run while their \
+         flight was in the air (a shader's bytes there may be lost)",
         if why.is_empty() { "0 times".to_owned() } else { why.join("; ") },
         classes(&UNDER_PAGES),
         classes(&UNDER_BLOCKS),
@@ -670,6 +688,8 @@ mod tests {
         joined(usize::MAX, usize::MAX, 0);
         joined(0x10, 0, 0);
         gave_up(99, 0, 0, 0, 0, 0);
+        under_page(u64::MAX, u64::MAX, usize::MAX, 0);
+        under_block(usize::MAX);
         opened(99, 1);
         updated(255, usize::MAX, 0);
         asked(255, u64::MAX);

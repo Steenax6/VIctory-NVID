@@ -575,7 +575,7 @@ pub(crate) fn writes_fine(start: usize, end: usize, guarded: bool) -> Option<(u6
         {
             crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
             if written.is_some() {
-                crate::copystat::buffers::view(first * PAGE, (last - first) * PAGE);
+                crate::copystat::buffers::view(first * PAGE, last.saturating_sub(first).saturating_mul(PAGE));
             }
         }
         written?
