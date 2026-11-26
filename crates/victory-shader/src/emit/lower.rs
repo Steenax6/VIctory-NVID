@@ -5139,7 +5139,7 @@ impl<'a> Lower<'a> {
             "min_u32" => Some(Rmw::UMin),
             "max_u32" => Some(Rmw::UMax),
             "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" | "max_f32" | "min_f32" => None,
+            "cmpst_b32" | "max_f32" | "min_f32" | "inc_u32" | "dec_u32" | "rsub_u32" | "mskor_b32" => None,
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
@@ -5166,6 +5166,50 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // The operations DXIL has no atomic for, as compare-exchange loops (RDNA2 ISA 12.13):
+        // an increment to 0 once the old value reaches data0, a decrement to data0 from 0 or
+        // from above it, data0 less the old value, and the old value with data0's bits cleared
+        // and data1's set.
+        if matches!(op.as_str(), "inc_u32" | "dec_u32" | "rsub_u32" | "mskor_b32") {
+            let set = if op == "mskor_b32" { Some(v1.ok_or("an LDS masked OR")?) } else { None };
+            let at = self.begin_guarded(guard);
+            let r = self.lds_rmw_loop(p, |l, old| {
+                let c = l.cur;
+                let (zero, one) = (l.s.m.i32(0), l.s.m.i32(1));
+                match (op.as_str(), set) {
+                    ("inc_u32", _) => {
+                        let wrap = l.s.m.cmp(c, pred::IUGE, old, v0);
+                        let next = l.s.m.bin(c, Bin::Add, old, one);
+                        l.s.m.select(c, wrap, zero, next)
+                    }
+                    ("dec_u32", _) => {
+                        let empty = l.s.m.cmp(c, pred::EQ, old, zero);
+                        let above = l.s.m.cmp(c, pred::IUGT, old, v0);
+                        let wrap = l.s.m.bin(c, Bin::Or, empty, above);
+                        let next = l.s.m.bin(c, Bin::Sub, old, one);
+                        l.s.m.select(c, wrap, v0, next)
+                    }
+                    ("mskor_b32", Some(set)) => {
+                        let ones = l.s.m.i32(u32::MAX);
+                        let clear = l.s.m.bin(c, Bin::Xor, v0, ones);
+                        let keep = l.s.m.bin(c, Bin::And, old, clear);
+                        l.s.m.bin(c, Bin::Or, keep, set)
+                    }
+                    _ => l.s.m.bin(c, Bin::Sub, v0, old),
+                }
+            });
+            let r = self.end_guarded(at, &[(r, outside)])[0];
+            if let Some(reg) = dst_reg {
+                self.write(inst, Reg::V(reg), r, None);
+            }
+            return Ok(());
+        }
+        // A subtraction of a constant is an add of its negation: `atomicrmw sub` removes the
+        // WARP device (Marvisak/VIctory pull request #3142), an add of a constant does not.
+        let (rmw, v0) = match (rmw, self.s.m.int_value(v0)) {
+            (Some(Rmw::Sub), Some(k)) => (Some(Rmw::Add), self.s.m.i32((k as u32).wrapping_neg())),
+            _ => (rmw, v0),
+        };
         let at = self.begin_guarded(guard);
         // A subtraction of a value that is no constant, as `ds_add` of its negation (HLSL's
         // `InterlockedAdd(shared, -x)`) or as `ds_sub`, is a compare-exchange loop: NVIDIA's

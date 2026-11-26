@@ -1364,6 +1364,125 @@ fn lds_subtractions_get_a_pipeline_and_stay_atomic() {
     eprintln!("ran on the hardware device: LDS subtractions as compare-exchange loops, atomic");
 }
 
+const DS_RSUB_U32: u8 = 0x02;
+const DS_INC_U32: u8 = 0x03;
+const DS_DEC_U32: u8 = 0x04;
+const DS_MSKOR_B32: u8 = 0x0C;
+const DS_SUB_U32: u8 = 0x01;
+const DS_RSUB_RTN_U32: u8 = 0x22;
+const DS_INC_RTN_U32: u8 = 0x23;
+const DS_DEC_RTN_U32: u8 = 0x24;
+const DS_MSKOR_RTN_B32: u8 = 0x2C;
+
+/// DS `op vdst, addr, data0, data1` at offset 0.
+const fn ds2(op: u8, vdst: u8, addr: u8, data0: u8, data1: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18,
+        (vdst as u32) << 24 | (data1 as u32) << 16 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
+/// The LDS integer operations DXIL has no atomic for (`ds_inc_u32`, `ds_dec_u32`,
+/// `ds_rsub_u32`, `ds_mskor_b32`, with and without `_rtn`), against RDNA2 ISA 12.13: with
+/// LDS[0] = s0 (`old`), data0 = s1, data1 = s2, v0 is the old value (`_rtn`) or the dword
+/// afterwards. One thread with LDS declares WaveSize(32), which WARP refuses: hardware only.
+/// (After fxceless/victory-fork pull request #1281, whose value tests are ignored there.)
+#[test]
+fn lds_integer_operations_without_a_dxil_atomic_follow_rdna2() {
+    let ops: [(u8, u8, &str, fn(u32, u32, u32) -> u32); 4] = [
+        (DS_INC_U32, DS_INC_RTN_U32, "ds_inc_u32", |o, d, _| if o >= d { 0 } else { o + 1 }),
+        (DS_DEC_U32, DS_DEC_RTN_U32, "ds_dec_u32", |o, d, _| if o == 0 || o > d { d } else { o - 1 }),
+        (DS_RSUB_U32, DS_RSUB_RTN_U32, "ds_rsub_u32", |o, d, _| d.wrapping_sub(o)),
+        (DS_MSKOR_B32, DS_MSKOR_RTN_B32, "ds_mskor_b32", |o, d, e| o & !d | e),
+    ];
+    let edges = [0u32, 1, 4, 5, 6, 0x7FFF_FFFF, 0x8000_0000, u32::MAX - 1, u32::MAX];
+    let mut cases = Vec::new();
+    for &old in &edges {
+        for &d in &edges {
+            cases.push([old, d, 0xF0F0_1234 ^ d, 0]);
+        }
+    }
+    for (plain, rtn, what, want) in ops {
+        for (op, returns) in [(plain, false), (rtn, true)] {
+            // v5 = 0; LDS[v5] = v1; the operation with v2 (and v3)
+            let mut body = vec![vop1(0x001, 5, 0x80)];
+            body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+            body.extend(ds2(op, 0, 5, 2, 3));
+            if !returns {
+                body.extend(ds(DS_READ_B32, 0, 5, 0));
+            }
+            let shader = build_cs(&body, 1, 512);
+            run_cases_on(&shader, &cases, &[("hardware", false)], |backend, _, [old, d, e, _], got| {
+                let w = if returns { old } else { want(old, d, e) };
+                assert_eq!(got, w, "{backend}: {what} (rtn {returns}) on {old:#x} with {d:#x}, {e:#x}");
+            });
+        }
+    }
+}
+
+/// 64 threads (two host waves of 32 or one of 64) each take one `ds_inc_rtn_u32` of a counter
+/// from 0 with the limit 63: every old value 0..63 comes back once and the counter wraps to 0;
+/// `ds_dec_rtn_u32` from 63 with the limit 63 gives the same values and ends at 63. Then a
+/// subtraction of a constant, an add of its negation here, on hardware and WARP.
+#[test]
+fn lds_integer_operations_stay_atomic_across_waves() {
+    for (op, start, end) in [(DS_INC_RTN_U32, 0u32, 0u32), (DS_DEC_RTN_U32, 63, 63)] {
+        let mut body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0: the counter's address
+        body.extend(ds(DS_WRITE_B32, 0, 5, 1)); // the counter = s0
+        body.push(S_BARRIER);
+        body.extend(ds(op, 6, 5, 2)); // v6: the old value, limit s1
+        body.push(vop2(0x1A, 3, 0x82, 0)); // v_lshlrev_b32 v3, 2, v0
+        body.extend(store_at(6, 3, 4)); // dword t + 1: what thread t got
+        body.push(S_BARRIER);
+        body.extend(ds(DS_READ_B32, 0, 5, 0)); // dword 0: the counter at the end
+        let shader = build_cs(&body, 64, 512);
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = [start, 63][d as usize];
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(65)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let mut got = out[0][1..65].to_vec();
+            got.sort_unstable();
+            assert!(got.iter().copied().eq(0..64), "{label}, op {op:#x}: {got:?}");
+            assert_eq!(out[0][0], end, "{label}, op {op:#x}: the counter at the end");
+            ran += 1;
+        }
+        assert!(ran > 0, "no SM 6.6 device");
+    }
+    // 64 threads subtract 3 from 1,000: the counter ends at 808.
+    let mut body = vec![vop1(0x001, 5, 0x80), vop1(0x001, 6, 0x83)]; // v5 = 0, v6 = 3
+    body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    body.push(S_BARRIER);
+    body.extend(ds(DS_SUB_U32, 0, 5, 6));
+    body.push(S_BARRIER);
+    body.extend(ds(DS_READ_B32, 0, 5, 0));
+    let shader = build_cs(&body, 64, 512);
+    run_cases(&shader, &[[1000, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 1000 - 64 * 3, "{backend}: ds_sub_u32 of a constant");
+    });
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
