@@ -505,6 +505,12 @@ less work in `State::bind` on the recording threads.
   slowed ("copies" 28 against 20 ms): the first room 75 to 80 against 67
   to 69 ms a frame, back to back on the same build (s_plain1, s_plain0).
   Taken out again.
+- `VICTORY_WIDE_REFRESH=1` (opt-in; a flush's copies refreshed on the
+  wide threads) with the refresh by event: the first room 85 against 69
+  ms a frame, "copies" 29 against 20 ms (s_wide1 against s_plain0, 2026-11-26).
+  The longest send of a frame is the list that makes the heap's buffers
+  ready: one flush of about 4,600 copies, almost all with nothing to
+  copy, 7 to 13 ms; spread over threads they cost more than on one.
 - `VICTORY_HOT_BLOCKS=1`, `VICTORY_NAMED_WRITES=1`: not yet tried in a run.
   (`VICTORY_MERGE_FORGET` is gone: it dropped the kernel's written bits a
   landing set, and with them the title's of before the landing;
