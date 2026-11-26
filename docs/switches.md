@@ -164,6 +164,42 @@ runtime's mappings and the writes behind the guards do tell); slots looked
 at before and fresh ones are served in turns (fxceless/victory-fork pull
 request #1246).
 
+## Textures written by DirectStorage
+
+The game maps physical pages that held other data, writes a texture's
+view, has DirectStorage fill the pages and waits for the read's status.
+A texture picked by index that was uploaded in between holds what the
+pages held before, page by page. Every write that no guard sees
+(DirectStorage into physical pages, at each address showing them, and its
+reads to plain addresses) is numbered when its bytes are there, and every
+upload of the texture pass keeps the number its read began at: one that
+read before a write under its texture is stale until uploaded again.
+
+`VICTORY_BAKE_WRITES` (on by default; `=0`: counted only, to compare):
+before a draw of the game's decoration bake (which picks its sources by
+index once, at load, and bakes skin and clothing for the whole run), the
+stale slots and the slots whose upload sits in a list not submitted yet
+are uploaded first, within the bake's budget (`VICTORY_BAKE_TEXTURES_MS`,
+1,500 ms a frame). Without it, a character's head came out with blocks or
+rows of colourful noise in about half the runs. The log line "bake
+sources, since the start" counts bake draws, the ones with stale slots,
+those slots, how many went up before the draw and how many did not (the
+budget ran out), slots under a read still running at a bake (one warning
+says so), and bake draws that got no pass while slots were stale.
+
+`VICTORY_PAGE_WRITES` (unset or `guards`: the guarded blocks under such a
+write are opened, so host copies of buffers and of textures read through
+tables take its bytes; `0`: not; `slots`, `1` or `all`: the stale slots are
+also due at once at every pass, not only before a bake, about 120
+uploads a second more in the opening cutscene). The line "writes behind
+the guards" counts the writes, the slots under them, the stale ones and
+the stale ones now.
+
+At the game's Submit the addresses a read into physical pages will write
+are known; until the read is done the texture pass leaves a texture there
+for the next frame instead of uploading the bytes from before and again
+after the read ("due slots left for after a read" in the same line).
+
 ## Light where no rays run
 
 `VICTORY_AMBIENT` (on by default; `=off`: the game's own output): the game
