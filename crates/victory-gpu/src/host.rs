@@ -4188,14 +4188,16 @@ fn late_line(frames: f64) {
         }
     }
     if late_exact() {
-        let [pages, runs, bytes, joined, joined_bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, joined, joined_bytes, whole, whole_bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; and {joined:.0} runs joined over blocks no compare ever flagged, {:.2} MB \
-             (VICTORY_MERGE_PAGES={})",
+             (VICTORY_MERGE_PAGES={}); and {whole:.0} flagged blocks the title rewrote in many places, one run each, {:.2} MB \
+             (VICTORY_MERGE_BLOCK_RUNS)",
             bytes / (1 << 20) as f64,
             joined_bytes / (1 << 20) as f64,
-            if crate::shadow::merge_pages() { 1 } else { 0 }
+            if crate::shadow::merge_pages() { 1 } else { 0 },
+            whole_bytes / (1 << 20) as f64
         );
     }
 }

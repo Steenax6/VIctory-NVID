@@ -1990,11 +1990,11 @@ fn back_run_gap() -> usize {
 /// compared, changed runs put in, and their bytes; of those runs, the ones
 /// joined over blocks no compare ever flagged ([`merge_pages`]) and their
 /// bytes.
-static MERGED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static MERGED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 5] {
-    [0, 1, 2, 3, 4].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 7] {
+    [0, 1, 2, 3, 4, 5, 6].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// Whether [`Shadow::merge_under_writes`] sends the title's changes to a
@@ -2049,6 +2049,97 @@ fn page_runs(pos: usize, title: &[u8], held: &[u8], gap: usize, flagged: impl Fn
         s = e;
     }
     (exact, joined)
+}
+
+/// The most changed runs with which a 4 KiB block that a compare on the
+/// card once flagged goes up byte by byte when the title rewrites it under
+/// flights' shader writes ([`Shadow::merge_under_writes`]); a block with
+/// more goes up as one run, first changed byte to last, as a block no
+/// compare ever flagged does. And where a page's exact runs are still more
+/// than its submission may send (`VICTORY_MERGE_RUNS`), its blocks with the
+/// most runs go up whole too, until they are not: the flights are no longer
+/// settled for it. `VICTORY_MERGE_BLOCK_RUNS` (32; `0`: every flagged block
+/// byte by byte and the flights settled above the cap, as before).
+///
+/// Why: the flags are for good (`Card::flagged`), and what shaders write in
+/// the title's big buffer moves through its ring of per-draw constants, so
+/// in time most of the ring is flagged. The title then rewrites a chunk of
+/// the ring for the next frame's draws while a flight that names the whole
+/// buffer is in the air, and byte by byte the new constants differ from
+/// the old in runs of some six bytes: 42,700 runs a frame for 0.25 MB with
+/// the cap out of the way (run `s_x5_runs`: 42,000 copies a frame recorded
+/// for them, preparing 10 ms longer, the landing thread 6), and with the cap
+/// one full wait for the card and the landings a frame, 12.5 ms of the
+/// submitting thread standing (profile of 2026-11-26). A block rewritten
+/// in more places than this is the title's block again, not one a shader
+/// and the title share a few bytes of.
+///
+/// The risk is [`merge_pages`]': a flight in the air that writes such a
+/// block has its bytes between the block's first and last changed byte put
+/// back to what the copy held, once. Diagnostics builds count the blocks
+/// that took a run of this kind and that a flight then in the air turned
+/// out to have written (`crate::copystat::buffers::flagged`): the count is
+/// the measure of this rule, and of the joined runs before it.
+fn block_runs() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_MERGE_BLOCK_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(32))
+}
+
+/// `exact` (a page's exact runs, in order, as [`page_runs`] gives them; the
+/// page's first byte lies `pos` bytes from the start of the copy's piece
+/// 0) by 4 KiB block, a run counted with the block it starts in: each
+/// block's first run in `exact` and how many it has.
+fn runs_by_block(pos: usize, exact: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    use crate::card_fine::BLOCK;
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut last = usize::MAX;
+    for (i, &(r, _)) in exact.iter().enumerate() {
+        let block = pos.saturating_add(r) / BLOCK;
+        match blocks.last_mut() {
+            Some(entry) if block == last => entry.1 += 1,
+            _ => blocks.push((i, 1)),
+        }
+        last = block;
+    }
+    blocks
+}
+
+/// The rule of [`block_runs`] for a page's exact runs: the runs of every
+/// block with more than `most` of them become one run for the block, from
+/// its first changed byte to its last; and while more than `left` exact
+/// runs remain, so do those of the block with the most runs left. The
+/// exact runs that stay, then the runs of the blocks taken whole, both in
+/// order. Every byte of `exact` is in one of them.
+fn rewritten_blocks(pos: usize, exact: Vec<(usize, usize)>, most: usize, left: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let blocks = runs_by_block(pos, &exact);
+    let mut whole: Vec<bool> = blocks.iter().map(|b| b.1 > most).collect();
+    let mut kept: usize = blocks.iter().zip(&whole).filter(|(_, whole)| !**whole).map(|(b, _)| b.1).sum();
+    if kept <= left && !whole.contains(&true) {
+        return (exact, Vec::new());
+    }
+    if kept > left {
+        // The fullest first; among equals the one that lies first.
+        let mut order: Vec<usize> = (0..blocks.len()).filter(|&i| !whole[i]).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(blocks[i].1));
+        for i in order {
+            if kept <= left {
+                break;
+            }
+            whole[i] = true;
+            kept -= blocks[i].1;
+        }
+    }
+    let (mut stay, mut taken) = (Vec::with_capacity(kept), Vec::new());
+    for (&(first, n), &whole) in blocks.iter().zip(&whole) {
+        let Some(runs) = exact.get(first..first + n) else {
+            continue;
+        };
+        match (whole, runs.first(), runs.last()) {
+            (true, Some(a), Some(b)) => taken.push((a.0, b.0 + b.1 - a.0)),
+            _ => stay.extend_from_slice(runs),
+        }
+    }
+    (stay, taken)
 }
 
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
@@ -2190,6 +2281,73 @@ mod page_run_tests {
         let (exact, joined) = page_runs(0, &title, &held, 0, |_| true);
         assert!(joined.is_empty());
         assert_eq!(exact.len(), (100..60_000).step_by(37).count());
+    }
+
+    /// `n` runs of four bytes, 64 apart, from byte 8 of `block` on.
+    fn runs_in(block: usize, n: usize) -> impl Iterator<Item = (usize, usize)> {
+        (0..n).map(move |k| (block * BLOCK + 8 + k * 64, 4))
+    }
+
+    /// Whether every byte of `runs` lies in a run of `stay` or of `taken`.
+    fn covered(runs: &[(usize, usize)], stay: &[(usize, usize)], taken: &[(usize, usize)]) -> bool {
+        runs.iter().all(|&(r, m)| stay.contains(&(r, m)) || taken.iter().any(|&(a, n)| a <= r && r + m <= a + n))
+    }
+
+    /// A flagged block with more runs than the rule allows goes up as one
+    /// run, first changed byte to last; the others stay byte-exact.
+    #[test]
+    fn a_block_rewritten_in_many_places_is_one_run() {
+        use super::rewritten_blocks;
+        // Blocks 0 to 3 with 3, 40, 10 and 5 runs.
+        let exact: Vec<(usize, usize)> = runs_in(0, 3).chain(runs_in(1, 40)).chain(runs_in(2, 10)).chain(runs_in(3, 5)).collect();
+        let (stay, taken) = rewritten_blocks(0, exact.clone(), 32, 512);
+        assert_eq!(taken, [(BLOCK + 8, 39 * 64 + 4)]);
+        assert_eq!(stay.len(), 18);
+        assert!(stay.iter().all(|r| exact.contains(r)) && covered(&exact, &stay, &taken));
+        // None over the line and room for all: as they were.
+        let (stay, taken) = rewritten_blocks(0, exact.clone(), 64, 512);
+        assert_eq!(stay, exact);
+        assert!(taken.is_empty());
+    }
+
+    /// Where the submission has room for fewer exact runs than remain, the
+    /// blocks with the most runs go up whole until they fit: never more
+    /// exact runs than there is room for.
+    #[test]
+    fn the_fullest_blocks_go_whole_until_the_runs_fit() {
+        use super::rewritten_blocks;
+        let exact: Vec<(usize, usize)> = runs_in(0, 3).chain(runs_in(1, 40)).chain(runs_in(2, 10)).chain(runs_in(3, 5)).collect();
+        // Room for 9: block 1 goes by the line, block 2 (the fullest left)
+        // for room; 3 + 5 stay.
+        let (stay, taken) = rewritten_blocks(0, exact.clone(), 32, 9);
+        assert_eq!(stay.len(), 8);
+        assert_eq!(taken, [(BLOCK + 8, 39 * 64 + 4), (2 * BLOCK + 8, 9 * 64 + 4)]);
+        assert!(covered(&exact, &stay, &taken));
+        // Room for 4: block 3 goes too. No room: every block.
+        let (stay, taken) = rewritten_blocks(0, exact.clone(), 32, 4);
+        assert_eq!((stay.len(), taken.len()), (3, 3));
+        let (stay, taken) = rewritten_blocks(0, exact.clone(), 32, 0);
+        assert!(stay.is_empty() && taken.len() == 4 && covered(&exact, &stay, &taken));
+        for left in 0..60 {
+            let (stay, taken) = rewritten_blocks(0, exact.clone(), 1000, left);
+            assert!(stay.len() <= left && covered(&exact, &stay, &taken), "{left}");
+        }
+        assert_eq!(rewritten_blocks(0, Vec::new(), 32, 0), (Vec::new(), Vec::new()));
+    }
+
+    /// A run is its first byte's block's, and blocks are cut where the
+    /// card's compare cuts them: at multiples of 4 KiB of title memory,
+    /// `pos` bytes into the copy's first piece.
+    #[test]
+    fn runs_are_counted_with_the_block_they_start_in() {
+        use super::runs_by_block;
+        // The page's first byte lies 100 bytes into a block.
+        let pos = 100;
+        let exact = [(0, 4), (BLOCK - 104, 8), (BLOCK - 96, 4), (BLOCK, 4), (3 * BLOCK, 1)];
+        // Bytes 0 and BLOCK - 104 lie in the first block (the second run
+        // ends in the next); BLOCK - 96 and BLOCK in the second.
+        assert_eq!(runs_by_block(pos, &exact), [(0, 2), (2, 2), (4, 1)]);
+        assert!(runs_by_block(usize::MAX, &exact).len() <= exact.len());
     }
 }
 
@@ -3636,10 +3794,10 @@ impl Shadow {
                         // With `merge_pages`: byte-exact only where a compare
                         // ever flagged the block; elsewhere one run a stretch,
                         // outside the cap.
-                        let (runs, joined) = if merge_pages() {
-                            self.card_page_runs(at, title, held)
+                        let (runs, joined, rewritten) = if merge_pages() {
+                            self.card_page_runs(at, title, held, *runs_left)
                         } else {
-                            (joined_over(changed_runs(title, held), merge_gap()), Vec::new())
+                            (joined_over(changed_runs(title, held), merge_gap()), Vec::new(), Vec::new())
                         };
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::buffers::under_page(runs.len());
@@ -3662,6 +3820,17 @@ impl Shadow {
                             self.card_changed(at + r, at + r + m);
                             MERGED[3].fetch_add(1, Ordering::Relaxed);
                             MERGED[4].fetch_add(m as u64, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                crate::copystat::buffers::title_wrote(lo + r, m);
+                                crate::copystat::buffers::joined(lo + r, m, PREPARED.load(Ordering::Relaxed));
+                            }
+                        }
+                        for (r, m) in rewritten {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[5].fetch_add(1, Ordering::Relaxed);
+                            MERGED[6].fetch_add(m as u64, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             {
                                 crate::copystat::buffers::title_wrote(lo + r, m);
@@ -4118,10 +4287,13 @@ impl Shadow {
     /// (within one 64 KiB page) where `title` differs from `held`, as
     /// (offset from `at`, bytes): first the exact runs, in the blocks a
     /// compare ever flagged; then one run per stretch of blocks none ever
-    /// flagged, from its first changed byte to its last.
-    fn card_page_runs(&self, at: usize, title: &[u8], held: &[u8]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    /// flagged, from its first changed byte to its last; then one run for
+    /// each flagged block taken whole by the rule of [`block_runs`], which
+    /// leaves at most `left` exact runs.
+    #[allow(clippy::type_complexity)]
+    fn card_page_runs(&self, at: usize, title: &[u8], held: &[u8], left: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
         let Some(card) = &self.card else {
-            return (joined_over(changed_runs(title, held), merge_gap()), Vec::new());
+            return (joined_over(changed_runs(title, held), merge_gap()), Vec::new(), Vec::new());
         };
         use crate::card_fine::BLOCK;
         let start = self.start as usize;
@@ -4147,7 +4319,13 @@ impl Shadow {
                 crate::copystat::buffers::under_block(n);
             }
         }
-        (exact, joined)
+        match block_runs() {
+            0 => (exact, joined, Vec::new()),
+            most => {
+                let (exact, rewritten) = rewritten_blocks(pos, exact, most, left);
+                (exact, joined, rewritten)
+            }
+        }
     }
 
     /// The walls trace (`crate::host::walls_trace`): a piece of `fetched`
