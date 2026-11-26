@@ -211,11 +211,22 @@ since the upload's read (a numbered write that made the slot stale, a tell
 that lay in the texture's span and was taken for another texture's, a store
 the guards saw, blocks nothing guards, nothing). "told to the texture pass"
 counts the tells by who told, "the texture pass per frame" is the pass's
-time by part, "the texture queue by what its slots wait for" the queue. And
-"textures the title fills that the card copied into" counts the uploads
-from the game's memory that were submitted after a copy on the card into the
-same texture (they overwrite what the card wrote: the suspect for the noise
-baked onto a head).
+time by part, "the texture queue by what its slots wait for" the queue.
+
+For a texture both the game and the card write (the game's bake compresses
+its result on the card and copies it, level by level, into textures it also
+has views of), what was written last is what the texture holds, by the
+order the lists are submitted in: the copies of an upload from the game's
+memory are decided and recorded when its list is submitted, into the list's
+prelude, and left out for the levels the card wrote last. They were
+recorded while the game's list was, and an upload recorded before such a
+card copy ran after it when its list was submitted later: 27 times in one
+run, whose textures then showed what their memory had held before (noise
+baked onto a head in about half the runs). The line "textures the title
+fills that the card copied into" counts the levels copied from memory after
+the card had written them last (0 now), the uploads withheld for that, and
+the times the game was found to have written such memory after the card
+(its bytes then go up again).
 
 At the game's Submit the addresses a read into physical pages will write
 are known; until the read is done the texture pass leaves a texture there

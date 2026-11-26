@@ -772,59 +772,402 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 /// - (1) of them, those an upload from title memory had been recorded for
 ///   before (their memory holds nothing the card wrote: what its pages
 ///   held before);
-/// - (2) uploads from title memory whose list was submitted after a list
-///   that copies into the same texture on the card: they were recorded
-///   before that copy was (a recorded upload is not taken back) and run
-///   after it, so the texture ends with title memory's bytes and what the
-///   card wrote is gone, for as long as the title does not copy again;
+/// - (2) subresources copied from title memory at a submission although
+///   the card had written them last (what the card wrote is overwritten):
+///   27 uploads a run did that while uploads were decided as the lists
+///   were recorded; nothing does now, and this says so (0);
 /// - (3) textures of views the title placed in memory that lay in the
 ///   memory of such a texture when the card first copied into it: each is
 ///   a host texture of its own, filled from title memory;
 /// - (4) uploads from title memory recorded for the texture of a placed
-///   view that lies in the memory of a texture the card copied into.
-///
-/// (2) is the count that says a card-written texture was overwritten: 0
-/// in a run where none was.
-pub(crate) static CARD_WRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+///   view that lies in the memory of a texture the card copied into;
+/// - (5) uploads withheld at their list's submission, in whole or in part,
+///   because the card wrote those subresources last;
+/// - (6) uploads not asked for because the card wrote every subresource
+///   last (whether the title wrote since is asked when the list is
+///   submitted);
+/// - (7) times the title was found to have written the memory after the
+///   card wrote the texture: the subresources it wrote are its own again
+///   and go up from title memory.
+pub(crate) static CARD_WRITTEN: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// Title textures an upload from title memory was ever recorded for
 /// ([`upload`]), for [`CARD_WRITTEN`]'s second count.
 static UPLOAD_RECORDED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
-/// Per title texture the title fills and the card copied into: the card
-/// copies into it whose lists were submitted so far ([`host_written`]'s
-/// submission-time step counts them, in the order the lists run).
-static CARD_COPIES_SUBMITTED: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
-
 /// The line on [`CARD_WRITTEN`], with the periodic lines; nothing while
 /// the card has copied into no texture the title fills.
 pub(crate) fn card_written_line() {
     use std::sync::atomic::Ordering::Relaxed;
-    let [first, uploaded_before, overtaken, placed_inside, placed_uploads] = CARD_WRITTEN.each_ref().map(|c| c.load(Relaxed));
+    let [first, uploaded_before, overtaken, placed_inside, placed_uploads, withheld, unasked, again] =
+        CARD_WRITTEN.each_ref().map(|c| c.load(Relaxed));
     if first == 0 {
         return;
     }
     tracing::info!(
         "textures the title fills that the card copied into, since the start: {first} at their first copy, {uploaded_before} \
-         of them with an upload from title memory recorded before it; {overtaken} uploads from title memory submitted after \
-         a card copy into the same texture (what the card wrote is overwritten: 0 if none was); {placed_inside} textures of \
-         placed views lay in the memory of such a texture at its first copy, {placed_uploads} uploads from title memory \
-         into such textures"
+         of them with an upload from title memory recorded before it; {overtaken} subresources copied from title memory \
+         after the card had written them last (what the card wrote is overwritten: 0 if none was); {withheld} uploads \
+         withheld at submission because the card wrote last, {unasked} not asked for because it wrote all of the texture \
+         last, {again} times the title was found to have written the memory after the card (uploaded again); \
+         {placed_inside} textures of placed views lay in the memory of such a texture at its first copy, {placed_uploads} \
+         uploads from title memory into such textures"
     );
 }
 
-/// A host copy or resolve recorded in `list` writes `resource`, whose host
-/// copy is `texture`.
-pub(crate) fn host_written(list: &HostList, resource: This, texture: &ID3D12Resource) {
+/// Where a title texture's memory is and how its subresources lie in it,
+/// for what the card wrote of it ([`CardState`]). Taken when a list records
+/// a card copy into the texture, while the title's object is surely there:
+/// the list may be submitted after the title let the object go.
+#[derive(Clone, Debug)]
+pub(crate) struct Where {
+    start: usize,
+    size: usize,
+    /// The memory by level ([`memory_parts`]) and the part each level's
+    /// bytes lie in.
+    parts: Vec<(usize, usize)>,
+    part_of_level: Vec<u8>,
+    /// Levels a layer, and subresources in all.
+    levels: u32,
+    total: u32,
+}
+
+impl Where {
+    /// Of a texture of `size` bytes at `start` with `levels` levels a
+    /// layer and `total` subresources, laid out in `slices` slices with
+    /// the levels before the shared block of the smallest ones at
+    /// `offsets`.
+    fn new(start: usize, size: u64, slices: u32, offsets: &[u64], levels: u32, total: u32) -> Where {
+        let parts = memory_parts(size, slices, offsets);
+        let part_of_level = (0..levels as usize)
+            .map(|level| match offsets.get(level) {
+                Some(&at) if parts.len() > 1 => parts.iter().position(|p| p.0 as u64 == at).unwrap_or(0) as u8,
+                _ => 0,
+            })
+            .collect();
+        Where { start, size: size as usize, parts, part_of_level, levels: levels.max(1), total: total.max(1) }
+    }
+
+    /// Subresource `sub` as a bit of a mask; every bit for a texture of
+    /// more subresources than a mask tells apart (it is then all the
+    /// card's or all the title's).
+    fn bit(&self, sub: u32) -> u64 {
+        subresource_bit(sub, self.total)
+    }
+
+    /// Every subresource.
+    fn all(&self) -> u64 {
+        if self.total >= 64 { u64::MAX } else { (1u64 << self.total) - 1 }
+    }
+
+    /// A digest of each part of the memory as it is now (never 0), read
+    /// through the kernel so that pages not there count as zeros. All 0 for
+    /// a texture too long to be one (nothing is then ever told changed).
+    fn digests(&self) -> [u64; crate::census::PARTS] {
+        let mut out = [0u64; crate::census::PARTS];
+        if self.size == 0 || self.size > 1 << 30 {
+            return out;
+        }
+        // (A buffer of its own: this runs between a list's reads, and the
+        // thread's read buffer may be lent out.)
+        let mut bytes = vec![0u8; self.size];
+        crate::host::copy_mapped(bytes.as_mut_ptr(), self.start as *const u8, self.size, false);
+        for (digest_of, &(from, to)) in out.iter_mut().zip(&self.parts) {
+            let d = digest(bytes.get(from..to.min(bytes.len())).unwrap_or(&[])).0;
+            *digest_of = (d as u64 ^ (d >> 64) as u64).max(1);
+        }
+        out
+    }
+
+    /// The subresources whose bytes lie in a part that differs between the
+    /// digests `a` and `b`.
+    fn changed(&self, a: &[u64; crate::census::PARTS], b: &[u64; crate::census::PARTS]) -> u64 {
+        let mut subs = 0;
+        for sub in 0..self.total.min(64) {
+            let part = self.part_of_level.get((sub % self.levels) as usize).copied().unwrap_or(0) as usize;
+            if a.get(part) != b.get(part) {
+                subs |= self.bit(sub);
+            }
+        }
+        subs
+    }
+}
+
+/// Subresource `sub` of `total` as a bit of a mask (see [`Where::bit`]).
+fn subresource_bit(sub: u32, total: u32) -> u64 {
+    if total > 64 { u64::MAX } else { 1u64 << sub.min(63) }
+}
+
+/// [`Where`] for title texture `resource` with the host copy `texture`;
+/// `None` for one without memory or a console layout.
+fn where_of(resource: This, texture: &ID3D12Resource) -> Option<Where> {
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())?;
+    if memory.is_null() || layout.size == 0 {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let levels = u32::from(d.MipLevels).max(1);
+    let total = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        levels
+    } else {
+        levels * u32::from(d.DepthOrArraySize).max(1)
+    };
+    let tail = (layout.first_tail_mip as usize).min(layout.mips.len());
+    let offsets: Vec<u64> = layout.mips[..tail].iter().map(|m| m.offset).collect();
+    Some(Where::new(memory as usize, layout.size, layout.slices, &offsets, levels, total))
+}
+
+/// What the card wrote of a title texture's host copy since the title last
+/// wrote the texture's memory: for a texture both can write, who wrote
+/// last is right, and an upload from title memory must not run after a
+/// card copy into the same subresource unless the title wrote the memory
+/// in between. It lives in the host copy (as upstream's flag does,
+/// Marvisak/VIctory pull request #1934) and changes only when a list is
+/// submitted, in the order the lists run ([`decide_uploads`],
+/// [`CardWrite::publish`]): a list that is recorded and never sent changes
+/// nothing.
+///
+/// "The title wrote since" is told by the memory itself: a digest of each
+/// level's bytes is kept from the card's write, and a subresource whose
+/// bytes are other than then is the title's again (as AndyLatimer's branch
+/// tells it for memory nothing watches, d5344a8; here for all of it, by
+/// level). The bytes are read only when the write journal or the guards
+/// say something may have written them ([`crate::watch::seen_since`]).
+#[derive(Default)]
+pub(crate) struct CardState {
+    /// The subresources the card wrote last (a bit each), and every
+    /// subresource the texture has (0 until the card first wrote it), for
+    /// those who ask without the lock.
+    subs: std::sync::atomic::AtomicU64,
+    all: std::sync::atomic::AtomicU64,
+    card: Mutex<Option<Card>>,
+}
+
+/// See [`CardState`]: where the memory is, the digests of its parts when
+/// they were last compared, and the journal's asking that was after.
+struct Card {
+    memory: Where,
+    digests: [u64; crate::census::PARTS],
+    asked: u64,
+}
+
+/// Has the write watch or the guards take `memory` anew, so that a store
+/// after this is seen: the asking's number (0: nothing watches it).
+fn watch_anew(memory: &Where) -> u64 {
+    crate::watch::writes(memory.start, memory.start.saturating_add(memory.size), false)
+        .or_else(|| crate::watch::writes(memory.start, memory.start.saturating_add(memory.size), true))
+        .map_or(0, |(now, _)| now)
+}
+
+impl CardState {
+    /// Whether something may have written the memory since its bytes were
+    /// last compared: asked of the journal and the guards, no byte read.
+    fn maybe_written(card: &Card) -> bool {
+        let end = card.memory.start.saturating_add(card.memory.size);
+        let (noted, written, open) = crate::watch::seen_since(card.memory.start, end, card.asked);
+        noted || written > 0 || open > 0
+    }
+
+    /// Compares the memory with what it held when last compared, if
+    /// something may have written it: the card-written subresources whose
+    /// bytes are other now are the title's again. Returns them.
+    fn settle(&self, card: &mut Card) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !Self::maybe_written(card) {
+            return 0;
+        }
+        let asked = watch_anew(&card.memory);
+        let now = card.memory.digests();
+        let rewritten = card.memory.changed(&card.digests, &now) & self.subs.load(Relaxed);
+        (card.digests, card.asked) = (now, asked);
+        if rewritten != 0 {
+            self.subs.fetch_and(!rewritten, Relaxed);
+        }
+        rewritten
+    }
+
+    /// At the submission of a list that asks for an upload of the
+    /// subresources `wanted` from title memory: those to copy (the title's
+    /// bytes are the last written), those withheld (the card's are), and
+    /// those of the first that the title wrote after the card.
+    fn decide(&self, wanted: u64) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.subs.load(Relaxed) & wanted == 0 {
+            return (wanted, 0, 0);
+        }
+        let mut card = self.card.lock().unwrap_or_else(|e| e.into_inner());
+        let rewritten = card.as_mut().map_or(0, |card| self.settle(card));
+        let subs = self.subs.load(Relaxed);
+        (wanted & !subs, wanted & subs, rewritten & wanted)
+    }
+
+    /// At the submission of a list that writes the subresources `subs` of
+    /// the texture at `memory` on the card: from here on the card's bytes
+    /// stand for them. What the title wrote before is settled first, so
+    /// that a subresource it wrote and this list does not write stays the
+    /// title's.
+    fn wrote(&self, memory: &Where, subs: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut card = self.card.lock().unwrap_or_else(|e| e.into_inner());
+        match card.as_mut() {
+            Some(card) => {
+                self.settle(card);
+            }
+            None => {
+                let asked = watch_anew(memory);
+                self.all.store(memory.all(), Relaxed);
+                *card = Some(Card { digests: memory.digests(), memory: memory.clone(), asked });
+            }
+        }
+        self.subs.fetch_or(subs, Relaxed);
+    }
+
+    /// For a list being recorded: whether the card wrote every subresource
+    /// last, as far as the lists submitted so far say. Two loads: nothing
+    /// is asked of the journal or the guards on a thread that records.
+    /// Such a list asks for no upload and has the memory looked at when it
+    /// is submitted ([`CardState::check`]).
+    fn all_card(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let all = self.all.load(Relaxed);
+        all != 0 && self.subs.load(Relaxed) & all == all
+    }
+
+    /// At the submission of a list that asked for no upload because the
+    /// card wrote all of the texture last: whether the title wrote its
+    /// memory since. The subresources it wrote are its own again, and the
+    /// next list that samples the texture uploads them.
+    fn check(&self) -> u64 {
+        let mut card = self.card.lock().unwrap_or_else(|e| e.into_inner());
+        card.as_mut().map_or(0, |card| self.settle(card))
+    }
+
+    /// The subresources the card wrote last (tests).
+    #[cfg(test)]
+    pub(crate) fn subs(&self) -> u64 {
+        self.subs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A card copy or resolve a list recorded into a texture the title fills:
+/// noted for the lists after it when the list is submitted
+/// ([`CardWrite::publish`]).
+pub(crate) struct CardWrite {
+    copy: Arc<crate::resource::HostTexture>,
+    memory: Where,
+    subs: u64,
+}
+
+impl CardWrite {
+    /// The list is submitted: the card's bytes stand for what it writes.
+    pub(crate) fn publish(&self) {
+        self.copy.card.wrote(&self.memory, self.subs);
+    }
+}
+
+/// An upload from title memory a list asked for ([`upload`]): decided when
+/// the list is submitted ([`decide_uploads`]) and recorded into its prelude
+/// ([`record_copies`]). `copied`: the levels it would write (all but those
+/// a texture made without them leaves out).
+pub(crate) struct TextureUpload {
+    copy: Arc<crate::resource::HostTexture>,
+    staging: Arc<Staging>,
+    copied: u32,
+}
+
+/// What [`decide_uploads`] found to copy: the host copy, the staging
+/// buffer, and the subresources (a bit each, see [`Where::bit`]).
+pub(crate) type Copies = (Arc<crate::resource::HostTexture>, Arc<Staging>, u64);
+
+/// At a list's submission: the textures it asked no upload for because the
+/// card wrote all of them last are looked at ([`CardState::check`]).
+pub(crate) fn check_card_written(copies: &[Arc<crate::resource::HostTexture>]) {
+    for copy in copies {
+        if copy.card.check() != 0 {
+            CARD_WRITTEN[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// At a list's submission, before the card writes it records are noted:
+/// which of the uploads it asked for are made. One is made if the staging
+/// buffer holds bytes its host copy lacks (never uploaded, or detiled anew
+/// since: its refresh ran with the list's steps), and of it the
+/// subresources the card did not write last ([`CardState::decide`]).
+/// Decided here and not while the list is recorded, because lists run in
+/// the order they are submitted: an upload recorded before a card copy
+/// into the same texture ran after it when its list was submitted later,
+/// and what the card had written was gone (Marvisak/VIctory issue #1891
+/// and pull request #1934, zondy1i, whose design this is).
+pub(crate) fn decide_uploads(uploads: &[TextureUpload]) -> Vec<Copies> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut copies = Vec::new();
+    for upload in uploads {
+        let staging = &upload.staging;
+        let wanted = staging.subresources(upload.copied);
+        let (subs, withheld, rewritten) = upload.copy.card.decide(wanted);
+        CARD_WRITTEN[5].fetch_add(u64::from(withheld != 0), Relaxed);
+        CARD_WRITTEN[7].fetch_add(u64::from(rewritten != 0), Relaxed);
+        if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) && rewritten == 0 {
+            continue;
+        }
+        // The host copy then holds what the staging buffer holds, or what
+        // the card wrote after it.
+        staging.uploaded.store(true, Relaxed);
+        staging.dirty.store(false, Relaxed);
+        staging.copied.store(upload.copied, Relaxed);
+        if subs != 0 {
+            copies.push((upload.copy.clone(), staging.clone(), subs));
+        }
+    }
+    copies
+}
+
+/// Records into `list` (a list's prelude, the texture in the copy
+/// destination state) the copies of the staging buffer's subresources
+/// `subs` into the host copy.
+pub(crate) fn record_copies(list: &ID3D12GraphicsCommandList, copy: &crate::resource::HostTexture, staging: &Staging, subs: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let total = staging.first + staging.footprints.len() as u32;
+    let card = copy.card.subs.load(Relaxed);
+    for (i, footprint) in staging.footprints.iter().enumerate() {
+        let sub = staging.first + i as u32;
+        let bit = subresource_bit(sub, total);
+        if subs & bit == 0 {
+            continue;
+        }
+        // (Never: what the card wrote last is not in `subs`.)
+        CARD_WRITTEN[2].fetch_add(u64::from(card & bit != 0 && total <= 64), Relaxed);
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+        };
+        // SAFETY: an open list; both locations name resources the list
+        // that asked for the upload holds until it is reset.
+        unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+}
+
+/// A host copy or resolve recorded in `list` writes subresource `sub` of
+/// `resource` (`None`: every one), whose host copy is `texture`. For a
+/// texture the title fills, the card's bytes stand for them from the
+/// list's submission on ([`CardState`]).
+pub(crate) fn host_written(list: &HostList, resource: This, texture: &ID3D12Resource, sub: Option<u32>) {
     use std::sync::atomic::Ordering::Relaxed;
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
-    // A texture the title fills: uploads from title memory may have been
-    // recorded for it, and one of them may run after this copy
-    // ([`CARD_WRITTEN`]). Noted when this list is submitted, in the order
-    // the lists run.
     if title_written(texture) {
         if new {
             CARD_WRITTEN[0].fetch_add(1, Relaxed);
@@ -835,14 +1178,13 @@ pub(crate) fn host_written(list: &HostList, resource: This, texture: &ID3D12Reso
                 .is_some_and(|set| set.contains(&(resource as usize)));
             CARD_WRITTEN[1].fetch_add(u64::from(uploaded), Relaxed);
         }
-        let key = resource as usize;
-        list.defer_host(move || {
-            let mut copies = CARD_COPIES_SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
-            *copies.get_or_insert_with(HashMap::new).entry(key).or_insert(0) += 1;
-        });
+        if let Some(copy) = crate::resource::host_copy(resource)
+            && let Some(memory) = where_of(resource, texture)
+        {
+            let subs = sub.map_or(memory.all(), |sub| memory.bit(sub));
+            list.card_write(CardWrite { copy, memory, subs });
+        }
     }
-    // Diagnostics (run 177): where its title memory is, for placed views
-    // the title reads that memory through ([`placed_in_host_written`]).
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
         // SAFETY: 56 bytes in the description's layout.
         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
@@ -922,40 +1264,6 @@ fn upload_recorded(resource: This) {
     }
 }
 
-/// For [`upload`]'s submission-time step: the upload of `resource` from
-/// title memory is submitted now. Counts and says the one that comes after
-/// a card copy into the same texture ([`CARD_WRITTEN`]).
-fn upload_submitted(resource: usize, staging: &Staging) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let copies = CARD_COPIES_SUBMITTED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|copies| copies.get(&resource).copied())
-        .unwrap_or(0);
-    if copies == 0 {
-        return;
-    }
-    let n = CARD_WRITTEN[2].fetch_add(1, Relaxed);
-    if n < 8 || n.is_multiple_of(64) {
-        let d = &staging.layout.desc;
-        tracing::warn!(
-            texture = format_args!("{resource:#x}"),
-            memory = format_args!("{:#x}", staging.memory as usize),
-            bytes = staging.layout.size,
-            width = d.width,
-            height = d.height,
-            levels = d.mips,
-            format = staging.footprints.first().map_or(0, |f| f.Footprint.Format.0),
-            card_copies_submitted_before = copies,
-            frame = crate::frame::current(),
-            so_far = n + 1,
-            "an upload from title memory is submitted after a card copy into the same texture: it was recorded before \
-             the copy was, runs after it and overwrites what the card wrote"
-        );
-    }
-}
-
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
@@ -1023,9 +1331,6 @@ pub(crate) fn forget(resource: usize) {
     if let Some(set) = UPLOAD_RECORDED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         set.remove(&resource);
     }
-    if let Some(copies) = CARD_COPIES_SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        copies.remove(&resource);
-    }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
     HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
@@ -1048,14 +1353,27 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
+    if !list.first_use(resource as usize) {
+        return;
+    }
+    // A texture the card wrote all of last: the host copy has what is
+    // right unless the title wrote the memory since, which is asked when
+    // the list is submitted (its next reader then uploads); no staging
+    // buffer is made and no byte read for it. (Whether the card wrote is
+    // what lists submitted so far did; a card copy only recorded, in any
+    // list, changes nothing here: an upload asked for is decided when its
+    // own list is submitted.)
+    let card_copied = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    if card_copied
+        && let Some(copy) = crate::resource::host_copy(resource)
+        && copy.card.all_card()
+    {
+        CARD_WRITTEN[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        list.card_check(copy);
         return;
     }
     let Some(mut staging) = staging(resource, texture) else {
@@ -1121,10 +1439,19 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         staging.dirty.store(true, Relaxed);
     }
     // The host texture has the staging buffer's contents: only the check
-    // at submission is left, and what it finds changed the next list that
-    // samples the texture uploads (a frame late where every list of the
-    // frame was recorded before that check).
+    // at submission is left. What it finds changed goes up in that
+    // submission, since the copies are decided there ([`decide_uploads`]):
+    // the list asks for the upload all the same. (It was the next list
+    // that samples the texture that uploaded it, a frame late where every
+    // list of the frame was recorded before that check. Still so for a
+    // texture made level by level, whose levels get their memory by a step
+    // of the list that uploads them.)
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+        if !staging.on_demand
+            && let Some(copy) = crate::resource::host_copy(resource)
+        {
+            list.defer_upload(TextureUpload { copy, staging: staging.clone(), copied });
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         // The list reads the texture all the same (through a table copied
@@ -1148,72 +1475,30 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     upload_recorded(resource);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
-    for (i, footprint) in staging.footprints.iter().enumerate() {
-        let sub = staging.first + i as u32;
-        let level = sub % staging.mips;
-        if level < 32 && copied & (1 << level) == 0 {
-            continue;
-        }
-        #[cfg(feature = "diagnostics")]
-        {
-            let f = footprint.Footprint;
-            // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
-            list.note_read(
-                || {
-                    format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {sub} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        d.Width,
-                        d.Height,
-                        d.DepthOrArraySize,
-                        d.Format.0,
-                        d.MipLevels,
-                        staging.footprints.len(),
-                        staging.size,
-                        footprint.Offset,
-                        f.Width,
-                        f.Height,
-                        f.Depth,
-                        f.RowPitch
-                    )
-                },
-                (gpu + footprint.Offset, len),
-            );
-        }
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: sub,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    }
-    // When the list is submitted, its copy takes what the staging buffer
-    // holds by then: noted before the check below, which sets `dirty`
-    // again if it detiles (the next list then uploads once more).
-    {
-        let staging = staging.clone();
-        let key = resource as usize;
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
-            staging.copied.store(copied, Relaxed);
-            upload_submitted(key, &staging);
-        });
+    // The copies out of the staging buffer are not recorded here: whether
+    // they are made, and of which subresources, is decided when the list
+    // is submitted ([`decide_uploads`]), and they go into the list's
+    // prelude, ahead of the list. The staging buffer lives as long as
+    // `staging`, which the deferred refresh below holds until the list is
+    // reset.
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        format!(
+            "texture upload {resource:?} ({}x{}x{} f{} mips {}) asked for: {} subresources from a staging of {:#x} bytes, \
+             levels {copied:#x}, copied in the prelude if title memory is what was written last",
+            d.Width,
+            d.Height,
+            d.DepthOrArraySize,
+            d.Format.0,
+            d.MipLevels,
+            staging.footprints.len(),
+            staging.size
+        )
+    });
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        list.defer_upload(TextureUpload { copy, staging: staging.clone(), copied });
     }
     // Levels on demand (`crate::tiles`): after the check below, in the
     // order of this list's steps, and before the list is executed, the
@@ -1784,6 +2069,21 @@ impl Staging {
             crate::census::read((why - 1) as u8, self.memory as u64, self.layout.size, self.bytes, Some(&read[..n]));
         }
         if n <= 1 { digest(tiled) } else { digest(&folded[..16 * n]) }
+    }
+
+    /// The subresources an upload of the levels `copied` writes from this
+    /// staging buffer, a bit each ([`subresource_bit`]).
+    fn subresources(&self, copied: u32) -> u64 {
+        let total = self.first + self.footprints.len() as u32;
+        let mut subs = 0;
+        for i in 0..self.footprints.len() as u32 {
+            let sub = self.first + i;
+            let level = sub % self.mips.max(1);
+            if level >= 32 || copied & (1 << level) != 0 {
+                subs |= subresource_bit(sub, total);
+            }
+        }
+        subs
     }
 
     /// The bytes from the start of the texture's memory that the levels
@@ -2573,6 +2873,66 @@ mod digest_tests {
 
     /// The digest tells every length and every changed byte apart, zeros
     /// among them (avatarmanz/VIctory-7900XTX 2dfba4dbd).
+    /// What the card wrote last stays the card's until the title writes
+    /// that level's bytes, level by level: a level the card did not write
+    /// comes from title memory, one the title wrote after the card is the
+    /// title's again, and a card write after that is the card's. (The
+    /// memory here is a buffer of the test's: nothing watches it, so it is
+    /// compared every time.)
+    #[test]
+    fn the_card_keeps_a_level_until_the_title_writes_it() {
+        use super::{CardState, Where, subresource_bit};
+        // Two levels in 0x3000 bytes: the block of the small one first,
+        // then level 0 from 0x1000.
+        let mut memory = vec![7u8; 0x3000];
+        let at = Where::new(memory.as_ptr() as usize, 0x3000, 1, &[0x1000], 2, 2);
+        assert_eq!((at.all(), at.bit(0), at.bit(1)), (3, 1, 2));
+        let card = CardState::default();
+        // Nothing is the card's: every level asked for is copied.
+        assert!(!card.all_card());
+        assert_eq!(card.decide(3), (3, 0, 0));
+        assert_eq!(card.check(), 0);
+        // The card writes level 0: it is withheld, level 1 is copied.
+        card.wrote(&at, 1);
+        assert_eq!(card.subs(), 1);
+        assert!(!card.all_card());
+        assert_eq!(card.decide(3), (2, 1, 0));
+        assert_eq!(card.decide(2), (2, 0, 0));
+        // The title writes level 0's bytes: its own again, and said so.
+        memory[0x2000] = 9;
+        assert_eq!(card.decide(3), (3, 0, 1));
+        assert_eq!(card.subs(), 0);
+        assert_eq!(card.decide(3), (3, 0, 0));
+        // The card writes both, the title then the small level alone.
+        card.wrote(&at, 3);
+        assert!(card.all_card());
+        assert_eq!(card.check(), 0);
+        memory[0x10] = 1;
+        assert_eq!(card.check(), 2);
+        assert_eq!(card.subs(), 1);
+        // The title writes level 0 and the card then writes level 1: what
+        // the title wrote of the level the card does not write stays the
+        // title's.
+        memory[0x2800] = 3;
+        card.wrote(&at, 2);
+        assert_eq!(card.subs(), 2);
+        assert_eq!(card.decide(3), (1, 2, 0));
+        // A texture of more subresources than a mask tells apart is all
+        // the card's or all the title's; one of several slices is one part.
+        let many = Where::new(memory.as_ptr() as usize, 0x3000, 6, &[0x1000], 12, 72);
+        assert_eq!((many.all(), many.bit(3), many.bit(71)), (u64::MAX, u64::MAX, u64::MAX));
+        assert_eq!(many.changed(&[1; crate::census::PARTS], &[2; crate::census::PARTS]), u64::MAX);
+        assert_eq!(many.changed(&[1; crate::census::PARTS], &[1; crate::census::PARTS]), 0);
+        assert_eq!((subresource_bit(0, 1), subresource_bit(63, 64), subresource_bit(200, 64)), (1, 1 << 63, 1 << 63));
+        // No bytes, or more than a texture has: nothing is read, nothing
+        // is ever told changed.
+        let none = Where::new(0, 0, 1, &[], 1, 1);
+        assert_eq!(none.digests(), [0; crate::census::PARTS]);
+        let huge = Where::new(0, 1 << 40, 1, &[], 1, 1);
+        assert_eq!(huge.digests(), [0; crate::census::PARTS]);
+        drop(memory);
+    }
+
     /// A texture's memory is told apart at the starts of its levels, in
     /// memory order, the block of the smallest ones first; one of several
     /// slices, or of more levels than are told apart, is one part.

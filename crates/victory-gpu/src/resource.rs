@@ -682,6 +682,11 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Its format and its texels: width, height, depth.
+    pub(crate) fn extent(&self) -> (u32, [u32; 3]) {
+        (self.format, [self.width, self.height, self.depth])
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -1157,6 +1162,10 @@ pub(crate) struct HostTexture {
     /// Made in the PC's memory the card reads over the bus ([`spill_on`]):
     /// counted in [`SPILLED`] while it lives, not as the card's.
     spilled: bool,
+    /// What the card itself wrote of it since the title last wrote the
+    /// texture's memory (`crate::texture::CardState`): uploads from title
+    /// memory leave that alone.
+    pub(crate) card: crate::texture::CardState,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -2435,6 +2444,7 @@ impl HostTexture {
             tiled: None,
             reuse: None,
             spilled: false,
+            card: crate::texture::CardState::default(),
         }
     }
 
@@ -2457,6 +2467,7 @@ impl HostTexture {
             tiled: Some(tiled),
             reuse: Some(reuse),
             spilled: false,
+            card: crate::texture::CardState::default(),
         }
     }
 }
@@ -4126,6 +4137,221 @@ mod tests {
         for row in 0..4 {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
+        }
+    }
+
+    /// For a texture both the title and the card write, what was written
+    /// last is what it holds, by the order the lists are submitted in and
+    /// not the order they were recorded in: an upload from title memory
+    /// recorded before a card copy and submitted after it leaves the
+    /// card's texels (it overwrote them: 27 times in a run of the title,
+    /// whose bake copies its result into textures the texture pass had
+    /// just asked uploads for; Marvisak/VIctory issue #1891 and pull
+    /// request #1934). The title's bytes come back when it writes the
+    /// memory after the card; a level the card did not write is the
+    /// title's; a card copy recorded and never submitted changes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_holds_what_was_written_last_by_the_order_of_submission() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const SHADER_READ: u32 = 0x80;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        // Fills every texel of a texture's title memory with one colour.
+        let fill = |t: This, colour: [u8; 4]| {
+            let desc = resource(t).desc;
+            let size = texture_layout(&desc).unwrap().planes[0].layout.size as usize;
+            let (memory, _) = texture_memory(t).unwrap();
+            // SAFETY: the texture's own committed memory, `size` bytes.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(memory.cast_mut(), size) };
+            for texel in bytes.chunks_exact_mut(4) {
+                texel.copy_from_slice(&colour);
+            }
+        };
+        // A 4x4 texture the title fills, of `levels` levels, in one colour.
+        let make = |levels: u16, colour: [u8; 4]| -> This {
+            let mut t = null;
+            let desc = ResourceDesc { layout: 1, ..texture(4, 4, 28, levels) };
+            assert_eq!(create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut t), S_OK);
+            fill(t, colour);
+            t
+        };
+        // The first texel of subresource `sub` of a texture's host copy.
+        let texel = |t: This, sub: u32| -> [u8; 4] {
+            let image = host_resource(t).unwrap();
+            // SAFETY: live resources, an open list, a finished copy.
+            unsafe {
+                let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let mut total = 0u64;
+                host.device.GetCopyableFootprints(&image.GetDesc(), sub, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+                let mut readback: Option<ID3D12Resource> = None;
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: total.max(256),
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut readback,
+                    )
+                    .unwrap();
+                let readback = readback.unwrap();
+                let back = host.new_list().unwrap();
+                if let Some((_, before)) = host_transition(t, COPY_SOURCE) {
+                    back.list.ResourceBarrier(&[crate::host::transition(
+                        image,
+                        D3D12_RESOURCE_STATES(before as i32),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                }
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(image),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+                };
+                back.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                back.close();
+                host.execute(&[&back]);
+                let mut mapped = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                let texel = mapped.cast::<u8>().add(footprint.Offset as usize).cast::<[u8; 4]>().read_unaligned();
+                readback.Unmap(0, None);
+                texel
+            }
+        };
+        // A list that samples `t`: its upload is asked for, as a draw's
+        // table read asks.
+        let reads = |t: This| {
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, t, host_resource(t).unwrap());
+            crate::list::ensure_state(&list, t, SHADER_READ);
+            list.close();
+            list
+        };
+        // A list that copies `from` into `to` on the card: all of it, or
+        // all of one subresource (as `copy_resource` and
+        // `copy_texture_region` record it).
+        let copies = |to: This, from: This, sub: Option<u32>| {
+            let list = host.new_list().unwrap();
+            let (host_to, host_from) = (host_resource(to).unwrap(), host_resource(from).unwrap());
+            crate::texture::upload(&list, from, host_from);
+            crate::list::ensure_state(&list, to, COPY_DEST);
+            crate::list::ensure_state(&list, from, COPY_SOURCE);
+            crate::texture::host_written(&list, to, host_to, sub);
+            // SAFETY: an open list, live textures in the copy states.
+            unsafe {
+                match sub {
+                    None => list.list.CopyResource(host_to, host_from),
+                    Some(sub) => {
+                        let part = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: std::mem::transmute_copy(texture),
+                            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+                        };
+                        list.list.CopyTextureRegion(&part(host_to), 0, 0, 0, &part(host_from), None);
+                    }
+                }
+            }
+            list.close();
+            list
+        };
+        let (red, green, blue) = ([200, 10, 10, 255], [10, 200, 10, 255], [10, 10, 200, 255]);
+        let counts = || crate::texture::CARD_WRITTEN.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        let before = counts();
+
+        // The upload recorded first, the card copy submitted first: the
+        // card wrote last.
+        let (t, s) = (make(1, red), make(1, green));
+        let upload = reads(t);
+        let copy = copies(t, s, None);
+        host.execute(&[&copy]);
+        host.execute(&[&upload]);
+        assert_eq!(texel(t, 0), green, "an upload recorded before a card copy and submitted after it overwrote the card's texels");
+        assert_eq!(host_copy(t).unwrap().card.subs(), 1);
+        // The same in one submission.
+        let (t2, s2) = (make(1, red), make(1, green));
+        let upload = reads(t2);
+        let copy = copies(t2, s2, None);
+        host.execute(&[&copy, &upload]);
+        assert_eq!(texel(t2, 0), green, "in one submission");
+        // And the other order: the upload submitted first, then the copy.
+        let (t3, s3) = (make(1, red), make(1, green));
+        let copy = copies(t3, s3, None);
+        let upload = reads(t3);
+        host.execute(&[&upload, &copy]);
+        assert_eq!(texel(t3, 0), green, "the copy submitted last");
+        // A list that samples it later leaves the card's texels, whether
+        // it was recorded before or after.
+        let later = reads(t);
+        host.execute(&[&later]);
+        assert_eq!(texel(t, 0), green, "a later reader");
+        let now = counts();
+        assert_eq!(now[2], before[2], "nothing copied from title memory over what the card wrote last");
+        assert!(now[5] + now[6] >= before[5] + before[6] + 3, "the uploads withheld or not asked for are counted");
+
+        // The title writes the memory after the card: its bytes are the
+        // last written. The list that samples it then has that found when
+        // it is submitted, and the next one uploads them.
+        fill(t, blue);
+        let again = reads(t);
+        host.execute(&[&again]);
+        assert_eq!(host_copy(t).unwrap().card.subs(), 0, "the title wrote after the card: found at a submission");
+        let again = reads(t);
+        host.execute(&[&again]);
+        assert_eq!(texel(t, 0), blue, "the title wrote after the card");
+        assert!(counts()[7] > before[7], "an upload made again because the title wrote after the card is counted");
+        // And the card after the title again.
+        let copy = copies(t, s, None);
+        host.execute(&[&copy]);
+        assert_eq!(texel(t, 0), green, "the card wrote after the title");
+        let later = reads(t);
+        host.execute(&[&later]);
+        assert_eq!(texel(t, 0), green);
+
+        // A card copy into one level: the other level is the title's, and
+        // comes from its memory though the upload is submitted after the
+        // copy.
+        let (levels, source) = (make(2, red), make(2, green));
+        let upload = reads(levels);
+        let copy = copies(levels, source, Some(0));
+        host.execute(&[&copy]);
+        host.execute(&[&upload]);
+        assert_eq!(texel(levels, 0), green, "the level the card wrote");
+        assert_eq!(texel(levels, 1), red, "the level it did not write is the title's");
+        assert_eq!(host_copy(levels).unwrap().card.subs(), 1);
+
+        // A card copy recorded and never submitted changes nothing: the
+        // texture is the title's.
+        let (never, source2) = (make(1, red), make(1, green));
+        let dropped = copies(never, source2, None);
+        dropped.reset();
+        let upload = reads(never);
+        host.execute(&[&upload]);
+        assert_eq!(texel(never, 0), red, "a copy that was never submitted");
+        assert_eq!(host_copy(never).unwrap().card.subs(), 0);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        for t in [t, s, t2, s2, t3, s3, levels, source, never, source2] {
+            resource_release(t);
         }
     }
 

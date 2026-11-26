@@ -2262,6 +2262,16 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// The uploads of textures from title memory the list asked for, and
+    /// the card copies it records into textures the title fills: decided
+    /// and noted when the list is submitted, in [`HostList::prelude`]
+    /// (`crate::texture` `decide_uploads`, `CardWrite::publish`).
+    texture_uploads: Vec<crate::texture::TextureUpload>,
+    card_writes: Vec<crate::texture::CardWrite>,
+    /// The textures the list asked no upload for because the card wrote
+    /// all of them last: looked at when the list is submitted, for what
+    /// the title wrote since (`crate::texture` `check_card_written`).
+    card_checks: Vec<std::sync::Arc<crate::resource::HostTexture>>,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -7475,6 +7485,20 @@ impl HostList {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // The uploads from title memory the list asked for: which are made
+        // is decided now, with what the lists submitted before this one
+        // wrote on the card; then what this list writes on the card is
+        // noted for the lists after it. (Its own copies run after its
+        // prelude: an upload it asked for is theirs to overwrite.)
+        let uploads = {
+            let deferred = self.deferred();
+            let uploads = crate::texture::decide_uploads(&deferred.texture_uploads);
+            crate::texture::check_card_written(&deferred.card_checks);
+            for write in &deferred.card_writes {
+                write.publish();
+            }
+            uploads
+        };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -7526,6 +7550,23 @@ impl HostList {
                 }
             }
         }
+        // An upload runs with its texture a copy destination, as a twin
+        // copy does: there from its real state, and on to the state the
+        // list starts with.
+        for (copy, ..) in &uploads {
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            if copying.contains_key(&key) {
+                continue;
+            }
+            let real = copy.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(&copy.texture, host_state(COPY_DEST), host_state(real)));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
@@ -7537,7 +7578,7 @@ impl HostList {
         let hoisted = (!hoist_runs.is_empty())
             .then(|| self.hoist_buffers.get().and_then(|b| b.as_ref()))
             .flatten();
-        if barriers.is_empty() && syncs.is_empty() && hoisted.is_none() {
+        if barriers.is_empty() && syncs.is_empty() && hoisted.is_none() && uploads.is_empty() {
             return None;
         }
         let mut again_held = self.preludes_again.lock().unwrap_or_else(|e| e.into_inner());
@@ -7576,6 +7617,9 @@ impl HostList {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
                 crate::own_time::end(list, timed);
+                for (copy, staging, subs) in &uploads {
+                    crate::texture::record_copies(list, copy, staging, *subs);
+                }
                 let timed = (!barriers.is_empty()).then(|| crate::own_time::begin(list, crate::own_time::Own::PreludeBarriers)).flatten();
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -8205,6 +8249,24 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// The list asks for an upload of a texture from title memory: decided
+    /// when the list is submitted, and then copied in its prelude.
+    pub(crate) fn defer_upload(&self, upload: crate::texture::TextureUpload) {
+        self.deferred().texture_uploads.push(upload);
+    }
+
+    /// The list samples a texture the card wrote all of last and asks no
+    /// upload for it: looked at when the list is submitted.
+    pub(crate) fn card_check(&self, copy: std::sync::Arc<crate::resource::HostTexture>) {
+        self.deferred().card_checks.push(copy);
+    }
+
+    /// The list records a card copy into a texture the title fills: noted
+    /// for the lists after it when this one is submitted.
+    pub(crate) fn card_write(&self, write: crate::texture::CardWrite) {
+        self.deferred().card_writes.push(write);
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`

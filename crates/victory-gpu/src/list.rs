@@ -840,6 +840,37 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+#[cfg(all(test, windows))]
+mod whole_tests {
+    /// A copy writes all of a subresource when it starts at its corner and
+    /// brings as many elements as it has: texel for texel, block for
+    /// block, or a texel for a block between a block-compressed format and
+    /// one whose texel is as wide (the bake's copies).
+    #[test]
+    fn a_copy_of_every_element_writes_the_whole_subresource() {
+        use super::writes_whole;
+        // RGBA8 4x4 into RGBA8 4x4.
+        assert!(writes_whole((28, [4, 4, 1]), [0; 3], (28, [4, 4, 1])));
+        // A part of it, or not at its corner.
+        assert!(!writes_whole((28, [4, 4, 1]), [0; 3], (28, [2, 4, 1])));
+        assert!(!writes_whole((28, [4, 4, 1]), [1, 0, 0], (28, [4, 4, 1])));
+        // 512x512 texels of 16 bytes into a 2048x2048 BC3 level, and the
+        // last levels: one texel for a level of 2x2 and of 1x1 texels.
+        assert!(writes_whole((78, [2048, 2048, 1]), [0; 3], (3, [512, 512, 1])));
+        assert!(writes_whole((78, [2, 2, 1]), [0; 3], (3, [1, 1, 1])));
+        assert!(writes_whole((78, [1, 1, 1]), [0; 3], (3, [1, 1, 1])));
+        assert!(!writes_whole((78, [2048, 2048, 1]), [0; 3], (3, [64, 64, 1])));
+        // Block for block, and a volume's depth.
+        assert!(writes_whole((71, [256, 256, 1]), [0; 3], (71, [256, 256, 1])));
+        assert!(!writes_whole((28, [4, 4, 4]), [0; 3], (28, [4, 4, 1])));
+        // A format with no known element, nothing copied, the top of the
+        // range: a part, never a panic.
+        assert!(!writes_whole((0, [4, 4, 1]), [0; 3], (28, [4, 4, 1])));
+        assert!(!writes_whole((28, [4, 4, 1]), [0; 3], (28, [0, 0, 0])));
+        assert!(!writes_whole((28, [u32::MAX; 3]), [u32::MAX; 3], (78, [u32::MAX; 3])));
+    }
+}
+
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
@@ -881,7 +912,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::card_writes(list, dst, to, None);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(list, dst, to);
+            crate::texture::host_written(list, dst, to, None);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -909,6 +940,36 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// The texels of subresource `sub` of a host texture described by `d`:
+/// width, height, depth.
+#[cfg(windows)]
+fn level_extent(d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, sub: u32) -> [u32; 3] {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let level = sub % u32::from(d.MipLevels).max(1);
+    let down = |texels: u64| (texels >> level.min(63)).max(1).min(u64::from(u32::MAX)) as u32;
+    let depth = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { down(u64::from(d.DepthOrArraySize)) } else { 1 };
+    [down(d.Width), down(u64::from(d.Height)), depth]
+}
+
+/// Whether a copy to the corner `at` of a destination subresource (its
+/// format and texels) from a source of `source` (its format and the
+/// texels copied) writes all of that subresource. Counted in the formats'
+/// elements: the host copies between a block-compressed format and one
+/// whose texel is as wide as a block, a texel for a block (the title's
+/// bake copies its compressed result so). A format without a known element
+/// is taken to write a part.
+#[cfg(windows)]
+fn writes_whole(destination: (u32, [u32; 3]), at: [u32; 3], source: (u32, [u32; 3])) -> bool {
+    let elements = |(format, texels): (u32, [u32; 3])| {
+        let block = crate::resource::element(format)?.1.max(1) as u32;
+        Some([texels[0].div_ceil(block), texels[1].div_ceil(block), texels[2]])
+    };
+    let (Some(to), Some(from)) = (elements(destination), elements(source)) else {
+        return false;
+    };
+    at == [0; 3] && (0..3).all(|k| from[k] >= to[k])
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -1012,13 +1073,48 @@ extern "system" fn copy_texture_region(
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
+        // A copy that leaves some of the destination's subresource as it
+        // was writes over what that held: for a texture the title fills
+        // that is title memory unless the card wrote it last, so its upload
+        // is asked for first (decided, as any, when the list is submitted;
+        // Marvisak/VIctory pull request #1934). A copy of all of a
+        // subresource needs nothing of it.
+        // SAFETY: the title's box, six dwords (left, top, front, right,
+        // bottom, back), or null.
+        let boxed = (!source_box.is_null()).then(|| unsafe { *source_box });
+        if dst.kind != FOOTPRINT && crate::texture::title_written(to) {
+            let source = (src.kind != FOOTPRINT).then(|| crate::resource::host_resource(src.resource)).flatten();
+            // SAFETY: live resources.
+            let of_source = match source {
+                Some(texture) => {
+                    let d = unsafe { texture.GetDesc() };
+                    Some((d.Format.0 as u32, level_extent(&d, src.footprint.offset as u32)))
+                }
+                None => (src.kind == FOOTPRINT).then(|| src.footprint.extent()),
+            };
+            // SAFETY: a live resource.
+            let d = unsafe { to.GetDesc() };
+            let whole = of_source.is_some_and(|(format, extent)| {
+                let extent = boxed.map_or(extent, |b| {
+                    [b[3].saturating_sub(b[0]), b[4].saturating_sub(b[1]), b[5].saturating_sub(b[2])]
+                });
+                writes_whole(
+                    (d.Format.0 as u32, level_extent(&d, dst.footprint.offset as u32)),
+                    [x, y, z],
+                    (format, extent),
+                )
+            });
+            if !whole {
+                crate::texture::upload(list, dst.resource, to);
+            }
+        }
         // A destination made level by level gets the level's memory ahead
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(list, dst.resource, to);
+        crate::texture::host_written(list, dst.resource, to, (dst.kind != FOOTPRINT).then_some(dst.footprint.offset as u32));
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1170,11 +1266,21 @@ extern "system" fn resolve(
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
+        // A source smaller than the destination resolves into a part of
+        // it: what the rest held stays, so the destination's upload is asked
+        // for first, as for a copy of a part.
+        // SAFETY: live resources.
+        if crate::texture::title_written(to) && unsafe {
+            let (a, b) = (to.GetDesc(), from.GetDesc());
+            (a.Width, a.Height) != (b.Width, b.Height)
+        } {
+            crate::texture::upload(list, dst, to);
+        }
         // As for a copy (`crate::tiles`).
         crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(list, dst, to);
+        crate::texture::host_written(list, dst, to, Some(dst_sub));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

@@ -1971,16 +1971,42 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
         let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
         j.written.range(first..last).any(|(_, w)| w.at > asked)
     };
-    let g = guards();
     let (mut written, mut open) = (0, 0);
-    for block in first..last {
-        if !g.protected.contains(&block) {
-            open += usize::from(!g.absent.contains(&block));
-        } else if !g.clean.contains(&block) {
-            written += 1;
+    {
+        let g = guards();
+        for block in first..last {
+            if !g.protected.contains(&block) {
+                open += usize::from(!g.absent.contains(&block));
+            } else if !g.clean.contains(&block) {
+                written += 1;
+            }
         }
     }
+    // Blocks no guard holds may be write-watched memory: the kernel says
+    // whether a page of them was written since its bits were last taken,
+    // and leaves the bits (no reset). What another asking took meanwhile
+    // is in the journal, above.
+    if open > 0
+        && let Some(pages) = watched_dirty(first * BLOCK, (last - first) * BLOCK)
+    {
+        (written, open) = (written + pages, 0);
+    }
     (noted, written, open)
+}
+
+/// How many pages of `[at, at + len)` the kernel's write watch holds as
+/// written (up to a few), without taking the bits; `None` if the range is
+/// not write-watched memory of one reservation.
+fn watched_dirty(at: usize, len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let mut found = [0usize; 8];
+    let mut count = found.len();
+    let mut granularity = 0u32;
+    // SAFETY: the answer buffer holds `count` entries; a range that is not
+    // watched makes the call fail.
+    let failed =
+        unsafe { GetWriteWatch(0, at as *const _, len, found.as_mut_ptr().cast(), &mut count, &mut granularity) } != 0;
+    (!failed).then_some(count)
 }
 
 /// The number of the journal's last asking: what a read of title memory
@@ -2681,6 +2707,38 @@ mod copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write-watched memory is asked without its bits being taken: what
+    /// was written stays written for the asking that copies it, and the
+    /// memory counts as watched, not as seen by nobody.
+    #[test]
+    fn the_write_watch_is_asked_without_taking_its_bits() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        /// The allocation type that has the kernel keep a dirty bit a page.
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let len = 4 * BLOCK;
+        // SAFETY: a fresh allocation of ours, written inside its bounds and
+        // released at the end.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE).cast::<u8>();
+            assert!(!p.is_null());
+            let at = p as usize;
+            assert_eq!(watched_dirty(at, len), Some(0));
+            assert_eq!(seen_since(at, at + len, 0), (false, 0, 0));
+            p.add(BLOCK + 5).write(1);
+            assert_eq!(watched_dirty(at, len), Some(1));
+            assert_eq!(watched_dirty(at, len), Some(1), "the bits are left");
+            assert_eq!(seen_since(at, at + len, 0), (false, 1, 0));
+            assert_ne!(VirtualFree(p.cast(), 0, MEM_RELEASE), 0);
+            // Memory that is not watched: nothing to ask.
+            let plain = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!plain.is_null());
+            assert_eq!(watched_dirty(plain as usize, len), None);
+            assert_ne!(VirtualFree(plain.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// Memory the guards do not hold is seen by nobody: every block of it
     /// counts as not guarded, and an empty range has none.
