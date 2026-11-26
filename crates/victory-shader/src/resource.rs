@@ -155,6 +155,11 @@ pub struct Resources {
     /// Every `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: where
     /// its nodes are.
     pub bvh: Vec<(Site, BvhNodes)>,
+    /// Each `v_readlane_b32` of a lane that `v_writelane_b32` set to an SGPR
+    /// (or a constant) earlier in the same block: the value it reads back
+    /// (spilled SGPRs, a reduction's scratch). What the VGPR's other lanes
+    /// hold does not matter to it, nor where they are.
+    pub(crate) restored_lanes: std::collections::HashMap<Site, Moved>,
 }
 
 /// Where a ray-tracing node test ([`crate::bvh`]) reads its nodes. Its
@@ -227,6 +232,9 @@ pub fn track(
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
             t.at.set(Some(site));
+            if let Some(value) = t.restored(inst, Some(b)) {
+                out.restored_lanes.insert(site, value);
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -514,7 +522,7 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let new = match copy_source(inst, k).or_else(|| self.restored(inst, None)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -2257,16 +2265,20 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+/// What a lane of a VGPR holds where an SGPR was spilled to it ([`Resources::restored_lanes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
 }
 
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
-    /// lane, found by following the VGPR's `v_writelane_b32` writes.
-    fn restored(&self, inst: &Inst) -> Option<Moved> {
+    /// lane, found by following the VGPR's `v_writelane_b32` writes; with
+    /// `block`, only where they are all in that block (no join between).
+    /// Not for a lane select past the wave: the hardware's is not the lane
+    /// it names, so it could not be matched with the writes'.
+    fn restored(&self, inst: &Inst, block: Option<usize>) -> Option<Moved> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
@@ -2276,22 +2288,37 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane).filter(|&l| l < self.wave())?;
+        self.spilled(inst.read(Reg::V(reg))?, lane, block, &mut Vec::new())
             .ok()
             .flatten()
     }
 
+    fn wave(&self) -> u32 {
+        if self.p.wave64 { 64 } else { 32 }
+    }
+
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
+    /// `seen` (already being resolved), `Err` if not a spilled SGPR (or with
+    /// `block`, if written outside that block or joined).
+    fn spilled(
+        &self,
+        v: Value,
+        lane: u32,
+        block: Option<usize>,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Moved>, ()> {
         if let Some((b, i)) = self.phis[v.0 as usize] {
+            if block.is_some() {
+                return Err(());
+            }
             if seen.contains(&v) {
                 return Ok(None);
             }
             seen.push(v);
             let mut found = None;
             for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
+                if let Some(m) = self.spilled(a, lane, block, seen)? {
                     if found.is_some_and(|f| f != m) {
                         return Err(());
                     }
@@ -2300,7 +2327,11 @@ impl Tracer<'_> {
             }
             return Ok(found);
         }
-        let inst = self.def(v).ok_or(())?;
+        let site = self.defs[v.0 as usize].ok_or(())?;
+        if block.is_some_and(|b| site.0 != b) {
+            return Err(());
+        }
+        let inst = self.inst(site);
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
@@ -2310,8 +2341,10 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        // (a write past the wave may be to any lane)
+        let written = lane_of(*at).filter(|&l| l < self.wave()).ok_or(())?;
+        if written != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, block, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {
@@ -3856,6 +3889,26 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// A lane read back where the block wrote it is what was written; a lane select past
+    /// the wave (35 of 32) is not taken for the lane it names, neither to read nor as a
+    /// write to another lane, so lane 3 is not traced through it.
+    /// (After codec-d/cool_fox 8cc31ab, codec_d.)
+    #[test]
+    fn lanes_read_back_in_their_block_and_selects_past_the_wave() {
+        const WRITE_5_TO_3: [u32; 2] = [0xD761_0009, 0x0001_0685]; // v_writelane_b32 v9, 5, 3
+        const WRITE_9_TO_35: [u32; 2] = [0xD761_0009, 0x0001_4689]; // v_writelane_b32 v9, 9, 35
+        const READ_3: [u32; 2] = [0xD760_0008, 0x0001_0709]; // v_readlane_b32 s8, v9, 3
+        let restored = |words: &[[u32; 2]]| {
+            let mut code: Vec<u32> = words.iter().flatten().copied().collect();
+            code.push(S_ENDPGM);
+            let r = track_words(&code, &[], HwStage::Cs);
+            r.restored_lanes.get(&(0, words.len() - 1)).copied()
+        };
+        assert_eq!(restored(&[WRITE_5_TO_3, READ_3]), Some(Moved::Const(5)));
+        assert_eq!(restored(&[WRITE_5_TO_3, WRITE_9_TO_35, READ_3]), None);
+        assert_eq!(restored(&[WRITE_5_TO_3, [0xD760_0008, 0x0001_4709]]), None, "a read of lane 35");
     }
 
     /// Lanes failing the compare leave EXEC and skip to the join (`s_cbranch_execz`)

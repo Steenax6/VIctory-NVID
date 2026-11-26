@@ -1278,3 +1278,97 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+
+/// SCC of a mask operation read as data (`s_cselect_b32` after `s_and_b64 s[12:13], exec,
+/// vcc`): 1 where some lane of the console wave is below s0, else 0. Its SCC has no value
+/// of its own; it is the wave's "some lane has the bit" (`Lower::scc_some`), and a host of
+/// 32-lane waves asks both halves. (After codec-d/cool_fox 8cc31ab, codec_d.)
+#[test]
+fn an_scc_of_a_mask_operation_selects_by_the_whole_console_wave() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0x878C_6A7E, // s_and_b64 s[12:13], exec, vcc
+        0x8507_8081, // s_cselect_b32 s7, 1, 0
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for host_wave in [32, 64] {
+        let shader = lowered_on(&native, &p, &HashSet::new(), host_wave).unwrap_or_else(|e| panic!("{host_wave} lanes: {e}"));
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        if host_wave != 32 {
+            continue;
+        }
+        for (s0, want) in [(0, 0), (1, 1), (64, 1)] {
+            let Some(got) = on_the_card(&shader, [s0, 0]) else {
+                return;
+            };
+            assert_eq!(got, want, "s0 = {s0}");
+        }
+        // only lane 40 below: none of the first host wave's lanes
+        let shader_at = |words: &[u32]| {
+            let n = super::wave64_tests::native(words);
+            let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+            lowered_on(&n, &p, &HashSet::new(), 32).expect("lower")
+        };
+        let only_40 = shader_at(&[
+            0x7D84_0000, // v_cmp_eq_u32 vcc, s0, v0
+            0x878C_6A7E,
+            0x8507_8081,
+            0x7E00_0207,
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16,
+        ]);
+        if let Some(got) = on_the_card(&only_40, [40, 0]) {
+            assert_eq!(got, 1, "a lane of the other host wave");
+        }
+    }
+}
+
+/// An SGPR spilled to a lane of a VGPR that the program also uses as a vector (so not one
+/// `ir::unspill` makes scalar moves of) and read back in the same block, inside a per-lane
+/// branch: the read is the spilled SGPR, wherever the lane it names is (here in the other
+/// host wave of 32, or out of EXEC) and whatever the VGPR's other lanes hold. Before, a
+/// lane read where not every lane runs stopped the program on such a host.
+/// (After codec-d/cool_fox 8cc31ab, codec_d.)
+#[test]
+fn an_sgpr_restored_from_a_lane_in_its_block_is_the_sgpr() {
+    let words = [
+        0x7E12_0300, // v_mov_b32 v9, v0 (v9 a vector too: not only parked lanes)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0009, // s_cbranch_execz to the restore of EXEC
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xD761_0009,
+        0x0001_6606, // v_writelane_b32 v9, s6, 51
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xD760_0007,
+        0x0001_6709, // v_readlane_b32 s7, v9, 51
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    assert_eq!(res.restored_lanes.len(), 1);
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for s0 in [1, 40, 64] {
+        let Some(got) = on_the_card(&shader, [s0, 0xABCD]) else {
+            return;
+        };
+        assert_eq!(got, 0xABCD, "s0 = {s0}");
+    }
+}

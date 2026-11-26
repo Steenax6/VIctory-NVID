@@ -917,6 +917,14 @@ thread_local! {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+    // SCC of a mask operation read by an instruction (`s_cselect`, `s_addc`, a mask
+    // operation of its own): "some lane of the wave has the bit" (`Lower::scc_some`), which
+    // the whole console wave answers. A branch on it is the structure's, no data use.
+    if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
+        && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
+    {
+        return true;
+    }
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
@@ -5964,6 +5972,13 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        // SCC of a mask operation, which has no value of its own (the operation is lowered as
+        // the structure's): whether some lane of the console wave has its bit of the result.
+        if self.x.st.scc_some.contains_key(&v) && matches!(self.vals.get(&v), None | Some(Val::Missing(_))) {
+            let x = self.scc_some(v)?;
+            self.vals.insert(v, Val::Bit(x));
+            return Ok(x);
+        }
         match self.get(v)? {
             Val::Bit(x) => Ok(x),
             _ => Err("SCC without a value"),
@@ -7026,6 +7041,15 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(&moved) = self.x.res.restored_lanes.get(&(b, i)) {
+            // A lane the same block set to a scalar earlier (`resource::Resources::restored_lanes`):
+            // that scalar, whatever the other lanes hold and wherever they are.
+            let word = match moved {
+                crate::resource::Moved::Value(v) => self.i32_of(v)?,
+                crate::resource::Moved::Const(k) => self.s.m.i32(k),
+            };
+            return self.write_i(inst, word, None);
+        }
         if self.x.res.waterfall.compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).
