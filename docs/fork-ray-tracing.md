@@ -73,6 +73,14 @@ shaders and emulates the one instruction.
   on in game runs on an RTX 5090, with or without `VICTORY_BVH_QUARANTINE=1`,
   the title crashed about 80 s into the gameplay, reading a pointer of all
   ones.
+- Without the builder (no `VICTORY_BVH_BUILDER=1`) the dynamic structures and
+  the top of the tree are never built, and a walk through them read whatever
+  their memory held: dark tiles on hair and faces, bright squares in shadow,
+  walks that ran to the trace loop limit. The node test now answers "no hit"
+  then (a box node returns no child, a triangle node a miss) and reads no
+  node, decided when the program is translated: a run with the switch whose
+  builder the host turns off later (a builder pipeline that cannot be made)
+  keeps the full test.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
