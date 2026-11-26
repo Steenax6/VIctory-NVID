@@ -465,13 +465,18 @@ submitted recording is translated.
   threads. `VICTORY_THIN_PRIORITY=<-2..2>` (0, normal, unless told): their
   Windows thread priority.
 - `VICTORY_THIN_CHECK=1` (diagnostics build): for every draw and dispatch the
-  first 32 bytes of each bound descriptor table and root view (what the draw
-  reads for certain) are hashed at the call and again at translation; the
-  line "thin check" counts the draws whose bytes differed, tables and views
-  apart, that is where the path in the call would have read something else,
-  and the log names the first 16 addresses. First room, 2026-11-26: of about
-  13,060 draws and dispatches a frame, tables 0 to 0.04, root views 2.2 to
-  2.4 (with 256 bytes about 115: they reach into the next draw's slots).
+  first 32 bytes of each bound descriptor table and root view are kept at
+  the call and compared at translation. The line "thin check" counts as a
+  difference only a table whose first descriptor changed: a table's records
+  are what the path in the call reads at the draw. A root view's bytes are
+  read by both paths only at the submission (its host copy is refreshed, or
+  it is filled into upload memory, then), so its changes are counted apart
+  as none. The log names the first 16 tables and 4 views with the words at
+  the call and at translation. Run t_thinchk4 (2026-11-26), loading and first
+  room: tables 0 in every line, root views 2.2 to 7.7 a frame, each a
+  block of the title's own constants that was still zeros at the call and
+  filled by the title afterwards (the old path would have read zeros had it
+  read them at the draw; it never did).
 
 The line "list calls translated by threads of ours per frame" gives the calls
 and the threads' time, lists, pieces, recordings let go of unfinished, the
@@ -490,6 +495,19 @@ millisecond. So the frame did not get shorter (71.5 and 66.8 to 72.3 ms
 against 70.9 without), and its sending got slower (preparing 51 to 54 ms
 against 45). What shortens the frame from here is the submitting thread's
 work, or the present no longer waiting for it.
+
+With thin recording more uploads are "withheld at submission because the
+card wrote last" (13 to 43 a run against 1 to 11) and fewer "not asked for"
+(both counts of the line "textures the title fills that the card copied
+into"). The title's lists are now translated while the submitting thread,
+which notes the card's copies into such textures at their submission, is
+still behind with the lists before them: a list asks for an upload where
+before it found the card's copy noted and asked none. Whether to copy is
+decided at the submission in either case, in the order of submissions, with
+title memory compared for writes since the card's (`CardState::decide`),
+so a withheld upload is one the path in the call did not make either, and
+none that was needed: the line's count of subresources copied over what the
+card wrote last stays 0, and of the title writing after the card 0.
 
 To become the default and the path in the call to be removed: the picture of
 the first room and of the open world as without it; the always-on invariant
