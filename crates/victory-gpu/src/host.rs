@@ -813,6 +813,23 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// A texture a list sampled is uploaded again for draws after a copy
+    /// of the list rewrote title memory, or other work that may have
+    /// (Marvisak/VIctory pull request #2297).
+    #[test]
+    fn a_title_memory_copy_makes_textures_due_again() {
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().unwrap();
+        assert!(list.first_use(8), "the first draw uploads it");
+        assert!(!list.first_use(8), "later draws find it done");
+        list.defer_copy(std::ptr::null_mut(), std::ptr::null(), 0);
+        assert!(list.first_use(8), "after a copy: again");
+        assert!(!list.first_use(8));
+        list.defer(|| {});
+        assert!(list.first_use(8), "after work that writes title memory: again");
+        list.close();
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -2050,6 +2067,42 @@ struct Deferred {
     /// (`crate::memory::ready`): [`AddressWrites`].
     address_writes: AddressWrites,
 }
+
+impl Deferred {
+    /// A step recorded after a texture to buffer read-back of the same list
+    /// reads title memory `[at, at + len)` at submission: if a read-back
+    /// writes there, the step reads the bytes from before it, which land
+    /// only once the list has run (Marvisak/VIctory pull request #2608 cuts
+    /// the list there). Not cut here: counted and said once, to learn from
+    /// a run whether the title does it. Nothing to look at for the lists
+    /// without read-backs.
+    fn reads_read_back(&self, at: usize, len: usize) {
+        if self.backs.is_empty() {
+            return;
+        }
+        let end = at.saturating_add(len);
+        if self
+            .backs
+            .iter()
+            .filter_map(|&(_, to, shape)| read_back_span(to, shape))
+            .any(|(from, to)| from < end && at < to)
+        {
+            let n = READ_BACK_READS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    n,
+                    at = format_args!("{at:#x}"),
+                    len,
+                    "a copy or refresh of a list reads title memory a read-back earlier in the list writes: it sees the bytes                      from before the read-back"
+                );
+            }
+        }
+    }
+}
+
+/// Since the start: steps that read what an earlier read-back of their
+/// list writes ([`Deferred::reads_read_back`]).
+static READ_BACK_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Per recording, of shaders that read and write title memory by address
 /// (`crate::memory`): the copies (by pointer) declared written for them and
@@ -7166,6 +7219,7 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        deferred.reads_read_back(src as usize, len);
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -7183,12 +7237,19 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        // A texture sampled before the copy may lie in what it writes: the
+        // next draw that samples it records its upload again, which the
+        // check behind the copy brings up to date (Marvisak/VIctory pull
+        // request #2297).
+        deferred.textures.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        deferred.reads_read_back(src as usize, len);
+        deferred
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
     }
@@ -7203,6 +7264,7 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        deferred.reads_read_back(address, len);
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
@@ -7610,8 +7672,11 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        // As after a copy ([`HostList::defer_copy`]).
+        deferred.textures.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
