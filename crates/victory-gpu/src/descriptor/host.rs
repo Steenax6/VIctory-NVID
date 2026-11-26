@@ -1366,6 +1366,10 @@ impl Drop for HostHeap {
     }
 }
 
+/// The samplers a shader-visible heap holds on any host: shaders clamp a
+/// sampler index to the last of them (`victory_shader::emit`).
+const SAMPLERS: u32 = 2048;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1400,7 +1404,27 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler {
+            // A sampler heap has every slot a host allows, whatever the
+            // title's own count: shaders clamp a sampler index to the last
+            // of those slots, not to the title's count, and an index past
+            // the title's heap (a number read from memory the host has not
+            // got yet) reads a plain point sampler then (`fill_null`), not
+            // past the heap's end.
+            let fitted = count.min(SAMPLERS);
+            if fitted < count {
+                // shortcut: samplers past the host's limit are left out; a title that reaches
+                // them needs remapping.
+                tracing::warn!(count, "host sampler heap capped at {SAMPLERS}");
+            }
+            match make(SAMPLERS) {
+                Ok(heap) => (heap, fitted, SAMPLERS),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -5713,6 +5737,25 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host sampler heap has every slot a host allows, whatever the
+    /// title's count: a sampler index is clamped to the last of them, and
+    /// one past the title's heap must not read past the host's.
+    #[test]
+    fn a_sampler_heap_has_every_slot_a_host_allows() {
+        let Some(small) = HostHeap::new(true, 16) else {
+            return;
+        };
+        // SAFETY: a live heap.
+        assert_eq!(unsafe { small.heap.GetDesc() }.NumDescriptors, SAMPLERS);
+        assert_eq!(small.count, 16);
+        let Some(full) = HostHeap::new(true, SAMPLERS) else {
+            return;
+        };
+        // SAFETY: a live heap.
+        assert_eq!(unsafe { full.heap.GetDesc() }.NumDescriptors, SAMPLERS);
+        assert_eq!(full.count, SAMPLERS);
+    }
 
     /// Typed buffer views of 32-bit integer formats are made in the float format of the same
     /// width (the same element size); every other format is the title's.
