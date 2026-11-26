@@ -1139,6 +1139,24 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        // Told while the view is still there, not after. With the notice
+        // after the unmap (fxceless/victory-fork pull request #1005, taken
+        // and taken out again) every run lost textures in the first room,
+        // other ones each time: the whole room dark, then only the lettering
+        // on the jumpsuit's back, then the whole jumpsuit black; every run
+        // with this order had them all. The likely path, read from the code
+        // and not traced: the GPU side keeps host copies of title textures
+        // and refreshes them lazily, and a notice makes the next refresh
+        // read the memory again. Told after the unmap, that refresh can find
+        // pages gone and read them as zeros (`victory_gpu` `copy_mapped`
+        // stands pages that are not there), and the texture goes up with
+        // holes; which textures depends on the timing. The pull request's
+        // concern, guards noted clean over memory that is then gone, does no
+        // harm here: a copy kept of what the memory held is what a texture
+        // should show, and whatever the title maps here next is told by
+        // `map`. The GPU side's frame lines count refreshes that read a
+        // texture with pages missing ("texture refreshes that read a texture
+        // with pages not there").
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
