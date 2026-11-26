@@ -127,6 +127,9 @@ struct Card {
     /// has been seen to write ([`Shadow::merge_under_writes`],
     /// [`merge_pages`]).
     flagged: Mutex<Vec<u64>>,
+    /// The copy itself, for [`DIRTY`]: set once the copy is shared (a copy
+    /// a test builds by hand has none, and is asked for its ranges itself).
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -310,6 +313,13 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// The copies in the card's memory whose CPU side changed and has not gone
+/// up yet: a copy is put here when its first such range is noted
+/// ([`Shadow::card_changed`]) and taken out when its ranges are
+/// ([`card_dirty`]). A copy may be here more than once, or with nothing
+/// left to take.
+static DIRTY: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -322,7 +332,13 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = {
+        // The copies that are gone leave the list here, once a frame-rate
+        // line (`card_dirty` let them go while it still walked them all).
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded.retain(|w| w.strong_count() > 0);
+        carded.len() as u64
+    };
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
@@ -508,34 +524,33 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
+///
+/// Only the copies with something to send are looked at ([`DIRTY`]). Every
+/// copy in the card's memory was, at every submission: 3,700 copies 29
+/// times a frame, 3 ms a frame of the submitting thread (profile of
+/// 2026-11-26) to find the few that had changed.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let changed = std::mem::take(&mut *DIRTY.lock().unwrap_or_else(|e| e.into_inner()));
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                }
-                ranges
-            })
-            .unwrap_or_default();
-        if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+    let mut out: Vec<(Arc<Shadow>, Vec<(usize, usize)>)> = Vec::with_capacity(changed.len());
+    for shadow in changed.iter().filter_map(|weak| weak.upgrade()) {
+        if let Some(ranges) = shadow.card_take_dirty(sent_as, fetched) {
+            out.push((shadow, ranges));
         }
-        true
-    });
+    }
     out
+}
+
+/// Notes `[from, to)` in a copy's changed ranges (joined with the last one
+/// noted where they touch); whether it is the first since the ranges were
+/// taken.
+fn note_changed(dirty: &mut Vec<(usize, usize)>, from: usize, to: usize) -> bool {
+    let first = dirty.is_empty();
+    match dirty.last_mut() {
+        Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+        _ => dirty.push((from, to)),
+    }
+    first
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -4179,11 +4194,30 @@ impl Shadow {
         if from >= to {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
+        let first = note_changed(&mut card.dirty.lock().unwrap_or_else(|e| e.into_inner()), from, to);
+        // The copy's first range since its ranges were last taken: it has
+        // something to send (outside the ranges' lock: `card_dirty` takes
+        // the list, then each copy's ranges).
+        if first && let Some(me) = card.me.get() {
+            DIRTY.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
         }
+    }
+
+    /// For [`card_dirty`]: the offsets of the CPU side that changed and
+    /// have not gone up, taken, in order and joined where they touch (none:
+    /// nothing changed); noted as sent with send `sent_as`, and the notes
+    /// of sends up to `fetched` dropped (every fetch still to be merged
+    /// came after them).
+    fn card_take_dirty(&self, sent_as: u64, fetched: u64) -> Option<Vec<(usize, usize)>> {
+        let card = self.card.as_ref()?;
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let ranges = std::mem::take(&mut *dirty);
+        if relay() {
+            let mut sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            sent.retain(|s| s.2 > fetched);
+            sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+        }
+        (!ranges.is_empty()).then(|| joined(ranges))
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -4975,6 +5009,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     size,
                     flagged: Mutex::default(),
+                    me: std::sync::OnceLock::new(),
                 };
                 (on_card, Some(card))
             }
@@ -5001,6 +5036,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            if let Some(card) = &shadow.card {
+                let _ = card.me.set(Arc::downgrade(&shadow));
+            }
         }
         entry.shadow = Some(shadow);
     }
@@ -5223,6 +5261,7 @@ fn loose_make(
                 sent: Mutex::default(),
                 size: len,
                 flagged: Mutex::default(),
+                me: std::sync::OnceLock::new(),
             };
             (on_card, Some(card))
         }
@@ -5241,6 +5280,9 @@ fn loose_make(
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        if let Some(card) = &shadow.card {
+            let _ = card.me.set(Arc::downgrade(&shadow));
+        }
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
@@ -5470,6 +5512,53 @@ mod card_merge_tests {
         }
     }
 
+    /// A copy's changed ranges are taken once, in order and joined, and
+    /// noted as sent with the send that took them; its first range since
+    /// they were last taken is what puts it on the list `card_dirty` walks.
+    #[test]
+    fn a_copys_changed_ranges_are_taken_once_and_its_first_one_lists_it() {
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        let mut side = vec![0u8; LEN];
+        let title = vec![0u8; LEN];
+        let mut shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+        // (No reference to itself: a copy built by hand stays off the list
+        // the submissions of other tests take their copies from.)
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            size: 0,
+            flagged: Mutex::default(),
+            me: std::sync::OnceLock::new(),
+        });
+        assert_eq!(shadow.card_take_dirty(1, 0), None);
+        shadow.card_changed(0x100, 0x200);
+        shadow.card_changed(0x1000, 0x1100);
+        shadow.card_changed(0x200, 0x300);
+        // An empty range notes nothing.
+        shadow.card_changed(0x5000, 0x5000);
+        assert_eq!(shadow.card_take_dirty(2, 0), Some(vec![(0x100, 0x300), (0x1000, 0x1100)]));
+        assert_eq!(shadow.card_take_dirty(3, 0), None);
+        shadow.card_changed(0x40, 0x80);
+        assert_eq!(shadow.card_take_dirty(4, 2), Some(vec![(0x40, 0x80)]));
+        // With the relay the ranges are noted with their send, and the
+        // notes of sends up to the fetched mark go.
+        if super::relay() {
+            let sent = shadow.card.as_ref().map(|c| c.sent.lock().unwrap().clone());
+            assert_eq!(sent, Some(vec![(0x40, 0x80, 4)]));
+        }
+        // The first range noted says so, the ones after it do not.
+        let mut dirty = Vec::new();
+        assert!(super::note_changed(&mut dirty, 8, 16));
+        assert!(!super::note_changed(&mut dirty, 16, 32));
+        assert!(!super::note_changed(&mut dirty, 100, 200));
+        assert_eq!(dirty, [(8, 32), (100, 200)]);
+    }
+
     /// The mixed landing the fetch inside flights must survive, on a real
     /// copy in the card's memory and its merge (`Shadow::card_merge_relay`):
     /// flights 5, 6, 7 in the air; 5 lands the old way with the queue's
@@ -5504,6 +5593,7 @@ mod card_merge_tests {
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
                 flagged: Mutex::default(),
+                me: std::sync::OnceLock::new(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
@@ -5587,6 +5677,7 @@ mod card_merge_tests {
                     sent: Mutex::new(vec![(skip_at, skip_at + 500, 9)]),
                     size: 0,
                     flagged: Mutex::default(),
+                    me: std::sync::OnceLock::new(),
                 });
                 // Two runs of the piece, as fetched blocks.
                 let mut scratch = Vec::new();
