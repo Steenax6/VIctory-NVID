@@ -334,6 +334,76 @@ pub(crate) static TRIMMED_BYTES: AtomicU64 = AtomicU64::new(0);
 static TRIMMED_AT: AtomicU64 = AtomicU64::new(0);
 static REPLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Calls into the host driver for pipelines, for [`driver_line`]: how many
+/// run now (all kinds, and the creating ones), the most at once since the
+/// last line (the same two), and per kind (create, load, store) the calls
+/// and their microseconds since the last line. The NVIDIA driver was
+/// reported to build about two pipelines at a time per process, however
+/// many threads call it; the line shows whether ours is serialised.
+static IN_DRIVER: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static MOST_IN_DRIVER: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static DRIVER_CALLS: [[AtomicU64; 2]; 3] = [const { [const { AtomicU64::new(0) }; 2] }; 3];
+static DRIVER_LINE_AT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+enum Driver {
+    Create,
+    Load,
+    Store,
+}
+
+/// A call into the driver of this thread, counted until dropped.
+struct InDriver(Driver, std::time::Instant);
+
+fn in_driver(kind: Driver) -> InDriver {
+    let all = IN_DRIVER[0].fetch_add(1, Ordering::Relaxed) + 1;
+    MOST_IN_DRIVER[0].fetch_max(all, Ordering::Relaxed);
+    if matches!(kind, Driver::Create) {
+        let creating = IN_DRIVER[1].fetch_add(1, Ordering::Relaxed) + 1;
+        MOST_IN_DRIVER[1].fetch_max(creating, Ordering::Relaxed);
+    }
+    InDriver(kind, std::time::Instant::now())
+}
+
+impl Drop for InDriver {
+    fn drop(&mut self) {
+        let us = self.1.elapsed().as_micros() as u64;
+        let slot = &DRIVER_CALLS[self.0 as usize];
+        slot[0].fetch_add(1, Ordering::Relaxed);
+        slot[1].fetch_add(us, Ordering::Relaxed);
+        IN_DRIVER[0].fetch_sub(1, Ordering::Relaxed);
+        if matches!(self.0, Driver::Create) {
+            IN_DRIVER[1].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// With the periodic lines: the driver calls since the last such line, if
+/// there were any (the library's loads and stores count with the creates:
+/// all of them are the driver's work on a pipeline).
+pub(crate) fn driver_line() {
+    let now = crate::host::now_ms();
+    let wall = now.saturating_sub(DRIVER_LINE_AT.swap(now, Ordering::Relaxed)).max(1);
+    let [[creates, create_us], [loads, load_us], [stores, store_us]] =
+        std::array::from_fn(|k| [0, 1].map(|i| DRIVER_CALLS[k][i].swap(0, Ordering::Relaxed)));
+    // What runs now counts for the next interval's most.
+    let most = [0, 1].map(|i| MOST_IN_DRIVER[i].swap(IN_DRIVER[i].load(Ordering::Relaxed), Ordering::Relaxed));
+    let calls = creates + loads + stores;
+    if calls == 0 {
+        return;
+    }
+    let sum_ms = (create_us + load_us + store_us) as f64 / 1e3;
+    tracing::info!(
+        "pipelines made by the driver: {calls} in the interval, {sum_ms:.0} ms of calls in sum over {wall} ms of wall time          ({:.2} at once on average), the most in flight at once: {} (creating: {} of them); by kind: {creates} created in          {:.0} ms, {loads} loaded from the library in {:.0} ms, {stores} stored in {:.0} ms",
+        sum_ms / wall as f64,
+        most[0],
+        most[1],
+        create_us as f64 / 1e3,
+        load_us as f64 / 1e3,
+        store_us as f64 / 1e3,
+    );
+}
+
 /// The library calls running now: thread, what (load, make, store,
 /// serialise), the pipeline, and since when (`crate::host::now_us`).
 static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new());
@@ -648,6 +718,7 @@ pub(crate) fn pipeline(
 ) -> windows::core::Result<ID3D12PipelineState> {
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        let _driver = in_driver(Driver::Create);
         return create();
     };
     pipeline_in(library, name, load, create)
@@ -666,6 +737,7 @@ fn pipeline_in(
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
+        let _driver = in_driver(Driver::Load);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
     // The load read the library's file (see `trim`).
@@ -688,6 +760,7 @@ fn pipeline_in(
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load from a seed", name);
+        let _driver = in_driver(Driver::Load);
         load(&seed.library, PCWSTR(wide.as_ptr())).ok()
     });
     let from_seed = seeded.is_some();
@@ -701,6 +774,7 @@ fn pipeline_in(
             // Compiled outside any lock: compiles take up to seconds.
             let pso = {
                 let _call = call("make", name);
+                let _driver = in_driver(Driver::Create);
                 create()?
             };
             MADE.fetch_add(1, Ordering::Relaxed);
@@ -718,6 +792,7 @@ fn pipeline_in(
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
+    let _driver = in_driver(Driver::Store);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {

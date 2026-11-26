@@ -9068,6 +9068,7 @@ impl Meter {
             crate::texture::filled_line();
             crate::placed::resident_line();
             crate::code_use::line();
+            crate::pipeline::driver_line();
             {
                 let [ns, made] = [0, 1].map(|i| crate::resource::MAKING[i].swap(0, Ordering::Relaxed) as f64);
                 let [heaps, placed, committed] = crate::placed::stats();
