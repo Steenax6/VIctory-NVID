@@ -965,6 +965,20 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     // The text that names the lists on the card, if another thread's.
     if removed {
         lists_said();
+        // No other thread said it (nothing was in the air, or the thread
+        // that lands flights did not come to it in time): this one asks
+        // the runtime for its data. The stopped lists are found among
+        // those the last submissions noted (`REMEMBERED`); our own tables
+        // are not searched for a fault address (their locks may be held).
+        let said = *LISTS_SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if said != 2
+            && let Some(host) = host()
+        {
+            let data = host.removal_data_of(&[], false);
+            if !data.is_empty() {
+                tracing::error!("device-removed data, asked by the failing thread{data}");
+            }
+        }
     }
     match ON_FAILURE.get() {
         Some(report) => report(&text),
@@ -6647,6 +6661,8 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        remember_lists(runs);
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
@@ -7152,12 +7168,23 @@ impl Host {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
+                    // A list of a submission that counts as landed (the
+                    // caller does not have it): what its submission noted.
                     #[cfg(feature = "diagnostics")]
-                    if tables
-                        && done > 0
-                        && let Some(r) = run
+                    let kept = list.and_then(|l| remembered(l as usize));
+                    #[cfg(feature = "diagnostics")]
+                    if run.is_none()
+                        && let Some((pipelines, _)) = &kept
                     {
-                        text.push_str(&reads_against_title(r));
+                        text.push_str(&format!(", its pipelines (noted at its submission) {pipelines}"));
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if done > 0 {
+                        match (&kept, run) {
+                            (Some((_, reads)), _) => text.push_str(&reads_against_title(reads)),
+                            (None, Some(r)) if tables => text.push_str(&reads_against_title(&refresh_ranges(r))),
+                            _ => {}
+                        }
                     }
                 }
                 plain = p.pNext;
@@ -10042,6 +10069,74 @@ fn last_notes(runs: &[&HostList]) -> String {
     }
 }
 
+/// A range of a host copy a list's draws read (copy, title address, bytes).
+#[cfg(feature = "diagnostics")]
+type Read = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// The ranges of host copies `list` brings up to date at its submission,
+/// each once.
+#[cfg(feature = "diagnostics")]
+fn refresh_ranges(list: &HostList) -> Vec<Read> {
+    let mut ranges = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for step in &list.deferred().copies {
+        if let Step::Refresh(shadow, address, len) = step
+            && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
+        {
+            ranges.push((shadow.clone(), *address, *len));
+        }
+    }
+    ranges
+}
+
+/// The lists of the last submissions, as each submission had them, while
+/// breadcrumbs are on (diagnostics): the command list (by address), the
+/// pipelines it binds and the ranges of host copies it reads. The report
+/// of a removed device takes a stopped list's from here when the thread
+/// that makes it does not have the list: a submission counted as landed
+/// before the card stood, or a failure on the submitting thread while
+/// nothing was in the air (run s_hang_2: the submitting thread could not
+/// make a list for the next submission, and the report had no list to
+/// name). Holding the ranges keeps their copies alive a little longer.
+#[cfg(feature = "diagnostics")]
+static REMEMBERED: Mutex<std::collections::VecDeque<(usize, String, Vec<Read>)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// How many lists [`REMEMBERED`] holds.
+#[cfg(feature = "diagnostics")]
+const REMEMBER_MOST: usize = 512;
+
+/// At a submission: notes its lists in [`REMEMBERED`].
+#[cfg(feature = "diagnostics")]
+fn remember_lists(runs: &[&HostList]) {
+    if !matches!(dred_mode(), Dred::Full | Dred::Light) {
+        return;
+    }
+    let noted: Vec<(usize, String, Vec<Read>)> = runs
+        .iter()
+        .map(|r| {
+            let pipelines = format!("{:?}", *r.pipelines.lock().unwrap_or_else(|e| e.into_inner()));
+            (r.list.as_raw() as usize, pipelines, refresh_ranges(r))
+        })
+        .collect();
+    let mut kept = REMEMBERED.lock().unwrap_or_else(|e| e.into_inner());
+    for entry in noted {
+        // A list submitted again is noted as it is now.
+        kept.retain(|k| k.0 != entry.0);
+        kept.push_back(entry);
+    }
+    while kept.len() > REMEMBER_MOST {
+        kept.pop_front();
+    }
+}
+
+/// What [`REMEMBERED`] holds of the command list at `list`.
+#[cfg(feature = "diagnostics")]
+fn remembered(list: usize) -> Option<(String, Vec<Read>)> {
+    let kept = REMEMBERED.lock().unwrap_or_else(|e| e.into_inner());
+    kept.iter().rev().find(|k| k.0 == list).map(|k| (k.1.clone(), k.2.clone()))
+}
+
 /// For the report of a removed device (diagnostics): the ranges of host
 /// copies a list that stopped had brought up to date for its draws (its
 /// buffer views, vertices, indices and constants), each against title
@@ -10053,20 +10148,9 @@ fn last_notes(runs: &[&HostList]) -> String {
 /// differ are listed (at most 32, the first 3 words of each), the most
 /// differing words first.
 #[cfg(feature = "diagnostics")]
-fn reads_against_title(list: &HostList) -> String {
-    let mut ranges: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    {
-        let mut seen = std::collections::HashSet::new();
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
-            {
-                ranges.push((shadow.clone(), *address, *len));
-            }
-        }
-    }
+fn reads_against_title(ranges: &[Read]) -> String {
     let (mut bytes, mut differ) = (0usize, Vec::new());
-    for (shadow, address, len) in &ranges {
+    for (shadow, address, len) in ranges {
         bytes += len;
         if let Some((words, pending, first)) = shadow.against_title(*address, *len, 3)
             && words > 0
