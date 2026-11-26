@@ -1088,6 +1088,9 @@ pub(crate) struct HostList {
     preludes_again: Mutex<Vec<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The first three of them in the order they were bound
+    /// ([`crate::resubmit::Summary`]).
+    first_bound: Mutex<Vec<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -2262,6 +2265,16 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// The uploads of textures from title memory the list asked for, and
+    /// the card copies it records into textures the title fills: decided
+    /// and noted when the list is submitted, in [`HostList::prelude`]
+    /// (`crate::texture` `decide_uploads`, `CardWrite::publish`).
+    texture_uploads: Vec<crate::texture::TextureUpload>,
+    card_writes: Vec<crate::texture::CardWrite>,
+    /// The textures the list asked no upload for because the card wrote
+    /// all of them last: looked at when the list is submitted, for what
+    /// the title wrote since (`crate::texture` `check_card_written`).
+    card_checks: Vec<std::sync::Arc<crate::resource::HostTexture>>,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -3466,8 +3479,10 @@ fn late_copy(dst: usize, src: usize, len: usize) {
     // As a shader's write that lands: reads of the destination ahead of it
     // are checked against it, and its guards are opened.
     shaders_write(dst, &new);
-    crate::watch::writing(dst, len);
+    crate::watch::writing_as(dst, len, crate::writes::Cause::Copy);
     write_mapped(dst as *mut u8, new.as_ptr(), len);
+    // Numbered for the texture pass once the bytes are there.
+    crate::descriptor::host::title_copied(dst, len);
 }
 
 /// Diagnostics: the fills of upload memory that made a submission wait for
@@ -4409,7 +4424,12 @@ fn read_backs(list: &HostList) {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
-                    copy_mapped((*at as *mut u8).wrapping_add(line * pitch), from.add(line * row.next_multiple_of(256)), *row, true);
+                    copy_into_title(
+                        (*at as *mut u8).wrapping_add(line * pitch),
+                        from.add(line * row.next_multiple_of(256)),
+                        *row,
+                        crate::writes::Cause::Texels,
+                    );
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
@@ -4658,6 +4678,7 @@ impl Host {
                 prelude,
                 preludes_again: Mutex::default(),
                 pipelines: Mutex::default(),
+                first_bound: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -7140,6 +7161,7 @@ impl HostList {
         // Every run of the list has finished: the extra preludes are done.
         self.preludes_again.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.first_bound.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -7191,6 +7213,24 @@ impl HostList {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 (before != wanted).then_some((texture, before))
+            }
+        }
+    }
+
+    /// [`HostList::transition`] of a host copy a pass of ours holds itself
+    /// (the title's object may be gone): the state it was in, if not
+    /// `wanted` (legal for it).
+    pub(crate) fn transition_copy(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
+        let wanted = legal_state(&copy.texture, wanted);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, copy.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some(before)
             }
         }
     }
@@ -7450,6 +7490,46 @@ impl HostList {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // The uploads from title memory the list asked for: which are made
+        // is decided now, with what the lists submitted before this one
+        // wrote on the card; then what this list writes on the card is
+        // noted for the lists after it. (Its own copies run after its
+        // prelude: an upload it asked for is theirs to overwrite.)
+        // Then the copies on the card that bring the textures of views
+        // placed in card-written memory what the card wrote: those noted
+        // by the lists submitted before this one and by this one's
+        // uploads, not those its own card copies ask for (they follow it,
+        // in the next prelude).
+        let (uploads, feeds) = {
+            let deferred = self.deferred();
+            let uploads = crate::texture::decide_uploads(&deferred.texture_uploads);
+            crate::texture::check_card_written(&deferred.card_checks);
+            let feeds = crate::texture::take_feeds();
+            crate::texture::count_own_writes(&uploads, &deferred.card_writes);
+            for write in &deferred.card_writes {
+                write.publish();
+            }
+            (uploads, feeds)
+        };
+        // Each feed with its two textures in the copy states, and back to
+        // the states they were in: taken here, before the states below are
+        // moved on to what this list leaves. The list holds the textures
+        // until it is reset.
+        let feed_moves: Vec<[Vec<D3D12_RESOURCE_BARRIER>; 2]> = feeds
+            .iter()
+            .map(|feed| {
+                let (mut there, mut back) = (Vec::new(), Vec::new());
+                for (texture, state) in feed.textures().into_iter().zip([COPY_SOURCE, COPY_DEST]) {
+                    self.keep(&texture.texture);
+                    let real = texture.state.load(Ordering::Relaxed);
+                    if real != state {
+                        there.push(transition(&texture.texture, host_state(real), host_state(state)));
+                        back.push(transition(&texture.texture, host_state(state), host_state(real)));
+                    }
+                }
+                [there, back]
+            })
+            .collect();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -7501,6 +7581,23 @@ impl HostList {
                 }
             }
         }
+        // An upload runs with its texture a copy destination, as a twin
+        // copy does: there from its real state, and on to the state the
+        // list starts with.
+        for (copy, ..) in &uploads {
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            if copying.contains_key(&key) {
+                continue;
+            }
+            let real = copy.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(&copy.texture, host_state(COPY_DEST), host_state(real)));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
@@ -7512,7 +7609,7 @@ impl HostList {
         let hoisted = (!hoist_runs.is_empty())
             .then(|| self.hoist_buffers.get().and_then(|b| b.as_ref()))
             .flatten();
-        if barriers.is_empty() && syncs.is_empty() && hoisted.is_none() {
+        if barriers.is_empty() && syncs.is_empty() && hoisted.is_none() && uploads.is_empty() && feeds.is_empty() {
             return None;
         }
         let mut again_held = self.preludes_again.lock().unwrap_or_else(|e| e.into_inner());
@@ -7542,6 +7639,15 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                for (feed, [there, back]) in feeds.iter().zip(&feed_moves) {
+                    if !there.is_empty() {
+                        list.ResourceBarrier(there);
+                    }
+                    feed.record(list);
+                    if !back.is_empty() {
+                        list.ResourceBarrier(back);
+                    }
+                }
                 // Timed with `VICTORY_GPU_TIMING` (`crate::own_time`).
                 let timed = (!syncs.is_empty()).then(|| crate::own_time::begin(list, crate::own_time::Own::TwinCopies)).flatten();
                 if !to_copy.is_empty() {
@@ -7551,6 +7657,9 @@ impl HostList {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
                 crate::own_time::end(list, timed);
+                for (copy, staging, subs) in &uploads {
+                    crate::texture::record_copies(list, copy, staging, *subs);
+                }
                 let timed = (!barriers.is_empty()).then(|| crate::own_time::begin(list, crate::own_time::Own::PreludeBarriers)).flatten();
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -7656,7 +7765,16 @@ impl HostList {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+            let mut first = self.first_bound.lock().unwrap_or_else(|e| e.into_inner());
+            if first.len() < 3 {
+                first.push(name.to_owned());
+            }
         }
+    }
+
+    /// The first three pipelines the list bound, in order.
+    pub(crate) fn first_bound(&self) -> Vec<String> {
+        self.first_bound.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -8182,6 +8300,30 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// The list asks for an upload of a texture from title memory: decided
+    /// when the list is submitted, and then copied in its prelude.
+    pub(crate) fn defer_upload(&self, upload: crate::texture::TextureUpload) {
+        self.deferred().texture_uploads.push(upload);
+    }
+
+    /// The list samples a texture the card wrote all of last and asks no
+    /// upload for it: looked at when the list is submitted.
+    pub(crate) fn card_check(&self, copy: std::sync::Arc<crate::resource::HostTexture>) {
+        self.deferred().card_checks.push(copy);
+    }
+
+    /// Whether the list has a card copy into `copy` noted already; the
+    /// subresources `subs` are then added to that note.
+    pub(crate) fn card_write_more(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, subs: u64) -> bool {
+        self.deferred().card_writes.iter_mut().any(|write| write.more(copy, subs))
+    }
+
+    /// The list records a card copy into a texture the title fills: noted
+    /// for the lists after it when this one is submitted.
+    pub(crate) fn card_write(&self, write: crate::texture::CardWrite) {
+        self.deferred().card_writes.push(write);
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
@@ -8209,6 +8351,9 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    // And the texture pass, by a number taken now that the
+                    // bytes are there: an upload that read before is stale.
+                    crate::descriptor::host::title_copied(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -8449,6 +8594,20 @@ fn fast_reads() -> bool {
 }
 
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_as(dst, src, len, title_dst.then_some(crate::writes::Cause::Copy));
+}
+
+/// [`copy_mapped`] into title memory, for a write that is not a copy of
+/// the title's: `cause` says what it is to those told of it
+/// (`crate::watch::writing_as`).
+pub(crate) fn copy_into_title(dst: *mut u8, src: *const u8, len: usize, cause: crate::writes::Cause) {
+    copy_mapped_as(dst, src, len, Some(cause));
+}
+
+/// [`copy_mapped`]; `title`: the destination is title memory, written for
+/// that cause.
+fn copy_mapped_as(dst: *mut u8, src: *const u8, len: usize, title: Option<crate::writes::Cause>) {
+    let title_dst = title.is_some();
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -8485,9 +8644,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
-    if title_dst {
+    if let Some(cause) = title {
         // The kernel writes the destination: it must not be guarded.
-        crate::watch::writing(dst as usize, len);
+        crate::watch::writing_as(dst as usize, len, cause);
     }
     // `VICTORY_USER_COPY` (on by default): the processor copies, and what
     // faults is left to the kernel's copy below, from where it faulted on.
@@ -8935,12 +9094,15 @@ impl Meter {
             );
         }
         {
-            let [counted, partial] = std::array::from_fn(|k| crate::draw::THREAD_DISPATCHES[k].swap(0, Ordering::Relaxed));
+            let [counted, cut, whole] =
+                std::array::from_fn(|k| crate::draw::THREAD_DISPATCHES[k].swap(0, Ordering::Relaxed));
             if counted > 0 {
                 tracing::info!(
-                    "dispatches that count threads: {:.1} a frame, {:.1} of them end in a partial group (run whole)",
+                    "dispatches that count threads: {:.1} a frame; ending in a partial group: {:.1} cut at the \
+                     count, {:.1} run whole",
                     counted as f64 / frames,
-                    partial as f64 / frames,
+                    cut as f64 / frames,
+                    whole as f64 / frames,
                 );
             }
         }
@@ -9046,6 +9208,9 @@ impl Meter {
             crate::resource::spill_line();
             crate::texture::filled_line();
             crate::placed::resident_line();
+            crate::code_use::line();
+            crate::pipeline::driver_line();
+            crate::resubmit::line();
             {
                 let [ns, made] = [0, 1].map(|i| crate::resource::MAKING[i].swap(0, Ordering::Relaxed) as f64);
                 let [heaps, placed, committed] = crate::placed::stats();
@@ -9099,15 +9264,29 @@ impl Meter {
             {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
-                let [kept, dropped, slots, uploaded] =
-                    [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
+                let [kept, dropped, slots, stale, left] =
+                    [0, 1, 2, 3, 4].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
+                let [copies, copy_bytes, by_copy] =
+                    [0, 1, 2].map(|i| crate::descriptor::host::COPY_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the \
+                     title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to \
+                     plain addresses finished; {copies} copies of the title's the layer did into memory under texture views \
+                     ({} MB); {kept} ranges of all three under texture views kept for the texture pass ({dropped} dropped); \
+                     {slots} slots of placed textures held their bytes, {stale} of them stale ({by_copy} by copies; their upload \
+                     read before the write ended, by the writes' numbers: {}), {} stale now; {left} due slots left for after a read the title had \
+                     submitted, {} such reads so far (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 neither, \
+                     slots, 1 or all makes stale slots due at once)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
-                    if mode & 4 != 0 { "told as well" } else { "counted only" },
-                    if mode & 2 != 0 { "made due again" } else { "left as they were" }
+                    copy_bytes >> 20,
+                    if mode & 2 != 0 { "made due at once" } else { "left as they were" },
+                    crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed),
+                    crate::writes::PENDING_COUNTS[0].load(Ordering::Relaxed)
                 );
+                crate::draw::bake_writes_line(0);
+                crate::texture::card_written_line();
+                crate::census::lines(logged_frames);
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(

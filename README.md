@@ -27,10 +27,10 @@ AMD Ryzen 7 9800X3D and 64 GB of memory, with the settings of
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase, boat, binoculars |
 | Open world | played from a save at the first boat mission: the boat floats, casts off and steers; on foot; a car is entered and driven |
 | Saves | the game's autosave is written and continued at the next start; a save made with another fork loads |
-| Frame rate | opening cutscene about 9 fps (106 ms a frame), first room 12.7 fps (78.6 ms), open world by boat and by car about 13 fps (77 ms; 63 to 94 over 22 minutes) |
+| Frame rate | opening cutscene about 10 fps (100 ms a frame), first room 13 fps (76 ms), open world 10 to 13 fps (77 to 97 ms, by scene; 77 ms by boat and by car over 22 minutes) |
 | Stability | 22 minutes in the open world in one session, ended by hand: no device loss, no error in the log |
-| Memory | the process peaks at 20 to 24 GB. The card's 12 GB are full: textures that do not fit lose their most detailed levels first and go to the PC's memory last (none was held back in the prologue; the open world has not been run with that last step yet) |
-| Known problems | anything in shadow is black and bright scenes overexpose (the game's ray-traced lighting does not run yet); black blocky patches on the water, most of them in the shallows |
+| Memory | the process peaks at 20 to 26 GB. The card's 12 GB are full: textures that do not fit lose their most detailed levels first and go to the PC's memory last; none waits for room, in the prologue or in the open world |
+| Known problems | the game's ray-traced lighting does not run yet: a stand-in fills in for its indirect light (`VICTORY_AMBIENT`), so what the sun does not reach is evenly lit, not black, and bright scenes overexpose; black blocky patches on the water, most of them in the shallows |
 
 In the first boat mission the "cast off" prompt comes back until the map
 has been opened once (View; Tab on the keyboard): a tutorial step of the
@@ -103,6 +103,7 @@ The switches a player may want:
 | `VICTORY_AUTO_SKIP=1` | what `-SkipIntro` sets |
 | `VICTORY_TEXTURE_DROP_LEVELS=0` | large textures keep every level of detail (for cards with more memory; on 12 GB many then go to the PC's memory) |
 | `VICTORY_TEXTURE_SPILL=0` | textures that find no room on the card wait for it instead of going to the PC's memory |
+| `VICTORY_AMBIENT=<level>` / `=off` | the stand-in for the game's indirect light while its rays do not run (0.3 by default; `off`: what the sun does not reach is black) |
 | `VICTORY_PIPELINE_WORKERS=<n>` | threads that build pipelines not cached yet (default: half the logical processors, at most 8) |
 | `VICTORY_WINDOW_MAX=1920x1080` | largest size of the game window |
 

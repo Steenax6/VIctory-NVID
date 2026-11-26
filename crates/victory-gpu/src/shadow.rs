@@ -3166,7 +3166,7 @@ impl Shadow {
                 };
                 let at = at + first;
                 crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
-                crate::watch::writing(start + at, n);
+                crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays. Runs a few bytes apart go in one write
@@ -3265,7 +3265,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        crate::watch::writing(start + at, n);
+        crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         if fast_merge() {
             // The processor's copy, the kernel's for what faults.
@@ -4097,7 +4097,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::host::shaders_write(start + at, &title[..]);
-                crate::watch::writing(start + at, n);
+                crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
@@ -4187,7 +4187,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        crate::watch::writing(start + at, n);
+        crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
@@ -4287,7 +4287,7 @@ impl Shadow {
             // the old merge left out its whole run), and so is one the card's
             // bytes did not change in title memory.
             let (hull_lo, hull_hi) = (stretches[0].0, stretches[stretches.len() - 1].1);
-            crate::watch::writing(start + hull_lo, hull_hi - hull_lo);
+            crate::watch::writing_as(start + hull_lo, hull_hi - hull_lo, crate::writes::Cause::Back);
             let mut written = 0;
             let mut put = 0;
             let mut race = races.into_iter();
@@ -4403,7 +4403,7 @@ fn buffers_changed() {
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let mut map = buffers();
-    map.insert(
+    let old = map.insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -4411,13 +4411,19 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         },
     );
     buffers_changed();
+    drop(map);
+    crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     let mut map = buffers();
-    map.remove(&(start, resource));
+    let old = map.remove(&(start, resource));
     buffers_changed();
+    drop(map);
+    if let Some(old) = old {
+        crate::memory::ownership_changed(start, old.end - start);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4459,6 +4465,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         buffers_changed();
     }
     let n = gone.len() as u64;
+    if n != 0 {
+        crate::memory::ownership_changed(at, len);
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }

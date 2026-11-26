@@ -53,7 +53,7 @@ shaders and emulates the one instruction.
    of the instruction. A plain Rust reference lives in
    `crates/victory-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
    over 311 ray/node cases and compare with the reference bit for bit.
-4. **The trace and shading programs translate** (59 of 64 trace programs, and
+4. **The trace and shading programs translate** (63 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
    64-lane waves running on a GPU with 32-lane waves.
@@ -80,17 +80,37 @@ shaders and emulates the one instruction.
   by one list were missed by another; walkers declared every copy written;
   the upload memory the builder's records lie in was out of reach of
   addresses; free memory and the process heap could be guarded (a freeze).
-  With the builder on, the walkers wait until it has run once.
-- The last group of a dispatch that counts threads runs whole: the
-  translated program has no thread count to stop at yet (a shader change).
-- The directory of title memory by address does not follow buffers the
-  title releases or replaces.
-- Five shadow-mask trace programs do not translate yet.
+  With the builder on, the walkers wait until it has run once, and again
+  once the host turns it off.
+  Fixed since in the translator (2026-11-26), not yet tried in a game: the
+  last group of a dispatch that counts threads starts only the lanes up to
+  the count (the builder's programs get two instructions in front that cut
+  EXEC there, the count a host word); programs that mark loads and stores
+  coherent (the bottom-up build and refit: a thread reads the box another
+  group's thread stored before an atomic) get globally coherent views and
+  device fences; the builder's loops are cut at 65,536 iterations, not the
+  compute programs' 4,096; with the builder on, the directory of title
+  memory by address follows buffers the title releases or replaces.
+- Without the builder (no `VICTORY_BVH_BUILDER=1`) the dynamic structures and
+  the top of the tree are never built, and a walk through them read whatever
+  their memory held: dark tiles on hair and faces, bright squares in shadow,
+  walks that ran to the trace loop limit. The node test now answers "no hit"
+  then (a box node returns no child, a triangle node a miss) and reads no
+  node, decided when the program is translated: a run with the switch whose
+  builder the host turns off later (a builder pipeline that cannot be made)
+  keeps the full test; its walkers are then held, not run.
+- One shadow-mask trace program does not translate yet
+  (`CS_TraceShadowRays_FullAdaptive`: a lane mask joined with numbers).
+  Four others now take their structure's address from a table of view
+  addresses by heap slot, which exists only with the builder on (without
+  it their dispatches are dropped).
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
-  of two boxes entered at the same distance, and the result for a ray exactly
-  through an edge.
+  of two boxes entered at the same distance, the result for a ray exactly
+  through an edge, and that a child whose pointer is "none" is a miss
+  whatever its box (sorted, it would otherwise stand before children that
+  are there).
 - Cost on the GPU is unmeasured.
 
 ## Where to look

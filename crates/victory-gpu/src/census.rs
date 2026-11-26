@@ -1,0 +1,613 @@
+//! What the pass over textures picked by index (`crate::draw`
+//! `heap_textures`) uploads and why, what is known of the writes it only
+//! finds by looking, where its time goes and what its queue waits for:
+//! counts kept as the pass and the uploads' reads go, and a group of lines
+//! with the periodic ones ([`lines`]).
+//!
+//! The pass is the layer's largest mover of texture bytes (some 200,000
+//! uploads and 83 GB in the first 106 s of the title, each texture about
+//! seven times), and what made a texture go up again was not known past
+//! "found changed by a look, nothing told of it" (30,000 to 37,000 times a
+//! run). These counts say, for every upload, what made its slot due and
+//! what its read then found: which of its levels held bytes other than at
+//! its last upload, which the same, which nothing; and for every change a
+//! look finds, what the layer was told of the memory since the upload read
+//! it.
+//!
+//! An upload's reason is known when the pass records it, what it reads
+//! when its list is submitted (`crate::texture` `Staging::refresh`): the
+//! reason rides in the staging buffer's state ([`mark`]) and the row is
+//! counted at the read ([`read`]).
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+use crate::writes::{CAUSES, Cause};
+
+/// Why a slot's texture goes up, as the queue's entries and the staging
+/// buffers carry it: the title wrote the slot's view (a slot new to the
+/// queue, another view of the texture it showed, a record copied in).
+pub(crate) const VIEW: u8 = 0;
+/// More of its memory is mapped than when it was last uploaded in part.
+pub(crate) const MORE: u8 = 1;
+/// A texture object not all mapped, uploaded again every 120 frames.
+pub(crate) const AGAIN: u8 = 2;
+/// A look at it after its upload found other bytes (its fingerprint).
+pub(crate) const RELOOK: u8 = 3;
+/// An upload left a level the title holds without the card's memory, or a
+/// level left out was brought back (`crate::tiles`).
+pub(crate) const LEVELS: u8 = 4;
+/// From here, one for each [`Cause`]: its memory was told as mapped,
+/// unmapped, written or about to be.
+pub(crate) const TOLD: u8 = 5;
+/// The reasons.
+pub(crate) const WHYS: usize = TOLD as usize + CAUSES;
+/// The row of an upload of memory the pass has not uploaded before,
+/// whatever made its slot due.
+const FIRST: usize = WHYS;
+const ROWS: usize = WHYS + 1;
+
+/// The reason code of memory told by `cause`.
+pub(crate) fn told(cause: Cause) -> u8 {
+    TOLD + cause as u8
+}
+
+fn row_name(row: usize) -> &'static str {
+    match row {
+        FIRST => "first upload of the memory",
+        r if r == VIEW as usize => "the slot's view written again",
+        r if r == MORE as usize => "more of it mapped",
+        r if r == AGAIN as usize => "an object not all mapped, every 120 frames",
+        r if r == RELOOK as usize => "found changed by a look",
+        r if r == LEVELS as usize => "a level without the card's memory",
+        r => Cause::ALL.get(r - TOLD as usize).map_or("?", |c| c.name()),
+    }
+}
+
+/// What an upload's row counts: uploads; the bytes of their textures in
+/// title memory; the bytes staged (the host's layout, without the levels a
+/// texture leaves out); of the title bytes, those of levels whose bytes
+/// were other than at the memory's last upload (or uploaded for the first
+/// time), the same as then, and all zero (pages not there, or nothing
+/// written yet); uploads none of whose levels had changed, and their title
+/// bytes; uploads whose read took no digest (write-watched memory read by
+/// its written pages); uploads that read nothing (the memory could not be
+/// had).
+const FIELDS: usize = 10;
+static UPLOADS: [[AtomicU64; FIELDS]; ROWS] = [const { [const { AtomicU64::new(0) }; FIELDS] }; ROWS];
+
+/// The most parts (levels, the smallest ones together) a texture's memory
+/// is told apart in; one of more is one part.
+pub(crate) const PARTS: usize = 16;
+
+/// What the pass last uploaded from a texture's memory, by where it starts
+/// and its bytes: a digest of each part (0: all zero), how many times it
+/// went up, and the frame of the last.
+struct Memo {
+    parts: [u64; PARTS],
+    uploads: u32,
+    frame: u64,
+}
+
+static MEMO: Mutex<Option<HashMap<(u64, u64), Memo>>> = Mutex::new(None);
+
+/// One part of a texture's memory as an upload read it: its bytes, a
+/// digest of them (never 0), and whether they are all zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Part {
+    pub(crate) bytes: u64,
+    pub(crate) digest: u64,
+    pub(crate) zero: bool,
+}
+
+/// What [`read`] found against the memory's last upload: whether the pass
+/// uploaded it before, and the title bytes changed, the same and zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Found {
+    pub(crate) before: bool,
+    pub(crate) changed: u64,
+    pub(crate) same: u64,
+    pub(crate) zero: u64,
+}
+
+/// `parts` against `memo` (the memory's last upload, if any), which is
+/// brought up to date.
+fn compare(memo: Option<&mut Memo>, parts: &[Part]) -> Found {
+    let mut found = Found { before: memo.is_some(), ..Found::default() };
+    let mut none = [0u64; PARTS];
+    let last = memo.map_or(&mut none, |m| &mut m.parts);
+    for (part, last) in parts.iter().zip(last.iter_mut()) {
+        let digest = if part.zero { 0 } else { part.digest.max(1) };
+        if part.zero {
+            found.zero += part.bytes;
+        } else if found.before && *last == digest {
+            found.same += part.bytes;
+        } else {
+            found.changed += part.bytes;
+        }
+        *last = digest;
+    }
+    found
+}
+
+/// An upload of the pass read the texture memory `[start, start + size)`
+/// for the reason `why`: `staged` bytes of staging buffer, and its parts
+/// as read (`None`: read without a digest; empty: nothing read). Counted
+/// in its row.
+pub(crate) fn read(why: u8, start: u64, size: u64, staged: u64, parts: Option<&[Part]>) {
+    /// Memory noted at most; past it the entries of uploads longest ago go.
+    const MOST: usize = 1 << 17;
+    let frame = crate::frame::current();
+    let mut all = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(HashMap::new);
+    if all.len() >= MOST {
+        let old = frame.saturating_sub(4096);
+        all.retain(|_, m| m.frame >= old);
+    }
+    let found = match parts {
+        Some(parts) if !parts.is_empty() => {
+            let found = compare(all.get_mut(&(start, size)), parts);
+            let memo = all.entry((start, size)).or_insert_with(|| {
+                let mut memo = Memo { parts: [0; PARTS], uploads: 0, frame };
+                compare(Some(&mut memo), parts);
+                memo
+            });
+            (memo.uploads, memo.frame) = (memo.uploads.saturating_add(1), frame);
+            found
+        }
+        _ => {
+            let before = all.get_mut(&(start, size)).map(|m| (m.uploads, m.frame) = (m.uploads.saturating_add(1), frame));
+            Found { before: before.is_some(), ..Found::default() }
+        }
+    };
+    drop_row(why, size, staged, parts, found);
+}
+
+/// [`read`]'s counting, after the memo.
+fn drop_row(why: u8, size: u64, staged: u64, parts: Option<&[Part]>, found: Found) {
+    let row = &UPLOADS[if found.before { usize::from(why).min(WHYS - 1) } else { FIRST }];
+    row[0].fetch_add(1, Relaxed);
+    row[1].fetch_add(size, Relaxed);
+    row[2].fetch_add(staged, Relaxed);
+    row[3].fetch_add(found.changed, Relaxed);
+    row[4].fetch_add(found.same, Relaxed);
+    row[5].fetch_add(found.zero, Relaxed);
+    match parts {
+        None => {
+            row[8].fetch_add(1, Relaxed);
+        }
+        Some([]) => {
+            row[9].fetch_add(1, Relaxed);
+        }
+        Some(_) if found.before && found.changed == 0 => {
+            row[6].fetch_add(1, Relaxed);
+            row[7].fetch_add(size, Relaxed);
+        }
+        Some(_) => {}
+    }
+}
+
+/// What the pass knows of an upload when it records it, beside its reason
+/// ([`FLAGS`]' places): its host copy was made anew after it had been let
+/// go; made for the first time; another texture's view starts inside the
+/// texture's span, and (the next place) the bytes of the span from there
+/// on; one starts inside the part its own view holds (from the view's
+/// first level on); the memory has host copies of several descriptions
+/// now; several slots show the span; the upload is for a bake draw; the
+/// upload staged nothing (its texture went up in this list already).
+pub(crate) const ANEW: usize = 0;
+pub(crate) const NEVER: usize = 1;
+pub(crate) const INNER: usize = 2;
+pub(crate) const INNER_BYTES: usize = 3;
+pub(crate) const INNER_HELD: usize = 4;
+pub(crate) const COPIES: usize = 5;
+pub(crate) const SLOTS: usize = 6;
+pub(crate) const BAKE: usize = 7;
+pub(crate) const NOTHING: usize = 8;
+/// Bytes of staging buffers filled with zeros for levels that are not the
+/// title's (`crate::texture` `Staging::detile`), of the pass's uploads.
+pub(crate) const NOT_HELD_BYTES: usize = 9;
+/// Uploads whose texture's span was none (no bytes, or an end below its
+/// start): asked about all the same, and nothing was inside.
+pub(crate) const NO_SPAN: usize = 10;
+/// Since the start, of the uploads the pass recorded.
+pub(crate) static FLAGS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// The parts of the pass ([`PASS_US`]): taking what was told since the
+/// last pass; the queue's order; looks at uploaded textures (their
+/// fingerprints); asking what of a texture's memory is mapped; making the
+/// view and the host texture; recording the upload (the staging buffer and
+/// the copies); asking the staging's state and letting it go; the
+/// fingerprint after an upload; the rest (the queue's bookkeeping).
+pub(crate) const P_TOLD: usize = 0;
+pub(crate) const P_ORDER: usize = 1;
+pub(crate) const P_LOOK: usize = 2;
+pub(crate) const P_MAPPED: usize = 3;
+pub(crate) const P_MAKE: usize = 4;
+pub(crate) const P_RECORD: usize = 5;
+pub(crate) const P_STAGED: usize = 6;
+pub(crate) const P_PRINT: usize = 7;
+pub(crate) const P_REST: usize = 8;
+const PASS_PARTS: usize = 9;
+const PASS_NAMES: [&str; PASS_PARTS] = [
+    "taking what was told",
+    "the queue's order",
+    "looks at uploaded ones",
+    "asking what is mapped",
+    "making views and host textures",
+    "recording uploads",
+    "the staging's state",
+    "fingerprints after uploads",
+    "the rest",
+];
+/// Microseconds of the pass by part, since the last line.
+static PASS_US: [AtomicU64; PASS_PARTS] = [const { AtomicU64::new(0) }; PASS_PARTS];
+
+/// Since the last line ([`PASS_COUNTS`]' places): passes; slots the queue
+/// handed out; slots looked at before the pass stopped; fingerprints
+/// taken, and the bytes read for them; askings of what is mapped; uploads
+/// recorded; passes stopped by their time, and by their bytes.
+pub(crate) const N_PASSES: usize = 0;
+pub(crate) const N_DUE: usize = 1;
+pub(crate) const N_SEEN: usize = 2;
+pub(crate) const N_PRINTS: usize = 3;
+pub(crate) const N_PRINT_BYTES: usize = 4;
+pub(crate) const N_MAPPED: usize = 5;
+pub(crate) const N_UPLOADS: usize = 6;
+pub(crate) const N_TIME: usize = 7;
+pub(crate) const N_BYTES: usize = 8;
+pub(crate) static PASS_COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// A pass's clock: the time since the last [`Clock::lap`] goes to a part.
+pub(crate) struct Clock {
+    last: std::time::Instant,
+    us: [u64; PASS_PARTS],
+}
+
+impl Clock {
+    pub(crate) fn start() -> Clock {
+        Clock { last: std::time::Instant::now(), us: [0; PASS_PARTS] }
+    }
+
+    /// The time since the last lap (or the start) was `part`'s.
+    pub(crate) fn lap(&mut self, part: usize) {
+        let now = std::time::Instant::now();
+        self.us[part] += now.duration_since(self.last).as_micros() as u64;
+        self.last = now;
+    }
+}
+
+impl Drop for Clock {
+    fn drop(&mut self) {
+        self.lap(P_REST);
+        for (all, us) in PASS_US.iter().zip(self.us) {
+            all.fetch_add(us, Relaxed);
+        }
+    }
+}
+
+/// What is known of the memory of a texture a look found changed, since
+/// its upload's read began ([`FOUND`]' places, after one for each
+/// [`Cause`] of a numbered write that made the slot stale and one for each
+/// of a tell that lay in the texture's span and was taken for another
+/// texture's): the guards or the write watch saw a store there; some of
+/// its 64 KiB blocks are not guarded, so nothing could tell; all of them
+/// are guarded and none was written; its upload had not read yet.
+pub(crate) const F_STALE: usize = 0;
+pub(crate) const F_HIDDEN: usize = CAUSES;
+pub(crate) const F_STORE: usize = 2 * CAUSES;
+pub(crate) const F_OPEN: usize = 2 * CAUSES + 1;
+pub(crate) const F_UNSEEN: usize = 2 * CAUSES + 2;
+pub(crate) const F_UNREAD: usize = 2 * CAUSES + 3;
+/// Since the start: textures found changed by a look, by what is known.
+pub(crate) static FOUND: [AtomicU64; 2 * CAUSES + 4] = [const { AtomicU64::new(0) }; 2 * CAUSES + 4];
+
+/// Since the start, by the look after an upload (the first to the fifth):
+/// looks that found the memory as it was, and that found it changed.
+pub(crate) static LOOKS: [[AtomicU64; 2]; 5] = [const { [const { AtomicU64::new(0) }; 2] }; 5];
+
+/// Since the start, for each [`Cause`] ([`TELLS`]' places): ranges told
+/// inside the spans of texture views; slots whose texture held bytes of
+/// them when a pass took them; of those, the slots made due (memory mapped
+/// or about to be written) or stale (a numbered write after their upload's
+/// read); of the slots made due, those whose upload had begun its read
+/// after the tell; slots whose span a tell lay in that was taken for
+/// another texture's (one that starts between), uploaded before it.
+pub(crate) const T_RANGES: usize = 0;
+pub(crate) const T_HELD: usize = 1;
+pub(crate) const T_DUE: usize = 2;
+pub(crate) const T_READ_AFTER: usize = 3;
+pub(crate) const T_HIDDEN: usize = 4;
+pub(crate) static TELLS: [[AtomicU64; 5]; CAUSES] = [const { [const { AtomicU64::new(0) }; 5] }; CAUSES];
+
+/// Counts `n` at `place` of the tells of the cause coded `cause`. A code
+/// past the causes counts under the last and a place past the row is
+/// dropped: these are called where the title's commands are recorded and
+/// where the runtime maps memory, and must not be able to panic.
+pub(crate) fn tell(cause: u8, place: usize, n: u64) {
+    if let Some(count) = TELLS[usize::from(cause).min(CAUSES - 1)].get(place) {
+        count.fetch_add(n, Relaxed);
+    }
+}
+
+/// Counts a texture a look found changed under what was known of its
+/// memory (a place of [`FOUND`]; one past them counts under the last).
+pub(crate) fn found(known: usize) {
+    FOUND[known.min(FOUND.len() - 1)].fetch_add(1, Relaxed);
+}
+
+/// The queue by what its slots wait for, as a pass last counted them
+/// (`crate::descriptor::host::HostHeap::texture_queue_kinds`): never
+/// looked at and due; never looked at, due later (a table's slot lately,
+/// or left for a read the title submitted); held for want of room on the
+/// card; memory not mapped, a view of address 0; memory not mapped,
+/// another; uploaded in part, waiting for more; uploaded whole, waiting
+/// for its first to fifth look; and what is none of these.
+pub(crate) const KINDS: usize = 12;
+const KIND_NAMES: [&str; KINDS] = [
+    "never looked at and due",
+    "never looked at, due later",
+    "held for room on the card",
+    "not mapped, a view of address 0",
+    "not mapped",
+    "uploaded in part, waiting for more",
+    "waiting for the 1st look",
+    "the 2nd",
+    "the 3rd",
+    "the 4th",
+    "the 5th",
+    "other",
+];
+pub(crate) static QUEUE: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+
+/// Placed textures by address, as a pass last counted them
+/// (`crate::resource::placed_descriptions`): textures in all; addresses
+/// with textures of several descriptions; the most at one address; such
+/// addresses with several host copies alive.
+pub(crate) static DESCRIPTIONS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether a pass counts the queue and the placed textures now: once a
+/// second.
+pub(crate) fn counting_due() -> bool {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let next = NEXT.load(Relaxed);
+    now >= next && NEXT.compare_exchange(next, now + 1000, Relaxed, Relaxed).is_ok()
+}
+
+/// The texture memories the pass uploaded by how many times: up to 1, 2,
+/// 4, 8, 16, 32 times and more, each with the textures and their uploads.
+fn times() -> [(u64, u64); 7] {
+    let mut out = [(0u64, 0u64); 7];
+    let all = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    for memo in all.iter().flat_map(|all| all.values()) {
+        let n = u64::from(memo.uploads.max(1));
+        let bucket = (64 - (n - 1).leading_zeros() as usize).min(6);
+        out[bucket].0 += 1;
+        out[bucket].1 += n;
+    }
+    out
+}
+
+/// The lines, every few seconds; `frames`: the frames since the last.
+pub(crate) fn lines(frames: f64) {
+    let mb = |bytes: u64| bytes >> 20;
+    let mut rows = String::new();
+    let mut all = [0u64; FIELDS];
+    for (row, counts) in UPLOADS.iter().enumerate() {
+        let c: [u64; FIELDS] = std::array::from_fn(|k| counts[k].load(Relaxed));
+        for (sum, n) in all.iter_mut().zip(c) {
+            *sum += n;
+        }
+        if c[0] == 0 {
+            continue;
+        }
+        use std::fmt::Write;
+        let _ = write!(
+            rows,
+            "; {}: {} ({} MB of title memory, {} MB staged; levels changed {} MB, the same {} MB, zero {} MB; {} with no \
+             level changed {} MB; {} read without a digest, {} read nothing)",
+            row_name(row),
+            c[0],
+            mb(c[1]),
+            mb(c[2]),
+            mb(c[3]),
+            mb(c[4]),
+            mb(c[5]),
+            c[6],
+            mb(c[7]),
+            c[8],
+            c[9]
+        );
+    }
+    if all[0] == 0 && PASS_COUNTS[N_PASSES].load(Relaxed) == 0 {
+        return;
+    }
+    tracing::info!(
+        "texture uploads by reason, since the start (counted when the upload reads): {} in all ({} MB of title memory, \
+         {} MB staged; levels changed {} MB, the same {} MB, zero {} MB; {} with no level changed {} MB){rows}",
+        all[0],
+        mb(all[1]),
+        mb(all[2]),
+        mb(all[3]),
+        mb(all[4]),
+        mb(all[5]),
+        all[6],
+        mb(all[7])
+    );
+    let f: [u64; 11] = std::array::from_fn(|k| FLAGS[k].load(Relaxed));
+    let t = times();
+    let d: [u64; 4] = std::array::from_fn(|k| DESCRIPTIONS[k].load(Relaxed));
+    tracing::info!(
+        "texture uploads as recorded, since the start: {} with a host copy made anew after it was let go, {} with a first \
+         host copy; {} of textures with another texture's view starting inside their span ({} MB of them from there on), \
+         {} with one inside the part their own view holds; {} of memory with host copies of several descriptions, {} of \
+         spans several slots show; {} for bake draws; {} that staged nothing; {} of spans that were none; {} MB of \
+         staging filled with zeros for levels not the title's. Memories by times uploaded (textures/uploads): once {}/{}, twice {}/{}, to 4 {}/{}, to 8 \
+         {}/{}, to 16 {}/{}, to 32 {}/{}, more {}/{}. Placed textures: {} in all, {} addresses with several \
+         descriptions (at most {} at one), {} of them with several host copies alive",
+        f[ANEW],
+        f[NEVER],
+        f[INNER],
+        mb(f[INNER_BYTES]),
+        f[INNER_HELD],
+        f[COPIES],
+        f[SLOTS],
+        f[BAKE],
+        f[NOTHING],
+        f[NO_SPAN],
+        mb(f[NOT_HELD_BYTES]),
+        t[0].0,
+        t[0].1,
+        t[1].0,
+        t[1].1,
+        t[2].0,
+        t[2].1,
+        t[3].0,
+        t[3].1,
+        t[4].0,
+        t[4].1,
+        t[5].0,
+        t[5].1,
+        t[6].0,
+        t[6].1,
+        d[0],
+        d[1],
+        d[2],
+        d[3]
+    );
+    {
+        use std::fmt::Write;
+        let found: [u64; 2 * CAUSES + 4] = std::array::from_fn(|k| FOUND[k].load(Relaxed));
+        let mut text = String::new();
+        for cause in Cause::ALL {
+            let (stale, hidden) = (found[F_STALE + cause as usize], found[F_HIDDEN + cause as usize]);
+            if stale + hidden > 0 {
+                let _ = write!(text, "; {}: {stale} stale by it and not made due, {hidden} in a tell taken for another texture", cause.name());
+            }
+        }
+        let mut looks = String::new();
+        for (k, look) in LOOKS.iter().enumerate() {
+            let _ = write!(looks, " {}:{}/{}", k + 1, look[1].load(Relaxed), look[0].load(Relaxed));
+        }
+        tracing::info!(
+            "textures found changed by a look, since the start, by what was known of their memory since the upload's read: \
+             {} in all; {} a store the guards or the write watch saw, {} with blocks not guarded (nothing could tell), {} \
+             guarded and clean (nothing seen), {} whose upload had not read yet{text}; by look, changed/the same:{looks}",
+            found.iter().sum::<u64>(),
+            found[F_STORE],
+            found[F_OPEN],
+            found[F_UNSEEN],
+            found[F_UNREAD]
+        );
+        let mut tells = String::new();
+        for cause in Cause::ALL {
+            let t: [u64; 5] = std::array::from_fn(|k| TELLS[cause as usize][k].load(Relaxed));
+            if t[T_RANGES] > 0 {
+                let _ = write!(
+                    tells,
+                    "; {}: {} ranges, {} slots held their bytes, {} made due or stale ({} of them read after the tell), {} \
+                     more in spans the tell lay in",
+                    cause.name(),
+                    t[T_RANGES],
+                    t[T_HELD],
+                    t[T_DUE],
+                    t[T_READ_AFTER],
+                    t[T_HIDDEN]
+                );
+            }
+        }
+        if !tells.is_empty() {
+            tracing::info!("told to the texture pass, since the start, by who told{tells}");
+        }
+    }
+    {
+        use std::fmt::Write;
+        let n: [u64; 9] = std::array::from_fn(|k| PASS_COUNTS[k].swap(0, Relaxed));
+        let mut parts = String::new();
+        let mut total = 0.0;
+        for (name, us) in PASS_NAMES.iter().zip(&PASS_US) {
+            let ms = us.swap(0, Relaxed) as f64 / 1e3 / frames;
+            total += ms;
+            let _ = write!(parts, ", {name} {ms:.2}");
+        }
+        let per = |k: usize| n[k] as f64 / frames;
+        tracing::info!(
+            "the texture pass per frame, since the last such line: {:.1} passes, {total:.2} ms on its thread (ms{parts}); \
+             {:.0} slots handed out, {:.0} looked at, {:.0} fingerprints over {:.1} MB, {:.0} askings of what is mapped, \
+             {:.0} uploads recorded; {:.2} passes stopped by their time, {:.2} by their bytes",
+            per(N_PASSES),
+            per(N_DUE),
+            per(N_SEEN),
+            per(N_PRINTS),
+            per(N_PRINT_BYTES) / 1e6,
+            per(N_MAPPED),
+            per(N_UPLOADS),
+            per(N_TIME),
+            per(N_BYTES)
+        );
+        let mut kinds = String::new();
+        for (name, count) in KIND_NAMES.iter().zip(&QUEUE) {
+            let _ = write!(kinds, ", {name} {}", count.load(Relaxed));
+        }
+        tracing::info!("the texture queue by what its slots wait for, at a pass of the last second: {}", kinds.trim_start_matches(", "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(bytes: u64, digest: u64) -> Part {
+        Part { bytes, digest, zero: false }
+    }
+
+    /// A memory's first upload counts every part with bytes as changed;
+    /// its next says which parts hold other bytes, which the same and which
+    /// nothing, by part; and one with nothing changed says so.
+    #[test]
+    fn an_upload_is_told_from_the_last_of_its_memory_by_part() {
+        let mut memo = Memo { parts: [0; PARTS], uploads: 0, frame: 0 };
+        let zero = Part { bytes: 400, digest: 9, zero: true };
+        // The first: nothing to compare with.
+        assert_eq!(compare(None, &[part(100, 5), zero]), Found { before: false, changed: 100, same: 0, zero: 400 });
+        compare(Some(&mut memo), &[part(100, 5), zero]);
+        // The large part arrived, the small one is as it was.
+        let next = [part(100, 5), part(400, 7)];
+        assert_eq!(compare(Some(&mut memo), &next), Found { before: true, changed: 400, same: 100, zero: 0 });
+        // Nothing new.
+        assert_eq!(compare(Some(&mut memo), &next), Found { before: true, changed: 0, same: 500, zero: 0 });
+        // A part that went (its pages unmapped) is zero, not changed; when
+        // it comes back with the same bytes it counts as changed (the
+        // upload between held nothing there).
+        assert_eq!(compare(Some(&mut memo), &[part(100, 5), zero]), Found { before: true, changed: 0, same: 100, zero: 400 });
+        assert_eq!(compare(Some(&mut memo), &next), Found { before: true, changed: 400, same: 100, zero: 0 });
+    }
+
+    /// Counting takes any code: one past the causes, the places or what
+    /// can be known counts under the last or is dropped, and a read of no
+    /// parts, of more parts than are told apart or of no bytes is counted
+    /// as any other.
+    #[test]
+    fn counting_takes_any_code() {
+        tell(255, T_RANGES, 1);
+        tell(0, 99, 1);
+        found(usize::MAX);
+        let many = [part(1, 1); PARTS + 9];
+        read(255, u64::MAX, u64::MAX, u64::MAX, Some(&many));
+        read(RELOOK, u64::MAX, 0, 0, Some(&[]));
+        read(VIEW, 0, 0, 0, None);
+        assert!(FOUND[FOUND.len() - 1].load(Relaxed) >= 1);
+        assert!(TELLS[CAUSES - 1][T_RANGES].load(Relaxed) >= 1);
+    }
+
+    /// A reason code past the table counts in its last row, and the codes
+    /// of the causes follow the fixed ones.
+    #[test]
+    fn reasons_have_rows() {
+        assert_eq!(usize::from(told(Cause::ALL[CAUSES - 1])), WHYS - 1);
+        assert_eq!(row_name(usize::from(told(Cause::Mapped))), Cause::Mapped.name());
+        assert_eq!(row_name(FIRST), "first upload of the memory");
+    }
+}

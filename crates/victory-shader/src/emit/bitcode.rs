@@ -727,6 +727,11 @@ impl Module {
         // An empty latch (only a branch back to its loop header) is folded
         // into its one predecessor, so the exiting block is the latch as in
         // DXC's loops; the AMD driver hangs on divergent loops otherwise.
+        // Not a second empty latch of one predecessor into one header (two
+        // latches of one branch, as dead code can leave): both edges would
+        // then come from the predecessor, and a join in the header would take
+        // two values from one block, which LLVM's verifier refuses and drivers
+        // read as they like.
         let mut preds = vec![Vec::new(); self.blocks.len()];
         for &b in &post {
             for &s in succs(b).iter() {
@@ -734,6 +739,7 @@ impl Module {
             }
         }
         let mut fold = vec![None; self.blocks.len()];
+        let mut folded: Vec<(usize, usize)> = Vec::new();
         for &b in &post {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
@@ -742,8 +748,10 @@ impl Module {
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
+                && !folded.contains(&(*p, h))
             {
                 fold[b] = Some((*p, h));
+                folded.push((*p, h));
             }
         }
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();

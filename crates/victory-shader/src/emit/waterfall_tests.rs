@@ -84,6 +84,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -232,6 +233,52 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
         assert_eq!(red, want, "{label}");
+    }
+}
+
+/// A 1D texture as the host makes it (2D, one texel high) read as the
+/// title reads its 128x1 lookup tables: the console waterfall above with
+/// its `image_sample_lz` in texel coordinates (`unorm`), once as a 1D
+/// sample (`dim:SQ_RSRC_IMG_1D`, x only) and once as the 2D sample the
+/// title's programs use on 1D textures (y = x, past the one row). Both
+/// validate and read texel `lane` (the last past the end) of the texture
+/// their lane's entry names: red `i` in the first 16x1 texture, `100 + i`
+/// in the second. Without the 2D declaration of a 1D image the 1D form
+/// read 0.0 in every lane on an RTX 5090 (Marvisak/VIctory PR #1727).
+#[test]
+fn one_texel_high_textures_read_their_texels_through_1d_and_2d_samples() {
+    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
+    const SAMPLE_2D: u32 = 0xF09C_0F08;
+    const UNORM: u32 = 1 << 12;
+    let first: Vec<[f32; 4]> = (0..16).map(|i| [i as f32, 0.0, 0.0, 1.0]).collect();
+    let second: Vec<[f32; 4]> = (0..16).map(|i| [100.0 + i as f32, 0.0, 0.0, 1.0]).collect();
+    let views = [
+        View::Texture(16, 1, &first),
+        View::Texture(16, 1, &second),
+        View::RawUav(32),
+    ];
+    for (dim, text) in [(0, "dim:SQ_RSRC_IMG_1D"), (1, "dim:SQ_RSRC_IMG_2D")] {
+        let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == SAMPLE_2D).expect("the sample");
+        // DIM, bits 5:3 of the first dword; UNORM, bit 12.
+        words[at] = (SAMPLE_2D & !(7 << 3)) | dim << 3 | UNORM;
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoded = crate::gfx10::decode(&code)
+            .expect("decode")
+            .iter()
+            .map(|i| i.text(false))
+            .find(|t| t.starts_with("image_sample"))
+            .expect("the sample's text");
+        assert!(decoded.contains(text) && decoded.contains("unorm"), "{decoded}");
+        let shader = build(&words, false);
+        let results = run(&shader, &views);
+        assert!(!results.is_empty());
+        for (label, got) in results {
+            let red: Vec<f32> = got.into_iter().map(f32::from_bits).collect();
+            let want: Vec<f32> =
+                (0..32).map(|l| [0.0, 100.0][l & 1] + l.min(15) as f32).collect();
+            assert_eq!(red, want, "{label}, {text}");
+        }
     }
 }
 

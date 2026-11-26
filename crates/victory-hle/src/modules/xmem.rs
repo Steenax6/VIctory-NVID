@@ -687,6 +687,10 @@ pub(crate) struct PageRuns {
     runs: Vec<(Slice, usize)>,
     within: usize,
     len: usize,
+    /// The title addresses that showed the bytes when they were resolved,
+    /// told to the GPU side as about to be written for as long as these
+    /// runs live ([`PageRuns::will_write`]).
+    pending: Option<victory_gpu::PendingWrite>,
 }
 
 /// Bytes `[offset, offset + len)` of `pages`, resolved; `None` if a page is
@@ -696,10 +700,22 @@ pub(crate) fn resolve_pages(pages: &[usize], offset: usize, len: usize) -> Optio
         runs: runs(pages, offset, len)?,
         within: offset % PAGE,
         len,
+        pending: None,
     })
 }
 
 impl PageRuns {
+    /// The bytes are about to be written (a read the title submitted):
+    /// the GPU side is told so at every title address that shows them now,
+    /// until these runs are dropped, after the write and its
+    /// [`PageRuns::written`], or with a read that failed or a queue that
+    /// closed (`victory_gpu::title_memory_will_write`: the texture pass
+    /// leaves the textures there for after the write). Call without the
+    /// page table's lock.
+    pub(crate) fn will_write(&mut self) {
+        self.pending = Some(victory_gpu::title_memory_will_write(&self.shown(self.len)));
+    }
+
     /// The bytes in place when they are consecutive pages of one section
     /// (how titles usually hand them out); `None` otherwise or on a host
     /// failure, when [`PageRuns::write`] serves.
@@ -773,9 +789,10 @@ impl PageRuns {
 
     /// The first `len` bytes have been written through a view of our own:
     /// the GPU side is told at every title address that shows them
-    /// (`victory_gpu::title_memory_written`; what it does with it is
-    /// `VICTORY_PAGE_WRITES`' to say, and it counts either way). Call when
-    /// the bytes are there, and without the page table's lock.
+    /// (`victory_gpu::title_memory_written`: it numbers the write for the
+    /// texture pass, and opens the guards as `VICTORY_PAGE_WRITES` says).
+    /// Call when the bytes are there, before the runs are dropped (their
+    /// pending ranges go then), and without the page table's lock.
     pub(crate) fn written(&self, len: usize) {
         for (at, bytes) in self.shown(len) {
             victory_gpu::title_memory_written(at, bytes, true);

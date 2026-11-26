@@ -140,6 +140,7 @@ fn lowered_on(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     })
 }
 
@@ -493,6 +494,121 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
         assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");
     }
     eprintln!("ran on the hardware device: the mask's bits, or the number");
+}
+
+/// A 32-lane console program in a group of 32 x 2 that reads its lane (`v_mbcnt`, so its
+/// threads are relabelled to put each console lane on its host lane), and stores lane + 1 at
+/// its own flat id (x + 32 y). A host may give such a group's waves 16 x 2 tiles: relabelled by
+/// the wave's first flat id, two waves then took the same ids and half the ids were never
+/// stored (upstream, RTX 3070 Ti). Every id is stored, with its lane.
+#[test]
+fn every_thread_of_a_group_a_wave_may_tile_keeps_its_own_id() {
+    let words = [
+        0xD765_0004,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v4, -1, 0: the lane
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+        0x3404_0285, // v_lshlrev_b32 v2, 5, v1: 32 y
+        0x4A04_0500, // v_add_nc_u32 v2, v0, v2: the flat id
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2: its byte
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 4 << 8 | 2, // buffer_store_dword v4, v2, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, false, 32);
+    // two thread-id VGPRs (x, y), 32 x 2 threads
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11,
+        threads: [32, 2, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 64) else { return };
+    let want: Vec<u32> = (0..64).map(|n| n % 32 + 1).collect();
+    assert_eq!(got, want);
+}
+
+/// A group of 64 threads of a dispatch that counts threads, run as two groups: with
+/// [`crate::spill::thread_limited`]'s entry code, the lanes past the count are off in EXEC
+/// from the start as the console launches them. Each lane adds the count of lanes in EXEC
+/// of its wave (`s_bcnt1_i32 exec`) to the dword of its thread in the group
+/// (`buffer_atomic_add`): only launched lanes add, and they count only launched lanes;
+/// u32::MAX (a dispatch of whole groups) runs every lane. As one console wave of 64 lanes
+/// in the paired form, and as two of 32 lanes.
+#[test]
+fn a_dispatch_that_counts_threads_starts_only_the_lanes_up_to_the_count() {
+    for wave64 in [true, false] {
+        let mut words = crate::spill::thread_limit_code(wave64).to_vec();
+        let mut native = native_of(
+            &[
+                sop1(if wave64 { 0x10 } else { 0x0F }, 20, 126), // s_bcnt1_i32 s20, exec
+                0x7E04_0214,                                     // v_mov_b32 v2, s20
+                vop2(0x1A, 1, k(2), 0),                          // v_lshlrev_b32 v1, 2, v0
+                0xE0C8_1000,
+                0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+            ],
+            wave64,
+            64,
+        );
+        words.extend(native.code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())));
+        native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert!(crate::spill::has_thread_limit(&native));
+        let shader = if wave64 {
+            paired(&native)
+        } else {
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            shader
+        };
+        let count = shader
+            .user_data
+            .iter()
+            .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS))
+            .expect("the dispatch's thread count")
+            .index;
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            eprintln!("the hardware device does not take this program; not run");
+            return;
+        };
+        for threads in [1u32, 7, 31, 32, 33, 63, 64, 65, 96, 100, 127, 128, u32::MAX] {
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            ud[count as usize] = threads;
+            let mut out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(64)],
+                        samplers: &[],
+                        groups: [2, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            let got = out.swap_remove(0);
+            // the lanes in EXEC of thread t's wave in group g, where t runs there
+            let lanes = if wave64 { 64 } else { 32 };
+            let wave = |g: u32, t: u32| {
+                let launched = threads.min(128).saturating_sub(64 * g).min(64);
+                let first = t / lanes * lanes;
+                u32::from(t < launched) * launched.saturating_sub(first).min(lanes)
+            };
+            let want: Vec<u32> = (0..64).map(|t| wave(0, t) + wave(1, t)).collect();
+            assert_eq!(got, want, "wave64 {wave64}, {threads} threads");
+        }
+    }
 }
 
 /// A 32-lane console wave. `if (t < s0) { ... SCC = (s1 == 7) }` and a branch on SCC after

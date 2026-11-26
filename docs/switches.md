@@ -8,9 +8,9 @@ frame line over a scene. State: 2026-11-26.
 
 | Scene | before 2026-11-25 | 2026-11-25 | 2026-11-26 |
 |---|---|---|---|
-| Opening cutscene | 1-5 fps | 132-135 ms a frame | 106 ms (about 9 fps) |
-| First room | 182 ms (5.5 fps) | 89-90 ms | 78.6 ms (12.7 fps) |
-| Open world, by boat and by car | | | 77 ms (63 to 94 over 22 minutes) |
+| Opening cutscene | 1-5 fps | 132-135 ms a frame | about 100 ms (10 fps) |
+| First room | 182 ms (5.5 fps) | 89-90 ms | 76 ms (13 fps) |
+| Open world | | | 77 to 97 ms, by scene (77 ms by boat and by car, 63 to 94 over 22 minutes) |
 
 ## What `scripts\play.ps1` sets
 
@@ -146,8 +146,10 @@ cutscene took 170 ms a frame against 106, with the same picture. In the
 prologue (205 s, to the first room) 11,356 textures were made there instead
 of waiting, 2,391 of them alive at the end (606 MB), beside 2,346 alive
 without their most detailed levels (2.8 GB of the card not taken); none was
-held back. The open world has not been run with it yet: the session of
-2026-11-26 there had it off.
+held back. In the open world (eight minutes from a save at the first boat
+mission) 22,389 textures were made there, 4,368 of them alive at the end
+(1.4 GB), and none waited for room; the frame time was that of the
+session without it (78.9 against 77.0 ms).
 
 `VICTORY_WAIT_RESIDENT` (on by default): new heaps for textures and
 committed host textures are made resident, and waited for, before anything
@@ -163,6 +165,108 @@ was not there is looked at again when nothing tells that it came (the
 runtime's mappings and the writes behind the guards do tell); slots looked
 at before and fresh ones are served in turns (fxceless/victory-fork pull
 request #1246).
+
+## Textures written by DirectStorage
+
+The game maps physical pages that held other data, writes a texture's
+view, has DirectStorage fill the pages and waits for the read's status.
+A texture picked by index that was uploaded in between holds what the
+pages held before, page by page. Every write that no guard sees
+(DirectStorage into physical pages, at each address showing them, and its
+reads to plain addresses), and every copy of the game's that the layer does
+in the game's memory itself (buffer copies at their submission, or when a
+submission sent ahead lands, and `CopyMemoryToMemoryX`), is numbered when
+its bytes are there, and every
+upload of the texture pass keeps the number its read began at: one that
+read before a write under its texture is stale until uploaded again.
+
+The stale slots are counted, in all and at each draw of the game's
+decoration bake (the log line "bake sources, since the start": bake draws,
+the ones with stale slots, those slots by what wrote them, and slots under
+a read still running at a bake). For two runs the texture pass uploaded
+them again ahead of every bake draw (`VICTORY_BAKE_WRITES`, some 25,000
+uploads a run): the head was baked with noise as before, and a character's
+body came apart in the run that did it, so that is gone.
+
+`VICTORY_PAGE_WRITES` (unset or `guards`: the guarded blocks under such a
+write are opened, so host copies of buffers and of textures read through
+tables take its bytes; `0`: not; `slots`, `1` or `all`: the stale slots are
+also due at once at every pass, about 120 uploads a second more in the
+opening cutscene). The line "writes behind
+the guards" counts the writes, the slots under them, the stale ones and
+the stale ones now.
+
+What the texture pass does is counted (no switch; lines every five
+seconds). "texture uploads by reason" says for every upload what made its
+slot due (the first upload of the memory, the slot's view written again,
+more of the memory mapped, a look that found it changed, and one row for
+each who told of the memory: DirectStorage into pages or to plain addresses,
+the layer's copies, texels and shader writes copied back, reads through the
+kernel, mappings) and what its read found against the memory's last upload,
+level by level: megabytes of levels that changed, that were the same and
+that were all zero, and the uploads none of whose levels had changed.
+"texture uploads as recorded" has the host copies made anew, the uploads of
+textures another texture's view starts inside of, the memories by how many
+times they went up and the addresses with several descriptions. "textures
+found changed by a look" splits those by what was known of their memory
+since the upload's read (a numbered write that made the slot stale, a tell
+that lay in the texture's span and was taken for another texture's, a store
+the guards saw, blocks nothing guards, nothing). "told to the texture pass"
+counts the tells by who told, "the texture pass per frame" is the pass's
+time by part, "the texture queue by what its slots wait for" the queue.
+
+For a texture both the game and the card write (the game's bake compresses
+its result on the card and copies it, level by level, into textures it also
+has views of), what was written last is what the texture holds, by the
+order the lists are submitted in: the copies of an upload from the game's
+memory are decided and recorded when its list is submitted, into the list's
+prelude, and left out for the levels the card wrote last. They were
+recorded while the game's list was, and an upload recorded before such a
+card copy ran after it when its list was submitted later: 27 times in one
+run, whose textures then showed what their memory had held before (noise
+baked onto a head in about half the runs). The same holds for every view
+of that memory: a view the game placed where a texture the card writes
+starts (another format of the same family, the same texels and levels) is
+a texture of its own here and is brought what the card wrote by a copy on
+the card, in the next list's prelude, and no upload from memory goes over
+it afterwards. The line "textures the title fills that the card copied
+into" counts the levels copied from memory over what the card had written
+last (0: none can be), the levels uploaded ahead of a card copy of their
+own list (the copy runs after, nothing is lost), the uploads withheld, the
+times the game was found to have written such memory after the card (its
+bytes then go up again), and the placed views in such memory: how many
+start where the texture does, have a host copy, are shown by a slot, were
+fed from the card, or do not fit it.
+
+At the game's Submit the addresses a read into physical pages will write
+are known; until the read is done the texture pass leaves a texture there
+for the next frame instead of uploading the bytes from before and again
+after the read ("due slots left for after a read" in the same line).
+
+## Light where no rays run
+
+`VICTORY_AMBIENT` (on by default; `=off`: the game's own output): the game
+fills its indirect light by tracing rays, which do not run while the
+structure builder is off, so whatever the sun does not reach directly is
+black. A small pass of ours replaces the screen probes' resolved light
+with a stand-in: a level times a warm white, shaded in creases and under
+objects from the scene's depth, which the game's lighting then applies
+with each surface's colours. The reflections, which without rays mirror
+the open sky indoors, are held to half of that light, and the program that
+asks the probes for rays is left out. The value is the level: unset 0.3
+(the level that came within 2 to 4 display-luma steps of console footage
+of the prison, Marvisak/VIctory pull request #2619; 0.6 looked balanced by
+eye on an RTX 4070, fxceless/victory-fork pull request #1093), a number of
+its own, or `sky` for a level that follows the sky the game draws (night
+to noon; Belobug/VIctory-Belobug-AMD). `VICTORY_AMBIENT_TINT=r,g,b`,
+`VICTORY_AMBIENT_SHADE=strength,radius,near,tan` (strength 0: no shading),
+`VICTORY_AMBIENT_REFLECT=most,least` (parts of the level; `0`: the
+reflections as the game has them) and `VICTORY_AMBIENT_SKY=gain,least,power`
+tune it; `VICTORY_AMBIENT_PROGRAMS=<hash>=resolve,...` names the programs
+for another build of the game. It is off whenever `VICTORY_BVH_BUILDER=1`.
+The log says "ambient light: stands in for the indirect light while no
+rays run" once with the level, then the reflections' and the left-out
+program's lines.
 
 ## Where the time goes
 
@@ -229,5 +333,11 @@ Diagnostics build: `cargo build --profile diag -p victory --features diagnostics
 | `VICTORY_BACK_RUN_GAP=0` | every run of a copy-back is a write of its own; by default runs under 64 bytes apart are one write (upstream pull request #857) |
 | `VICTORY_WAVE_PAIRS=0` | no paired form for 64-lane programs on 32-lane cards (upstream pull request #854) |
 | `VICTORY_MESH_LINK=0` | mesh programs over 32 KiB are not linked with their pixel program (upstream pull request #854) |
+| `VICTORY_CODE_IN_USE=0` | no measure of the shader code the host pipelines hold in the driver (on by default, release builds too, and cheap: one `GetCachedBlob` per pipeline where it is made). The periodic line `shader code of pipelines in use` gives the sum of the cached blobs' sizes of the pipelines bound at least once and not yet released, the most so far, and the sum of those made and never bound; a warning is logged once at 300, 400 and 450 MB. The blob is a proxy for the driver's machine code (it holds other state as well). NVIDIA drivers were measured elsewhere to remove the device at 512 MB of code in use (about 448 MB of blob in 262 pipelines at the point of removal) |
 | `VICTORY_GPU_TIMING=1` + `VICTORY_D3D12_DRED=1` | the card's time per command and per pass of ours (diagnostics build; submissions are waited for, so not for frame rate); `VICTORY_TIMING_LINES=<n>` lists that many commands |
 | `VICTORY_WINDOW_MAX=1920x1080` | largest size of the game window; unset, it is fitted to the screen's work area. The game's render targets keep their size |
+
+Two more lines come with the frame-rate line, without a switch (counters only, nothing waits):
+
+- `pipelines made by the driver: ...` while pipelines were made in the interval: the driver calls (create, library load, library store) of the pipeline workers, their summed time over the wall time (the average number at once) and the most in flight at once. A most near 2 with an average near 2 on many workers says the driver builds about two at a time.
+- `title lists submitted again in a later submission ...`: lists the title submits again without a reset, by the fence of the earlier submission (not reached, no signal behind it yet, reached). The first of the first two is logged once with the frame number.

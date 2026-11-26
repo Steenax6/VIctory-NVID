@@ -477,7 +477,12 @@ pub(crate) fn land(back: &Back) {
     // written by the title since it was read here.
     let mut written = 0;
     for (from, to) in changed_runs(&before, &tiled) {
-        crate::host::copy_mapped(at.wrapping_add(from) as *mut u8, tiled[from..].as_ptr(), to - from, true);
+        crate::host::copy_into_title(
+            at.wrapping_add(from) as *mut u8,
+            tiled[from..].as_ptr(),
+            to - from,
+            crate::writes::Cause::Texels,
+        );
         written += to - from;
     }
     LANDED[0].fetch_add(1, Ordering::Relaxed);

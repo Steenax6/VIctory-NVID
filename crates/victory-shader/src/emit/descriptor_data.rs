@@ -5,10 +5,31 @@
 
 use super::{
     Attr, Bin, Fields, Inst, Lower, Operand, Reg, ResourceType, Role, Site, Source, UsedResource, V,
-    Val, Why,
+    Val, Why, host_kind,
 };
 
 impl<'a> Lower<'a> {
+    /// The title address (low dword, bits from 32 up) of the view at the heap slot the
+    /// descriptor load at `site` reads, from the host's table
+    /// ([`crate::emit::SLOT_VIEW_ADDRESSES`]), in the current block. After
+    /// ka1qux/BRVIctory-ka1qux 699236769 (from fxceless/victory-fork PR #994, PiloteCode).
+    pub(super) fn heap_view_address(&mut self, site: Site) -> Option<(V, V)> {
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let c = self.cur;
+        // Inside the table whatever the index (lanes that do not run compute one too).
+        let last = self.s.m.i32(crate::emit::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, super::Tag::Clamp);
+        let k3 = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, k3);
+        let h = self.s.root_srv_handle(crate::emit::SLOT_VIEW_ADDRESSES);
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), self.s.m.i32(4));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, both, align]);
+        let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        Some((self.as_int(lo), self.as_int(hi)))
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code reads as numbers, besides using the descriptor or (an image's
     /// size) instead of it: the console compiler computes sizes
@@ -99,14 +120,24 @@ impl<'a> Lower<'a> {
                         5 => 7,
                         _ => return Err("an image dimension (cube or MSAA)"),
                     };
-                    ((kind | u, 0x409), Some(kind))
+                    // Declared 2D for a 1D (array), as `image` reads them.
+                    ((host_kind(kind) | u, 0x409), Some(kind))
                 }
                 Fields::Buffer { idxen, format, .. } => {
                     let stride = used.map_or(0, |u| u.stride);
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
-                        (10 | u, 0x409)
+                        // (Unsigned integers where the access moves halves:
+                        // `Self::places_read_as_halves`.)
+                        let halves = self
+                            .table_place(&Source::Loaded { load: site, first })
+                            .is_some_and(|p| {
+                                self.halves_only.contains(&p)
+                                    && (un.contains("_format_d16_")
+                                        || self.format_load_read_as_halves(ui))
+                            });
+                        (10 | u, if halves { 0x405 } else { 0x409 })
                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
                     {
                         (12 | u, stride)
@@ -216,7 +247,8 @@ impl<'a> Lower<'a> {
                 let (height, depth) = match kind {
                     1 => (one, one),
                     2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
+                    // The 2D array's layers (its third place).
+                    6 => (one, field(self, 2)),
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };

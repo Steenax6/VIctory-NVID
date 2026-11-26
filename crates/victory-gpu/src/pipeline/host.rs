@@ -469,6 +469,9 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
+    /// What its code holds in the driver ([`crate::code_use`]); `None` with
+    /// `VICTORY_CODE_IN_USE=0`.
+    pub(crate) code: Option<Arc<crate::code_use::Code>>,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
@@ -599,6 +602,7 @@ impl HostPipeline {
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
+                            || slot == victory_shader::emit::SLOT_VIEW_ADDRESSES
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the
@@ -705,11 +709,13 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host pipeline");
+            let code = crate::code_use::measure(&pso);
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
+                code,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -787,11 +793,13 @@ impl HostPipeline {
                 return None;
             };
             tracing::info!(?shaders, "host mesh pipeline");
+            let code = crate::code_use::measure(&pso);
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
+                code,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -927,6 +935,7 @@ impl HostPipeline {
             return None;
         };
         tracing::info!(?shaders, "host pipeline");
+        let code = crate::code_use::measure(&pso);
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -942,6 +951,7 @@ impl HostPipeline {
             compute: false,
             mesh: false,
             pso,
+            code,
             root,
             stages: bound,
             name: format!("{shaders:?}"),

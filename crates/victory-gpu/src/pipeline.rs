@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// What it is to the stand-in for the indirect light
+    /// ([`crate::ambient`]), by its hash.
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -107,9 +111,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let hash = full.to_hex()[..16].to_owned();
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                ambient: crate::ambient::role(&hash),
+                hash,
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
@@ -315,13 +322,22 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
-/// A stage of the builder was dropped after all: none runs from here on.
+/// A stage of the builder was dropped after all: none runs from here on,
+/// and the programs that walk its structures are held again
+/// ([`walker_held`]): what it built goes stale as the title moves on.
+/// (fxceless/victory-fork PR #1217, BradRoland.)
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
-        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+        b.whole = false;
+        BUILT.store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            why,
+            "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none, \
+             and the programs that walk its structures are held again"
+        );
     }
 }
 
@@ -350,6 +366,13 @@ pub(crate) fn walker_held(this: This) -> bool {
         && pipeline(this).walks
         && builder_allowed()
         && !BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether one of the title's pipeline `this`'s shaders has `role` to the
+/// stand-in for the indirect light ([`crate::ambient`]).
+#[cfg(windows)]
+pub(crate) fn has_ambient_role(this: This, role: crate::ambient::Role) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| s.ambient == Some(role))
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
@@ -586,6 +609,12 @@ fn note_other_targets(p: &Pipeline, bound: &windows::Win32::Graphics::Direct3D12
             "draws whose pipeline names other render target formats than the views bound"
         );
     }
+}
+
+/// The line on the driver's calls for pipelines, with the periodic lines.
+#[cfg(windows)]
+pub(crate) fn driver_line() {
+    library::driver_line();
 }
 
 /// Host pipelines queued and not made yet.

@@ -37,6 +37,35 @@ thread_local! {
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
+    /// The tests' stand-in for [`structures_built`]: the node test is tested
+    /// as it runs with the builder, unless a test says otherwise.
+    pub(in crate::emit) static TEST_BUILT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether the title's ray-tracing structures are built: whether its
+/// structure builder runs, which `victory-gpu` lets it do only with
+/// `VICTORY_BVH_BUILDER=1`. Without the builder the structures it builds and
+/// refits every frame (the dynamic ones and the top of the tree, above the
+/// static world's pre-built ones) hold whatever their memory held before, and
+/// a ray's walk through them reads garbage: dark tiles on hair and faces,
+/// bright squares in shadow, a different picture each start, and walks that
+/// run to [`super::lower`]'s trace loop limit. So the node test then answers
+/// as for a tree the ray misses everywhere: a box node returns no child, a
+/// triangle node [`bvh::MISS`]. The node is not read.
+// shortcut: decided when the program is translated (the switch joins the
+// shader cache's key): a run with the switch whose builder `victory-gpu`
+// turns off later (a builder pipeline that cannot be made) keeps the full
+// test over unbuilt structures.
+fn structures_built() -> bool {
+    #[cfg(test)]
+    {
+        TEST_BUILT.get()
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+    }
 }
 
 /// Where the instruction's node is.
@@ -122,6 +151,20 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if !structures_built() {
+            // No child of a box node (kinds 4 and 5), a miss for the others.
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()
@@ -250,8 +293,9 @@ impl<'a> Lower<'a> {
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
+    /// Leaves `self.cur` at the block it ends in (a look for the second half
+    /// ends in a block of its own).
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         // The second half of a 128-byte node may lie in the next 64 KiB
         // page, which may be in another copy: its own look, made once.
@@ -268,9 +312,10 @@ impl<'a> Lower<'a> {
                     // Every lane in this block runs the instruction.
                     let (handle, byte) = self.bvh_memory(low, high, None);
                     let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
+                    (handle, self.s.m.bin(self.cur, Bin::Sub, byte, k64))
                 }),
             };
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -330,7 +375,9 @@ impl<'a> Lower<'a> {
         let k16 = self.s.m.i32(16);
         let words = self.bvh_node_words(at, None, 16, 24);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        // (the second half's look ends in a block of its own)
+        let wide_end = self.cur;
+        self.s.m.terminate(wide_end, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
@@ -359,7 +406,7 @@ impl<'a> Lower<'a> {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_block)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).
@@ -401,8 +448,10 @@ impl<'a> Lower<'a> {
             let off = self.is_nan_f32(bx[0]);
             let on = self.s.m.bool(true);
             let on = self.s.m.bin(c, Bin::Xor, off, on);
+            let there = self.s.m.cmp(c, pred::NE, children[n], none);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            let hit = self.s.m.bin(c, Bin::And, hit, there);
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }

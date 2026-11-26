@@ -1938,33 +1938,107 @@ pub(crate) fn forgot(at: usize, len: usize) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    writing_as(at, len, crate::writes::Cause::Kernel);
+}
+
+/// [`writing`] for the layer's own writes, which say what they are
+/// (`cause`).
+pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
-    crate::descriptor::host::remapped(at, len);
+    crate::descriptor::host::remapped(at, len, cause);
 }
 
-/// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
-/// not see once its bytes are there ([`title_memory_written`]), as bits:
-/// 1, the guarded blocks under it are opened and count as written (host
-/// copies of buffers and textures read through tables take them again);
-/// 2, the placed textures picked by index that lie under it are due again;
-/// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
+/// What the journal and the guards hold of title memory `[start, end)`
+/// against the asking numbered `asked` (the one a texture's upload read
+/// after, `crate::texture` `Staging::asked`), asked without changing
+/// either (no kernel asking, no block guarded again): whether a page of it
+/// is noted written after that asking; how many of its 64 KiB blocks are
+/// guarded and counted written since they were last taken; and how many
+/// are not guarded at all, so that a store there is seen by nobody. For
+/// the count of what was known of a texture a look found changed
+/// (`crate::census`): two locks, one after the other.
+pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, usize) {
+    if start >= end {
+        return (false, 0, 0);
+    }
+    // (No more than 4 GiB of it: no texture is longer, and a range that is
+    // nonsense must not keep a recording thread walking.)
+    let first = start / BLOCK;
+    let last = end.div_ceil(BLOCK).min(first.saturating_add(1 << 16));
+    let noted = asked != 0 && {
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.written.range(first..last).any(|(_, w)| w.at > asked)
+    };
+    let (mut written, mut open) = (0, 0);
+    {
+        let g = guards();
+        for block in first..last {
+            if !g.protected.contains(&block) {
+                open += usize::from(!g.absent.contains(&block));
+            } else if !g.clean.contains(&block) {
+                written += 1;
+            }
+        }
+    }
+    // Blocks no guard holds may be write-watched memory: the kernel says
+    // whether a page of them was written since its bits were last taken,
+    // and leaves the bits (no reset). What another asking took meanwhile
+    // is in the journal, above.
+    if open > 0
+        && let Some(pages) = watched_dirty(first * BLOCK, (last - first) * BLOCK)
+    {
+        (written, open) = (written + pages, 0);
+    }
+    (noted, written, open)
+}
+
+/// How many pages of `[at, at + len)` the kernel's write watch holds as
+/// written (up to a few), without taking the bits; `None` if the range is
+/// not write-watched memory of one reservation.
+fn watched_dirty(at: usize, len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let mut found = [0usize; 8];
+    let mut count = found.len();
+    let mut granularity = 0u32;
+    // SAFETY: the answer buffer holds `count` entries; a range that is not
+    // watched makes the call fail.
+    let failed =
+        unsafe { GetWriteWatch(0, at as *const _, len, found.as_mut_ptr().cast(), &mut count, &mut granularity) } != 0;
+    (!failed).then_some(count)
+}
+
+/// The number of the journal's last asking: what a read of title memory
+/// that begins now comes after.
+pub(crate) fn asked_now() -> u64 {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked
+}
+
+/// What `VICTORY_PAGE_WRITES` asks to be done with a write into physical
+/// pages that the guards do not see, once its bytes are there
+/// ([`title_memory_written`]), as bits: 1, the guarded blocks under it are
+/// opened and count as written (host copies of buffers and textures read
+/// through tables take them again); 2, the placed textures picked by index
+/// whose last upload read before the write (by the writes' numbers,
+/// `crate::writes`) are due again at once, at every pass (without it they
+/// are counted and left as they are). Unset or `guards`: bit 1 alone. `0`: nothing.
+/// `1` or `all`: bits 1 and 2. `slots`: bit 2 alone. Every such write and
+/// every read to a plain address that finished is numbered and noted for
+/// the texture pass whatever this says (a read to a plain address writes
+/// from user mode, which the guards see).
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
-/// it. Bit 2 makes texture slots due and is the one that flooded the
-/// queue in an earlier form: still asked for by name.)
+/// it. Bit 2 uploads some 120 textures a second again in the opening
+/// cutscene (12,011 in 100 s); in its earlier form, two frames after the
+/// write, it cost 8 ms a frame.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
         Ok("0") => 0,
-        Ok("1") => 3,
+        Ok("1") | Ok("all") => 3,
         Ok("slots") => 2,
-        Ok("all") => 7,
         _ => 1,
     })
 }
@@ -1986,10 +2060,11 @@ pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 ///
 /// Upstream's c75fdba does the same for its trackers (its `Writing` marks
 /// the pages once more when dropped; page destinations are reported at
-/// each address showing them). Here it is counted always and acted on as
-/// [`page_writes`] says. Called without the runtime's page-table lock;
-/// takes the guards' lock, then, alone, the lock of the ranges kept for
-/// the texture pass.
+/// each address showing them). Here it is counted always, the guards are
+/// acted on as [`page_writes`] says, and the range is kept with a number
+/// for the texture pass (`crate::writes`). Called without the runtime's
+/// page-table lock; takes the guards' lock, then, alone, the lock of the
+/// ranges kept for the texture pass.
 pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     if len == 0 {
@@ -2002,16 +2077,11 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
-        if mode & 4 == 0 {
-            return;
-        }
     }
-    {
+    if pages {
         let mut g = guards();
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
-        if pages {
-            WRITTEN[2].fetch_add(guarded, Relaxed);
-        }
+        WRITTEN[2].fetch_add(guarded, Relaxed);
         if mode & 1 != 0 && guarded != 0 {
             // Written through another view: these addresses need not be
             // writable, only copied again (`mark_only`).
@@ -2023,7 +2093,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         }
     }
     // A placed texture there changed with no descriptor written.
-    crate::descriptor::host::page_written(at, len);
+    crate::descriptor::host::page_written(at, len, pages);
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -2110,7 +2180,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texture::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
-    crate::descriptor::host::remapped(at, len);
+    crate::descriptor::host::remapped(at, len, crate::writes::Cause::Mapped);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
@@ -2637,6 +2707,58 @@ mod copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write-watched memory is asked without its bits being taken: what
+    /// was written stays written for the asking that copies it, and the
+    /// memory counts as watched, not as seen by nobody.
+    #[test]
+    fn the_write_watch_is_asked_without_taking_its_bits() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        /// The allocation type that has the kernel keep a dirty bit a page.
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let len = 4 * BLOCK;
+        // SAFETY: a fresh allocation of ours, written inside its bounds and
+        // released at the end.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE).cast::<u8>();
+            assert!(!p.is_null());
+            let at = p as usize;
+            assert_eq!(watched_dirty(at, len), Some(0));
+            assert_eq!(seen_since(at, at + len, 0), (false, 0, 0));
+            p.add(BLOCK + 5).write(1);
+            assert_eq!(watched_dirty(at, len), Some(1));
+            assert_eq!(watched_dirty(at, len), Some(1), "the bits are left");
+            assert_eq!(seen_since(at, at + len, 0), (false, 1, 0));
+            assert_ne!(VirtualFree(p.cast(), 0, MEM_RELEASE), 0);
+            // Memory that is not watched: nothing to ask.
+            let plain = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!plain.is_null());
+            assert_eq!(watched_dirty(plain as usize, len), None);
+            assert_ne!(VirtualFree(plain.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Memory the guards do not hold is seen by nobody: every block of it
+    /// counts as not guarded, and an empty range has none.
+    #[test]
+    fn memory_no_guard_holds_is_seen_by_nobody() {
+        // An address no test maps and no guard holds.
+        let at = 0x7fe9_0000_0000usize;
+        assert_eq!(seen_since(at, at + 3 * BLOCK, 0), (false, 0, 3));
+        assert_eq!(seen_since(at + 1, at + BLOCK + 1, 5), (false, 0, 2));
+        assert_eq!(seen_since(at, at, 0), (false, 0, 0));
+        // A range that is none, address 0 and the top of the address space.
+        assert_eq!(seen_since(at + BLOCK, at, 7), (false, 0, 0));
+        assert_eq!(seen_since(0, 0, 0), (false, 0, 0));
+        assert_eq!(seen_since(0, 1, 0).1, 0);
+        assert_eq!(seen_since(usize::MAX, usize::MAX, 0), (false, 0, 0));
+        assert_eq!(seen_since(usize::MAX - 1, usize::MAX, u64::MAX).1, 0);
+        // All of the address space: looked at for 4 GiB of it, no longer.
+        assert_eq!(seen_since(0, usize::MAX, 0), (false, 0, 1 << 16));
+        assert!(asked_now() <= asked_now());
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };

@@ -17,7 +17,9 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i` (0: a constant buffer view,
+/// or a typed buffer whose element size the host does not know;
+/// [`SLOT_STRIDES_SKIP`]: no buffer view at all).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -26,6 +28,38 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] entry of a slot that holds no buffer view and no
+/// constant buffer view (a texture's, a null view, nothing): a buffer the
+/// program picks there is read as nothing. With 0 there (as before) such
+/// a slot was read as a constant buffer, and on AMD a texture's descriptor
+/// read as a buffer's points at its image address shifted right by 8: 13
+/// of the 16 page faults recorded for the meshlet culls of the previous
+/// frame's records (`CS_BatchCullMeshlets_Prev`,
+/// `CS_BatchCullPreSkinnedMeshlets_Prev`, with work sent ahead) are such
+/// addresses. Such a buffer reads the null view of its class the host keeps
+/// below the null slot instead ([`NULL_BUFFER_SRV_BELOW`]).
+pub const SLOT_STRIDES_SKIP: u32 = u32::MAX;
+
+/// How far below the host view heap's null slot ([`view_heap_limit`]) the
+/// null views sit that a buffer picked from the heap reads where the host's
+/// table says its slot holds no buffer view ([`SLOT_STRIDES_SKIP`]): one
+/// per descriptor class, so the view matches the access. The null slot's
+/// own 2D view read as a buffer is a mismatch not every GPU survives.
+pub const NULL_BUFFER_SRV_BELOW: u32 = 1;
+/// See [`NULL_BUFFER_SRV_BELOW`]: a raw buffer UAV, for writes.
+pub const NULL_BUFFER_UAV_BELOW: u32 = 2;
+/// See [`NULL_BUFFER_SRV_BELOW`]: a constant buffer view, the lowest.
+pub const NULL_CBV_BELOW: u32 = 3;
+
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that takes the address out of a buffer descriptor it picks from the view
+/// heap at an index it computes, and uses it as a pointer (the title's
+/// shadow-mask ray traces take the address of their ray-tracing structure
+/// so): a raw buffer of 2 x [`SLOT_STRIDES_COUNT`] dwords the host keeps,
+/// dwords `2i` and `2i + 1` the title address of the view at heap slot `i`
+/// (low dword, bits from 32 up; 0 for a slot without a buffer or structure
+/// view). As [`USER_VIEW_ADDRESS`] for a table entry at a fixed place.
+pub const SLOT_VIEW_ADDRESSES: u8 = 252;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -77,6 +111,13 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// by a program that reads its group id ([`crate::io::Input::GroupId`] and
 /// the mesh stage's group), which adds it to `x`.
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// threads in `x` of a dispatch that counts threads (`DispatchX` with
+/// `USE_THREAD_DIMENSIONS`), `u32::MAX` for one of whole groups. Read only
+/// by a program with [`crate::spill::thread_limited`]'s entry code, whose
+/// lanes past the count are off in EXEC from the start, as the console
+/// launches them.
+pub const USER_DISPATCH_THREADS: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -136,8 +177,21 @@ pub fn set_view_heap_limit(null_slot: u32) {
 
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_VIEW_LIMIT.get() {
+        return limit;
+    }
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`view_heap_limit`], for its thread only.
+    pub(super) static TEST_VIEW_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Resource properties, word 0: a globally coherent UAV (bit 14).
+const COHERENT: u32 = 0x4000;
 
 pub(crate) struct Shader {
     pub m: Module,
@@ -167,6 +221,10 @@ pub(crate) struct Shader {
     /// A pixel shader whose writes to views the console orders by primitive (POPS): its
     /// heap views written or read as UAVs are rasterizer-ordered views.
     pub ordered: bool,
+    /// Every UAV globally coherent: a program that orders memory between
+    /// thread groups (`crate::ir::orders_across_groups`). Set before the
+    /// first handle is made.
+    pub coherent: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -225,6 +283,7 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             ordered: false,
+            coherent: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -359,7 +418,7 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let h = self.annotate(block, h, 11 | 0x1000 | self.coherent_bit(), 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -392,6 +451,12 @@ impl Shader {
         self.annotate(block, h, 14 | cmp, 0)
     }
 
+    /// Resource properties, word 0, of a UAV of this shader: bit 14, globally
+    /// coherent, in a program that orders memory between groups.
+    fn coherent_bit(&self) -> u32 {
+        if self.coherent { COHERENT } else { 0 }
+    }
+
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
@@ -416,7 +481,7 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_heap_limit();
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -447,6 +512,11 @@ impl Shader {
         let props = if self.ordered && !sampler && props.0 & 0x1000 != 0 {
             self.flags |= flags::ROVS;
             (props.0 | 0x2000, props.1)
+        } else {
+            props
+        };
+        let props = if !sampler && props.0 & 0x1000 != 0 {
+            (props.0 | self.coherent_bit(), props.1)
         } else {
             props
         };
@@ -592,6 +662,9 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                // as the handles are annotated (`coherent_bit`)
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -605,7 +678,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,
