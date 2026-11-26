@@ -8537,8 +8537,15 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
+            // The clock is read for the steps that are timed, the copies
+            // and the fills (and, with diagnostics, the title's own work),
+            // not for every step: a frame of the first room has 12,800
+            // copies and fills and 21,700 refreshes besides the declared
+            // writes and the textures, and the clock was 1.7 ms of the
+            // submitting thread's 69 ms a frame (the profile of 2026-11-26;
+            // Marvisak/VIctory pull request 3096 does the same in its own
+            // preparing).
+            let (started, copied) = match step {
                 &Step::Copy(dst, src, len) => {
                     // Left to the submission's landing (`copy_goes_late`).
                     if let Some(at) = batch.late.iter().position(|c| *c == (dst, src, len)) {
@@ -8546,6 +8553,7 @@ impl HostList {
                         batch.went_late.push((dst, src, len));
                         continue;
                     }
+                    let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8563,9 +8571,10 @@ impl HostList {
                     // And the texture pass, by a number taken now that the
                     // bytes are there: an upload that read before is stale.
                     crate::descriptor::host::title_copied(dst, len);
-                    len
+                    (started, len)
                 }
                 &Step::Fill(dst, src, len) => {
+                    let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8574,7 +8583,7 @@ impl HostList {
                         crate::copystat::buffers::cpu_read(src, len);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    (started, len)
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8586,6 +8595,8 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
