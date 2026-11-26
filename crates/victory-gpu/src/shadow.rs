@@ -3723,6 +3723,63 @@ impl Shadow {
         }
     }
 
+    /// Diagnostics, for the report of a removed device: `len` bytes of the
+    /// copy from `address` on against title memory as it is now. The 4-byte
+    /// words (from `address` on) in which they differ, whether a range
+    /// shaders may be writing holds part of it, and the first `first` such
+    /// words as (address, the title's value, the copy's value). For a copy
+    /// in the card's memory the copy's side is the CPU's, which is what
+    /// went up to the card. `None` for title memory in place (no copy) and
+    /// a range outside the buffer. Parts of title memory that cannot be
+    /// read are passed over.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn against_title(&self, address: usize, len: usize, first: usize) -> Option<(usize, bool, Vec<(usize, u32, u32)>)> {
+        if self.place.is_some() {
+            return None;
+        }
+        let (from, to) = self.inside(address, len);
+        if from >= to {
+            return None;
+        }
+        let start = self.start as usize;
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < start + to && e > start + from);
+        let (mut words, mut said) = (0, Vec::new());
+        let mut title = vec![0u8; PAGE];
+        let mut at = from;
+        while at < to {
+            // Up to the end of the title page (a page that cannot be read
+            // is passed over whole).
+            let (lo, hi) = (at, (((start + at) / PAGE + 1) * PAGE - start).min(to));
+            let n = hi - lo;
+            let title = &mut title[..n];
+            if crate::host::read_into((start + lo) as *const u8, title) {
+                // SAFETY: `[lo, hi)` lies inside `[from, to)`, which
+                // `inside` cut to the copy, so inside the mapping of its bytes.
+                let copy = unsafe { std::slice::from_raw_parts(self.data.add(lo).cast_const(), n) };
+                for (w, (t, c)) in title.chunks(4).zip(copy.chunks(4)).enumerate() {
+                    if t != c {
+                        words += 1;
+                        if said.len() < first {
+                            let word = |b: &[u8]| {
+                                let mut w = [0u8; 4];
+                                w[..b.len()].copy_from_slice(b);
+                                u32::from_le_bytes(w)
+                            };
+                            said.push((start + lo + 4 * w, word(t), word(c)));
+                        }
+                    }
+                }
+            }
+            at = hi;
+        }
+        Some((words, pending, said))
+    }
+
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.

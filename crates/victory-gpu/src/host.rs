@@ -6971,6 +6971,13 @@ impl Host {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
+                    #[cfg(feature = "diagnostics")]
+                    if tables
+                        && done > 0
+                        && let Some(r) = run
+                    {
+                        text.push_str(&reads_against_title(r));
+                    }
                 }
                 plain = p.pNext;
             }
@@ -9849,6 +9856,61 @@ fn last_notes(runs: &[&HostList]) -> String {
         let _ = runs;
         String::new()
     }
+}
+
+/// For the report of a removed device (diagnostics): the ranges of host
+/// copies a list that stopped had brought up to date for its draws (its
+/// buffer views, vertices, indices and constants), each against title
+/// memory as it is after the removal. A draw of the list may have run for
+/// seconds on what its copy held: a range whose copy differs from what the
+/// title holds says which bytes the card read that the title did not
+/// write, or wrote since (the title runs on while the card stands); one
+/// that is the same says the card read the title's own bytes. Ranges that
+/// differ are listed (at most 32, the first 3 words of each), the most
+/// differing words first.
+#[cfg(feature = "diagnostics")]
+fn reads_against_title(list: &HostList) -> String {
+    let mut ranges: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step
+                && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
+            {
+                ranges.push((shadow.clone(), *address, *len));
+            }
+        }
+    }
+    let (mut bytes, mut differ) = (0usize, Vec::new());
+    for (shadow, address, len) in &ranges {
+        bytes += len;
+        if let Some((words, pending, first)) = shadow.against_title(*address, *len, 3)
+            && words > 0
+        {
+            differ.push((words, *address, *len, shadow.id(), pending, first));
+        }
+    }
+    differ.sort_unstable_by_key(|d| std::cmp::Reverse(d.0));
+    let shown: Vec<String> = differ
+        .iter()
+        .take(32)
+        .map(|(words, address, len, copy, pending, first)| {
+            let first: Vec<String> = first.iter().map(|(at, title, copy)| format!("{at:#x} title {title:#x} copy {copy:#x}")).collect();
+            format!(
+                "{address:#x}+{len:#x} (copy {copy}{}): {words} words differ, {}",
+                if *pending { ", shaders of a flight may write it" } else { "" },
+                first.join(", ")
+            )
+        })
+        .collect();
+    format!(
+        "; its reads against title memory now: {} ranges ({} MB) of host copies, {} differ{}{}",
+        ranges.len(),
+        bytes >> 20,
+        differ.len(),
+        if shown.is_empty() { "" } else { ": " },
+        shown.join("; ")
+    )
 }
 
 /// Where the faulting address `va` lies against a range `(start, bytes)` a
