@@ -8989,6 +8989,15 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
+            let [first, first_us] =
+                [0, 1].map(|i| crate::texture::FIRST_WAITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if first > 0.0 {
+                tracing::info!(
+                    "first reads of textures never filled that waited for title memory to hold still, per frame \
+                     (VICTORY_TEXTURE_NO_WAIT=1 leaves the others for the next refresh): {first:.1}, {:.2} ms",
+                    first_us / 1000.0
+                );
+            }
             let [read, taken] = [0, 1].map(|i| crate::texture::PAGES_MISSING[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if read > 0.0 {
                 tracing::info!(

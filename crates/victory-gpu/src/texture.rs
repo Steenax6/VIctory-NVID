@@ -92,6 +92,10 @@ pub(crate) struct Staging {
     /// the check before it reads the memory, whatever the guards, the
     /// write watch or the wait of a partly mapped texture say.
     remapped: Arc<std::sync::atomic::AtomicBool>,
+    /// A detiling of title memory has filled the buffer (until then it
+    /// holds zeros): a refresh that could not read memory leaves a texture
+    /// that held bytes as it was, but must not leave this one empty.
+    filled: std::sync::atomic::AtomicBool,
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -506,6 +510,11 @@ fn no_wait() -> bool {
 /// through the kernel because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the last frame-rate line, with [`no_wait`]: first reads of a
+/// texture never filled that waited for the runtime's remap instead of
+/// being left for the next refresh, and the microseconds they waited.
+pub(crate) static FIRST_WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line: refreshes that read a texture whose
 /// memory was not all mapped (pages not there read as zeros), and those of
@@ -1300,10 +1309,26 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
+            match crate::watch::title_memory_reading_now() {
+                Some(mapped) => mapped,
+                None => {
+                    let read = self.refresh_unlocked(last, size);
+                    if read > 0 || self.filled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return read;
+                    }
+                    // Never filled: left for the next refresh, it went up
+                    // as zeros, and the frame's draws and a bake that
+                    // samples it (once, at load: skin and clothing) took
+                    // them (a black face that never came back). Its first
+                    // read waits for the runtime's remap instead.
+                    let waiting = std::time::Instant::now();
+                    let mapped = waited(2, crate::watch::title_memory_reading);
+                    FIRST_WAITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    FIRST_WAITS[1]
+                        .fetch_add(waiting.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    mapped
+                }
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -1454,6 +1479,7 @@ impl Staging {
         }
         // Every staged level written: what a spare buffer held is gone.
         self.stale.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.filled.store(true, std::sync::atomic::Ordering::Relaxed);
         if !self.on_demand {
             self.fill_missing_levels();
         }
@@ -2009,6 +2035,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     index_staged(memory as usize, layout.size as usize, &remapped);
     let s = Arc::new(Staging {
         remapped,
+        filled: std::sync::atomic::AtomicBool::new(false),
         buffer,
         #[cfg(feature = "diagnostics")]
         size: total,
@@ -2068,6 +2095,56 @@ mod remap_tests {
             assert!(!staging.remapped.load(Relaxed), "the check took the flag");
         }
         // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// With `VICTORY_TEXTURE_NO_WAIT=1`, a texture never filled whose first
+    /// refresh meets the runtime remapping (and cannot be read through the
+    /// kernel: a page is not there) waits for the remap and is read, not
+    /// left for the next refresh with zeros.
+    #[test]
+    fn a_first_read_waits_for_a_remap() {
+        use windows_sys::Win32::System::Memory::*;
+        const CHILD: &str = "VICTORY_TEST_FIRST_READ";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_TEXTURE_NO_WAIT", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        const RUN: usize = 0x1_0000;
+        // A linear 256x256 RGBA8 texture: four runs, only the first there.
+        // SAFETY: a private reservation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * RUN, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: the first run of the reservation above.
+        assert!(!unsafe { VirtualAlloc(base, RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        // SAFETY: committed memory of ours.
+        unsafe { base.cast::<u8>().write(0x33) };
+        let description = [3, 0, 0, 0, 256, 0, 256, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(base as u64, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            super::staging(resource, host_texture)
+        });
+        if let Some(staging) = staged {
+            let (held, release) = std::sync::mpsc::channel();
+            let remapping = std::thread::spawn(move || {
+                let _changing = crate::watch::title_memory_remapping();
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            });
+            release.recv().unwrap();
+            staging.refresh();
+            remapping.join().unwrap();
+            // SAFETY: the staging buffer stays mapped while `staging` lives.
+            assert_eq!(unsafe { staging.data.read_volatile() }, 0x33, "the first read was left for later");
+            assert_eq!(super::FIRST_WAITS[0].load(Relaxed), 1);
+        }
+        // SAFETY: the reservation above, released once.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
