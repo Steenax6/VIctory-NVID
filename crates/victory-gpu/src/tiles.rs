@@ -1445,7 +1445,7 @@ void look() {
                 }
                 let mut device: Option<ID3D12Device> = None;
                 if card {
-                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                    crate::adapter::create_device(D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 } else {
                     let adapter = warp_adapter().ok()?;
                     D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;

@@ -2780,7 +2780,7 @@ void work() {
             // views are made in heaps that live as long as the rig.
             unsafe {
                 let mut device: Option<ID3D12Device> = None;
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                crate::adapter::create_device(D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 let device = device?;
                 let desc = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
                     .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))

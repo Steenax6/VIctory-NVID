@@ -815,7 +815,7 @@ mod tests {
                     let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
                     D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 } else {
-                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                    crate::adapter::create_device(D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 }
                 let device = device?;
                 let queue: ID3D12CommandQueue = device

@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod adapter;
+#[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
