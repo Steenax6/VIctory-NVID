@@ -87,11 +87,11 @@ pub(crate) struct Shadow {
     /// census (`crate::copystat::buffers`).
     #[cfg(feature = "diagnostics")]
     asked_by: AtomicU8,
-    /// The range last brought up to date by asking, and the events counted
-    /// in it just before (`crate::watch::events`): with
+    /// The range last brought up to date by asking, with the events counted
+    /// in it just before (`crate::watch::Seen`): with
     /// `VICTORY_REFRESH_EVENTS`, a refresh inside it at the same count has
     /// nothing to ask.
-    events_seen: Mutex<(usize, usize, u64)>,
+    events_seen: Mutex<crate::watch::Seen>,
 }
 
 /// Who asks for a refresh of a copy ([`Shadow::refresh_as`]): a draw for
@@ -3227,7 +3227,7 @@ impl Shadow {
             place: None,
             #[cfg(feature = "diagnostics")]
             asked_by: AtomicU8::new(0),
-            events_seen: Mutex::new((0, 0, 0)),
+            events_seen: Mutex::default(),
         }
     }
 
@@ -3950,35 +3950,48 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         // By event (`crate::watch::events_mode`), for a range in view
-        // memory: whether anything happened in the range last brought up
+        // memory of a copy that is asked about at all (one whose memory
+        // nothing watches is copied whole every time, whatever the
+        // counts): whether anything happened in the range last brought up
         // to date since it was, if this one lies inside it.
+        use crate::watch::{Checked, Look, Seen};
         let by_event = crate::watch::events_mode();
-        let looked = (by_event != 0 && crate::inplace::view_at(from).is_some() && crate::inplace::view_at(to - 1).is_some())
+        let watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
+        let looked = (by_event != 0 && watched && crate::inplace::view_at(from).is_some() && crate::inplace::view_at(to - 1).is_some())
             .then(|| {
-                let (a, b, then) = *self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
-                let inside = a <= from && to <= b;
-                (inside, inside && crate::watch::events(a, b) == then, crate::watch::events(from, to))
+                let seen = *self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
+                let inside = seen.holds(from, to);
+                // (The counts of this range, from before its asking.)
+                (seen, inside, inside && seen.quiet(), Seen::before(from, to))
             });
-        if by_event == 1 && matches!(looked, Some((true, true, _))) {
-            crate::watch::event_checked(true, true, None, (self.start, self.len), from, to);
+        if by_event == 1 && matches!(looked, Some((_, true, true, _))) {
+            let left_out = Checked { inside: true, quiet: true, quiet_locked: true, copied: None };
+            crate::watch::event_checked(left_out, (self.start, self.len), from, to, None);
             return 0;
         }
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+        if watched {
+            // The check looks at the counts again with the asking's locks
+            // held: what the asking finds is then what they stand for.
+            let mut look = Look { seen: looked.filter(|_| by_event == 2).map(|l| l.0), ..Look::default() };
             let copied = if refresh_parts() || refresh_kernel_pages() {
-                crate::watch::writes_fine(from, to, true).map(|(now, written)| self.copy_stale_fine(from, to, now, &written))
+                crate::watch::writes_fine_look(from, to, true, &mut look).map(|(now, written)| self.copy_stale_fine(from, to, now, &written))
             } else {
-                crate::watch::writes(from, to, true).map(|(now, written)| self.copy_stale(from, to, now, &written))
+                crate::watch::writes_fine_look(from, to, true, &mut look)
+                    .map(|(now, written)| (now, written.into_iter().map(|(p, w)| (p, w.at)).collect::<Vec<_>>()))
+                    .map(|(now, written)| self.copy_stale(from, to, now, &written))
             };
             if let Some(copied) = copied {
-                if let Some((inside, quiet, now)) = looked {
-                    crate::watch::event_checked(quiet, inside, Some(copied), (self.start, self.len), from, to);
-                    // The count from before the asking: what the asking
+                if let Some((_, inside, quiet, before)) = looked {
+                    let quiet_locked = if by_event == 2 { inside && look.quiet } else { quiet };
+                    let checked = Checked { inside, quiet, quiet_locked, copied: Some(copied) };
+                    crate::watch::event_checked(checked, (self.start, self.len), from, to, look.found);
+                    // The counts from before the asking: what the asking
                     // itself noted has this range asked once more.
                     let mut seen = self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
                     // A range inside the one known keeps the wider one
                     // while nothing happened in it.
                     if !(inside && quiet) {
-                        *seen = (from, to, now);
+                        *seen = before.after(&look);
                     }
                 }
                 self.watched.store(1, Ordering::Relaxed);

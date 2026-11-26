@@ -103,21 +103,43 @@ census's "guarded blocks opened by the layer's own writes" should fall to
 nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
 pull request 3069; this tree's own code).
 
-`VICTORY_REFRESH_EVENTS` (2026-11-26; off: its check `=2` found 7 refreshes with
-bytes to copy and no event in the prologue's 205 s and 2 in the open
-world's first 130 s, so `=1` would have left writes out): a
+`VICTORY_REFRESH_EVENTS` (2026-11-26; off until its check has run again): a
 copy in view memory is not asked about again while nothing happened in
 its memory since it was last brought up to date. What can make a guarded
 block count as written (a write that faults, one of ours that opens or
 marks it, a new mapping, a page the journal notes) raises a count for
-its 4 MiB of title memory, and a copy remembers the counts of the range
-it last brought up to date. `=2` is the check: every refresh is asked as
-before, and each one that `=1` would have left out and that found bytes
-to copy is counted and named ("a refresh found bytes to copy where no
-event was counted"); the line "refreshes by event" must say 0 of those
-in the prologue and at the open world's entry and in its bedroom before
-`=1` is used. Copies in private memory are asked as before: only the
-kernel knows what was written there.
+its 4 MiB of title memory, with the lock held under which an asking
+sees it, and a copy remembers the counts of the range it last brought up
+to date. A range that held blocks not committed is asked once in every 30
+frames all the same (`VICTORY_ABSENT_FRAMES`): a block committed with
+nothing told is found by looking, as before. `=2` is the check: every
+refresh is asked as before, and each one that `=1` would have left out
+and that found bytes to copy is counted and named ("a refresh found bytes
+to copy where no event was counted", with the block the guards reported
+and what it was to them); the line "refreshes by event" must say 0 of
+those in the prologue and at the open world's entry and in its bedroom
+before `=1` is used. Copies in private memory are asked as before: only
+the kernel knows what was written there.
+
+The check's first form found 7 such refreshes in the prologue's 205 s and
+2 in the open world's first 130 s. It decided that nothing had happened
+before the asking took its locks and counted whatever the asking then
+found; a write whose fault or mark was counted in that moment was a find,
+though `=1` asks for it at the next refresh. It decides with the locks
+held now, and the line counts the others apart ("whose event was counted
+between the refresh's look and its asking"). Reading the code for a
+writer the events miss found two places, both put right: a mapping's
+count was raised before the guards' lock was taken (a refresh between
+the two remembered the count and not the mapping), and a copy whose
+memory turned out not to be watched could be left out. Whether the 9
+finds were the check's own is what its next runs say; it is inferred.
+
+A read of the kernel's into title memory (`ReadFile`) now says when it is
+done, and blocks a check guarded again while the kernel was writing count
+as written once more: a file read without buffering goes on into such a
+block with no fault, and the host copies there kept the bytes of the
+moment they looked. The line "reads of the kernel's into title memory
+that finished" counts those blocks; no switch.
 
 ## Pipelines
 
