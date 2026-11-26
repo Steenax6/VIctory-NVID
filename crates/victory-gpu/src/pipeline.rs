@@ -657,9 +657,11 @@ pub(crate) extern "system" fn create_stream(
             break;
         };
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8; the title's
+            // stream is bytes and need not put it on 8 (a reference to it
+            // there would be undefined, and a panic in checked builds).
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -845,5 +847,27 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// A stream need not be 8-aligned: its shaders' bytecode is read as it
+    /// lies (Marvisak/VIctory #2301).
+    #[test]
+    fn a_stream_off_8_yields_its_shaders() {
+        let vs = [7u8; 3];
+        // 8-aligned, so one byte in is not.
+        let mut backing = [0u64; 4];
+        // SAFETY: 24 of the 32 bytes of `backing`, from its second byte.
+        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 24) };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // a vertex shader
+        stream[8..16].copy_from_slice(&(vs.as_ptr() as u64).to_le_bytes());
+        stream[16..24].copy_from_slice(&(vs.len() as u64).to_le_bytes());
+        let desc = StreamDesc {
+            size: stream.len(),
+            stream: stream.as_ptr(),
+        };
+        assert_ne!(desc.stream as usize % 8, 0);
+        let mut p = std::ptr::null();
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(shaders(p), [("vertex", vs.to_vec())]);
     }
 }
