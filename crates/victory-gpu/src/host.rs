@@ -6251,6 +6251,7 @@ impl Host {
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
+        crate::timeline::ev("sub.", 1, runs.len() as u64);
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -6287,12 +6288,14 @@ impl Host {
         // of its own beside what follows, joined before the lists go
         // (`crate::descriptor::beside`; it started before the sweep, now
         // after it).
+        crate::timeline::ev("sub.", 2, runs.len() as u64);
         let heap_sync = crate::descriptor::beside::begin();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
         // The sync's askings come before the submission's own.
         heap_sync.asked();
+        crate::timeline::ev("sub.", 3, runs.len() as u64);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -6352,8 +6355,10 @@ impl Host {
         }
         // The lists run so far: a list run again records a prelude of its
         // own (`HostList::prelude`).
+        crate::timeline::ev("sub.", 4, runs.len() as u64);
         let mut run_before: Vec<*const HostList> = Vec::new();
         for list in runs {
+            crate::timeline::ev("list.", list.deferred().copies.len() as u64, 0);
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             let again = run_before.contains(&std::ptr::from_ref(*list));
@@ -6367,6 +6372,7 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        crate::timeline::ev("sub.", 5, runs.len() as u64);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -6380,6 +6386,7 @@ impl Host {
         // The heap sync is done before the lists go; the slots it left
         // waiting for a texture made since are made now. (The wait is left
         // out of "preparing", as the sync was: the sync's line has it.)
+        crate::timeline::ev("sub.", 6, runs.len() as u64);
         let joining = std::time::Instant::now();
         heap_sync.join();
         settled += joining.elapsed();
@@ -6393,11 +6400,13 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        crate::timeline::ev("sub.", 7, runs.len() as u64);
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        crate::timeline::ev("sub.", 8, runs.len() as u64);
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
@@ -8367,6 +8376,7 @@ impl Batch {
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let _span = crate::timeline::span("upd>", "upd<", (to - from) as u64, from as u64);
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
@@ -8393,6 +8403,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let _span = crate::timeline::span("flush>", "flush<", self.refreshes.len() as u64, 0);
         self.index.clear();
         // Copies of one title buffer that lie close together become one:
         // the refresh moves 460 to 1,370 MB a frame in 25,000 to 90,000
