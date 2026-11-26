@@ -4036,21 +4036,33 @@ impl Shadow {
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
     /// refresh of `[from, to)` that trusted the write watch or the guards,
     /// the first 256 bytes of every 64 KiB block of it are read from title
-    /// memory and compared with the copy. A block that differs on three
-    /// refreshes in a row was changed with nothing to tell of it (a write
-    /// through another view of its pages, as DirectStorage's page
-    /// destinations make) and the card reads old bytes there: said with
-    /// the copy and the address. One that differs once is a write of the
-    /// title's that arrived between the refresh and the look.
+    /// memory and compared with the copy. One that differs once is a write
+    /// of the title's that arrived between the refresh and the look.
+    ///
+    /// One that differs on three refreshes in a row was said to have
+    /// changed "with nothing to tell of it". That is not so for a block a
+    /// read of the title's is filling: DirectStorage writes a destination's
+    /// pages through a view of the runtime's own for as long as the read
+    /// and its decoding take, and the guards are told when it is done
+    /// (`crate::watch::title_memory_written`); until then every host copy
+    /// over the pages holds the bytes from before, and a copy is brought up
+    /// to date several times in one submission. The open world's entry had
+    /// 1,024 such blocks in 130 s (run s_we_y2_check), all of them in
+    /// 4 MiB windows, at the rate the reads came in. So the looks are told
+    /// apart ([`REFRESH_CHECKED`], [`refresh_check_line`]): those under a
+    /// read the title has submitted and that is not done
+    /// (`crate::writes::in_flight_over`) count for nothing; a block that
+    /// differs three times in a row with no such read is said, with what
+    /// the guards hold of it; when it matches again it is counted by
+    /// whether a write behind the guards was told there meanwhile; and one
+    /// that has differed for two seconds with nothing told is said once
+    /// more: that one is a copy that keeps old bytes.
     fn refresh_check(&self, from: usize, to: usize) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !refresh_checked() {
             return;
         }
         const SAMPLE: usize = 256;
-        // Blocks found differing: how many refreshes in a row.
-        static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
-        static SAID: AtomicU64 = AtomicU64::new(0);
+        static SAID: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
         let start = self.start as usize;
         let mut title = [0u8; SAMPLE];
         let mut at = from;
@@ -4061,25 +4073,61 @@ impl Shadow {
                 // so these bytes are inside the copy's mapping.
                 let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
-                let map = map.get_or_insert_with(Default::default);
                 if copy == &title[..n] {
-                    map.remove(&at);
+                    if let Some(was) = map.remove(&at)
+                        && was.times >= 3
+                    {
+                        REFRESH_CHECKED[if was.told { 3 } else { 4 }].fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if crate::writes::in_flight_over(at as u64, (at + n) as u64) {
+                    REFRESH_CHECKED[0].fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let times = map.entry(at).or_insert(0);
-                    *times += 1;
-                    if *times == 3 {
-                        let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+                    REFRESH_CHECKED[1].fetch_add(1, Ordering::Relaxed);
+                    let d = map.entry(at).or_insert_with(|| Differing {
+                        times: 0,
+                        since: std::time::Instant::now(),
+                        told: false,
+                        long: false,
+                    });
+                    d.times += 1;
+                    let named = |what: &str, said: u64, d: &Differing| {
+                        tracing::warn!(
+                            said,
+                            copy = self.id,
+                            copy_start = format_args!("{start:#x}"),
+                            copy_bytes = self.len,
+                            address = format_args!("{at:#x}"),
+                            refreshed = format_args!("{from:#x}..{to:#x}"),
+                            on_the_card = self.card.is_some(),
+                            window = self.window,
+                            refreshes = d.times,
+                            ms = d.since.elapsed().as_millis() as u64,
+                            guards = crate::watch::guard_state(at),
+                            copy_zeros = copy.iter().all(|&b| b == 0),
+                            title_zeros = title[..n].iter().all(|&b| b == 0),
+                            "{what} (VICTORY_REFRESH_CHECK=1)"
+                        );
+                    };
+                    if d.times == 3 {
+                        REFRESH_CHECKED[2].fetch_add(1, Ordering::Relaxed);
+                        let said = SAID[0].fetch_add(1, Ordering::Relaxed) + 1;
                         if said <= 64 || said.is_power_of_two() {
-                            tracing::warn!(
+                            named(
+                                "a host copy of title memory differs from it after its refresh, three times in a row, with no read of the title's known in flight there",
                                 said,
-                                copy = self.id,
-                                copy_start = format_args!("{start:#x}"),
-                                copy_bytes = self.len,
-                                address = format_args!("{at:#x}"),
-                                refreshed = format_args!("{from:#x}..{to:#x}"),
-                                on_the_card = self.card.is_some(),
-                                window = self.window,
-                                "a host copy of title memory is stale after its refresh, three times in a row:                                  the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
+                                d,
+                            );
+                        }
+                    }
+                    if d.times >= 3 && !d.long && !d.told && d.since.elapsed() >= std::time::Duration::from_secs(2) {
+                        d.long = true;
+                        REFRESH_CHECKED[5].fetch_add(1, Ordering::Relaxed);
+                        let said = SAID[1].fetch_add(1, Ordering::Relaxed) + 1;
+                        if said <= 64 || said.is_power_of_two() {
+                            named(
+                                "a host copy of title memory has differed from it for two seconds of refreshes, and nothing was told of a write there: the copy keeps old bytes",
+                                said,
+                                d,
                             );
                         }
                     }
@@ -4969,6 +5017,69 @@ impl Shadow {
 fn fast_merge() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_MERGE").is_none_or(|v| v != "0"))
+}
+
+/// Whether every refresh's copy is sampled against title memory afterwards
+/// (`VICTORY_REFRESH_CHECK=1`, a diagnostic; `Shadow::refresh_check`).
+pub(crate) fn refresh_checked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// What the refresh check holds of a block (by the address of its sample)
+/// that a copy was found to differ in, with no read of the title's in
+/// flight over it.
+struct Differing {
+    /// Refreshes in a row that found it so.
+    times: u32,
+    /// Since the first of them.
+    since: std::time::Instant,
+    /// Whether a write behind the guards was told there meanwhile
+    /// ([`refresh_check_told`]).
+    told: bool,
+    /// Whether it was said to have differed for long.
+    long: bool,
+}
+
+static DIFFERING: Mutex<BTreeMap<usize, Differing>> = Mutex::new(BTreeMap::new());
+
+/// The refresh check, since the start: looks that found a block other than
+/// title memory under a read of the title's in flight, and with none;
+/// blocks that differed three times in a row with none; of them, those
+/// that matched again after a write behind the guards was told there, and
+/// those that matched again with none told; blocks that differed for two
+/// seconds with nothing told.
+static REFRESH_CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// A write behind the guards into title memory `[at, at + len)` is done
+/// and told (`crate::watch::title_memory_written`): the blocks the refresh
+/// check holds as differing there were under it. Not to be called with the
+/// guards' lock held.
+pub(crate) fn refresh_check_told(at: usize, len: usize) {
+    if !refresh_checked() || len == 0 {
+        return;
+    }
+    let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
+    // (A sample is a block's first bytes, or a refresh's.)
+    for (_, d) in map.range_mut(at.saturating_sub(255)..at.saturating_add(len)) {
+        d.told = true;
+    }
+}
+
+/// With the frame line, while the refresh check is on.
+pub(crate) fn refresh_check_line() {
+    if !refresh_checked() {
+        return;
+    }
+    let [flying, none, thrice, told, untold, long] = [0, 1, 2, 3, 4, 5].map(|i| REFRESH_CHECKED[i].load(Ordering::Relaxed));
+    let still = DIFFERING.lock().unwrap_or_else(|e| e.into_inner()).values().filter(|d| d.times >= 3).count();
+    tracing::info!(
+        "refresh check, since the start (VICTORY_REFRESH_CHECK=1): {flying} looks found a copy's block other than title memory \
+         while a read the title had submitted was writing there (the guards are told when it is done); {none} with no such read \
+         known; {thrice} blocks differed three times in a row with none, of them {told} matched again once a write behind the \
+         guards was told there, {untold} matched again with none told, {still} differ now; {long} differed for two seconds with \
+         nothing told (those are copies that keep old bytes; each is named)"
+    );
 }
 
 /// Whether a landing takes the kernel's written bits of the private title

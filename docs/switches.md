@@ -158,6 +158,22 @@ guards line's "equal to the CPU side, not sent up" should fall by about
 that. Each taking costs a kernel call of 30 to 70 microseconds on the
 landing thread.
 
+`VICTORY_REFRESH_CHECK=1` (a diagnostic, slow): after every refresh the
+first 256 bytes of each 64 KiB block of it are read from title memory
+and compared with the copy. A block DirectStorage is filling differs for
+as long as the read takes (it writes the pages through a view of the
+runtime's own and tells the guards when it is done), and that is as it
+should be: the open world's entry had 1,024 blocks "stale three times in
+a row" in 130 s, all in 4 MiB windows, while 14,000 such reads came in.
+So the line "refresh check, since the start" tells the looks apart:
+those under a read the title has submitted and that is not done; those
+with none; blocks that differed three times in a row with none (named,
+with what the guards hold of the block); of them, those that matched
+again once a write behind the guards was told there and those that
+matched again with none told; and blocks that differed for two seconds
+with nothing told. Only the last are copies that keep old bytes; each is
+named a second time.
+
 A read of the kernel's into title memory (`ReadFile`) now says when it is
 done, and blocks a check guarded again while the kernel was writing count
 as written once more: a file read without buffering goes on into such a

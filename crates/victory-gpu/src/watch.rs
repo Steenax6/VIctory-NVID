@@ -2688,6 +2688,23 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     // A placed texture there changed with no descriptor written.
     crate::descriptor::host::page_written(at, len, pages);
+    // The refresh check: what it holds as differing there was under this
+    // write (the guards' lock is let go by now).
+    crate::shadow::refresh_check_told(at, len);
+}
+
+/// What the guards hold of the block of `at`, in words (for the refresh
+/// check's warnings).
+pub(crate) fn guard_state(at: usize) -> &'static str {
+    let g = guards();
+    let block = at / BLOCK;
+    match (g.protected.contains(&block), g.clean.contains(&block)) {
+        (true, true) => "guarded, not written since it was taken",
+        (true, false) => "guarded, counted written",
+        _ if g.absent.contains(&block) => "noted absent",
+        _ if g.views.contains(&block) => "view memory, not guarded now",
+        _ => "not known to the guards (private memory, or never taken)",
+    }
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`

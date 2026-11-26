@@ -145,11 +145,28 @@ pub(crate) fn pending_over(start: u64, end: u64) -> bool {
     PENDING.lock().unwrap_or_else(|e| e.into_inner()).overlaps(start, end)
 }
 
+/// With the refresh check (`crate::shadow::refresh_checked`): every range
+/// the title's submitted reads are about to write, under a texture view or
+/// not ([`in_flight_over`]). A read writes its destination's pages through
+/// a view of the runtime's own for as long as it takes, and the guards are
+/// told when it is done: until then every host copy over them holds the
+/// bytes from before, as it should, and the check must know it.
+static IN_FLIGHT: Mutex<Pending> = Mutex::new(Pending { ranges: BTreeMap::new(), longest: 0, next: 0 });
+
+/// Whether a read the title submitted is about to write, or is writing,
+/// some of title memory `[start, end)`; known only with the refresh check
+/// on, and only for reads whose pages were known at their Submit.
+pub(crate) fn in_flight_over(start: u64, end: u64) -> bool {
+    end > start && IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).overlaps(start, end)
+}
+
 /// Ranges of title memory a read is about to write, until dropped: from
 /// the title's Submit until the read's bytes are there and told
 /// (`title_memory_written`), or it failed, or its queue closed.
 pub struct PendingWrite {
     keys: Vec<(u64, u64)>,
+    /// Its ranges in [`IN_FLIGHT`].
+    all: Vec<(u64, u64)>,
 }
 
 /// A read the title submitted is about to write title memory at `ranges`
@@ -157,20 +174,25 @@ pub struct PendingWrite {
 /// leaves the textures there for after the write. Ranges outside every
 /// texture view are left out. Locks one mutex and calls nothing.
 pub fn title_memory_will_write(ranges: &[(usize, usize)]) -> PendingWrite {
-    let ranges: Vec<(u64, u64)> = ranges
-        .iter()
-        .map(|&(at, len)| (at as u64, at.saturating_add(len) as u64))
-        .filter(|&(start, end)| end > start && crate::descriptor::host::spanned(start, end))
-        .collect();
+    let ranges: Vec<(u64, u64)> =
+        ranges.iter().map(|&(at, len)| (at as u64, at.saturating_add(len) as u64)).filter(|&(start, end)| end > start).collect();
+    // For the refresh check: all of them.
+    let all = if crate::shadow::refresh_checked() && !ranges.is_empty() {
+        let mut flying = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.iter().map(|&(start, end)| flying.add(start, end)).collect()
+    } else {
+        Vec::new()
+    };
+    let ranges: Vec<(u64, u64)> = ranges.into_iter().filter(|&(start, end)| crate::descriptor::host::spanned(start, end)).collect();
     if ranges.is_empty() {
-        return PendingWrite { keys: Vec::new() };
+        return PendingWrite { keys: Vec::new(), all };
     }
     PENDING_COUNTS[0].fetch_add(1, Relaxed);
     PENDING_COUNTS[1].fetch_add(ranges.len() as u64, Relaxed);
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     let keys = ranges.into_iter().map(|(start, end)| pending.add(start, end)).collect();
     PENDING_ANY.store(pending.ranges.len(), Relaxed);
-    PendingWrite { keys }
+    PendingWrite { keys, all }
 }
 
 impl Pending {
@@ -194,6 +216,9 @@ impl Pending {
 
 impl Drop for PendingWrite {
     fn drop(&mut self) {
+        if !self.all.is_empty() {
+            IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.all);
+        }
         if self.keys.is_empty() {
             return;
         }
