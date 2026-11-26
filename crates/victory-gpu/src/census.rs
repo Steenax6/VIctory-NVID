@@ -214,6 +214,20 @@ pub(crate) const NO_SPAN: usize = 10;
 /// Since the start, of the uploads the pass recorded.
 pub(crate) static FLAGS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
+/// What the uploads did level by level ([`BY_LEVEL`]'s places), every
+/// upload's, the pass's and those of textures read through tables: bytes
+/// of staging buffer detiled; bytes of levels not detiled because the host
+/// copy held them as their memory is; bytes copied to the card; uploads
+/// decided at a submission that copied something, and that copied nothing
+/// (`crate::texture::decide_uploads`).
+pub(crate) const L_DETILED: usize = 0;
+pub(crate) const L_WITH_COPY: usize = 1;
+pub(crate) const L_COPIED: usize = 2;
+pub(crate) const L_SOME: usize = 3;
+pub(crate) const L_NONE: usize = 4;
+/// Since the start.
+pub(crate) static BY_LEVEL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 /// The parts of the pass ([`PASS_US`]): taking what was told since the
 /// last pass; the queue's order; looks at uploaded textures (their
 /// fingerprints); asking what of a texture's memory is mapped; making the
@@ -476,6 +490,17 @@ pub(crate) fn lines(frames: f64) {
         d[1],
         d[2],
         d[3]
+    );
+    let l: [u64; 5] = std::array::from_fn(|k| BY_LEVEL[k].load(Relaxed));
+    tracing::info!(
+        "texture uploads level by level, since the start (the pass's and those of textures read through tables): {} \
+         decided with levels to copy, {} with none (the host copy held every level as its memory is); {} MB detiled into \
+         staging, {} MB of levels not detiled because the host copy held them, {} MB copied to the card",
+        l[L_SOME],
+        l[L_NONE],
+        mb(l[L_DETILED]),
+        mb(l[L_WITH_COPY]),
+        mb(l[L_COPIED])
     );
     {
         use std::fmt::Write;
