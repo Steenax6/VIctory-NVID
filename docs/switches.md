@@ -171,7 +171,10 @@ view, has DirectStorage fill the pages and waits for the read's status.
 A texture picked by index that was uploaded in between holds what the
 pages held before, page by page. Every write that no guard sees
 (DirectStorage into physical pages, at each address showing them, and its
-reads to plain addresses) is numbered when its bytes are there, and every
+reads to plain addresses), and every copy of the game's that the layer does
+in the game's memory itself (buffer copies at their submission, or when a
+submission sent ahead lands, and `CopyMemoryToMemoryX`), is numbered when
+its bytes are there, and every
 upload of the texture pass keeps the number its read began at: one that
 read before a write under its texture is stale until uploaded again.
 

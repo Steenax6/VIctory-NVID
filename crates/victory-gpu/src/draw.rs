@@ -102,14 +102,16 @@ fn bake_writes() -> bool {
 /// the slots made due at bakes that lay under a read the title had
 /// submitted and not finished (the bake samples what is there before it);
 /// bake draws for which no pass ran (the frame's bake budget was spent)
-/// while slots were stale.
-pub(crate) static BAKE_WRITES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// while slots were stale; of the stale slots summed over the draws, those
+/// stale by DirectStorage's writes and those stale by the layer's copies of
+/// the title's into title memory.
+pub(crate) static BAKE_WRITES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// The line on bake sources and the writes behind the guards
 /// ([`BAKE_WRITES`]), after the 1st, 2nd, 4th, ... bake draw's pass and
 /// with the periodic lines (`frame`: 0 there).
 pub(crate) fn bake_writes_line(frame: u64) {
-    let [bakes, stale_bakes, stale, uploaded, missed, unread, pending, passless] =
+    let [bakes, stale_bakes, stale, uploaded, missed, unread, pending, passless, by_storage, by_copy] =
         BAKE_WRITES.each_ref().map(|c| c.load(Ordering::Relaxed));
     if bakes == 0 && passless == 0 {
         return;
@@ -119,7 +121,8 @@ pub(crate) fn bake_writes_line(frame: u64) {
         stale_now = crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed),
         reads_under_pending = crate::texture::READ_UNDER_PENDING.load(Ordering::Relaxed),
         "bake sources, since the start: {bakes} bake draws with a texture pass, {stale_bakes} of them with slots \
-         stale by the writes' numbers ({stale} such slots in all; read before a DirectStorage write ended, not \
+         stale by the writes' numbers ({stale} such slots in all, {by_storage} by DirectStorage, {by_copy} by copies \
+         of the title's; read before the write ended, not \
          uploaded again), {unread} slots whose upload was recorded and not submitted yet; of the slots made due first \
          {uploaded} uploaded before the draw, {missed} not reached or refused; {pending} slots under a read still to \
          finish at a bake; {passless} bake draws without a pass while slots were stale (VICTORY_BAKE_WRITES={})",
@@ -2093,10 +2096,12 @@ impl State {
         let bake = PASS_BUDGET.get().is_some_and(|b| b.2);
         let first: Vec<(u32, u64)> = if bake {
             BAKE_WRITES[0].fetch_add(1, Ordering::Relaxed);
-            let stale = crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed);
-            if stale > 0 {
+            let [by_storage, by_copy] = host.texture_slots_stale_by();
+            if by_storage + by_copy > 0 {
                 BAKE_WRITES[1].fetch_add(1, Ordering::Relaxed);
-                BAKE_WRITES[2].fetch_add(stale, Ordering::Relaxed);
+                BAKE_WRITES[2].fetch_add(by_storage + by_copy, Ordering::Relaxed);
+                BAKE_WRITES[8].fetch_add(by_storage, Ordering::Relaxed);
+                BAKE_WRITES[9].fetch_add(by_copy, Ordering::Relaxed);
             }
             if bake_writes() {
                 let (slots, stale) = host.texture_slots_stale(frame, std::ptr::from_ref(list) as usize);

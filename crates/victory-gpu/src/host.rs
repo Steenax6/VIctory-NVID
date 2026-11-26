@@ -3468,6 +3468,8 @@ fn late_copy(dst: usize, src: usize, len: usize) {
     shaders_write(dst, &new);
     crate::watch::writing(dst, len);
     write_mapped(dst as *mut u8, new.as_ptr(), len);
+    // Numbered for the texture pass once the bytes are there.
+    crate::descriptor::host::title_copied(dst, len);
 }
 
 /// Diagnostics: the fills of upload memory that made a submission wait for
@@ -8227,6 +8229,9 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    // And the texture pass, by a number taken now that the
+                    // bytes are there: an upload that read before is stale.
+                    crate::descriptor::host::title_copied(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -9122,16 +9127,20 @@ impl Meter {
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
                 let [kept, dropped, slots, stale, left] =
                     [0, 1, 2, 3, 4].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
+                let [copies, copy_bytes, by_copy] =
+                    [0, 1, 2].map(|i| crate::descriptor::host::COPY_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
                     "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the \
                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to \
-                     plain addresses finished; {kept} ranges of both under texture views kept for the texture pass ({dropped} dropped); \
-                     {slots} slots of placed textures held their bytes, {stale} of them stale (their upload read before the write \
-                     ended, by the writes' numbers: {}), {} stale now; {left} due slots left for after a read the title had \
+                     plain addresses finished; {copies} copies of the title's the layer did into memory under texture views \
+                     ({} MB); {kept} ranges of all three under texture views kept for the texture pass ({dropped} dropped); \
+                     {slots} slots of placed textures held their bytes, {stale} of them stale ({by_copy} by copies; their upload \
+                     read before the write ended, by the writes' numbers: {}), {} stale now; {left} due slots left for after a read the title had \
                      submitted, {} such reads so far (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 neither, \
                      slots, 1 or all makes stale slots due at once)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
+                    copy_bytes >> 20,
                     if mode & 2 != 0 { "made due at once" } else { "uploaded again before a bake" },
                     crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed),
                     crate::writes::PENDING_COUNTS[0].load(Ordering::Relaxed)

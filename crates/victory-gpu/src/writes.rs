@@ -12,7 +12,9 @@
 //! as noise for the run (`crate::draw` `early_textures`).
 //!
 //! So every such write gets a number once its bytes are there ([`next`],
-//! given under the lock of the ranges kept for the texture pass), and every
+//! given under the lock of the ranges kept for the texture pass; so is
+//! every copy of the title's that the layer does in title memory itself,
+//! `crate::descriptor::host::title_copied`), and every
 //! upload of the pass the number its read began at ([`stamp`]): an upload
 //! whose stamp is below the number of a write under its texture read
 //! before that write's bytes were there ([`holds`]), whatever flags of the
