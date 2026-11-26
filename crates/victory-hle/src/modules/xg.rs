@@ -223,17 +223,6 @@ const _: () = assert!(size_of::<MipOut>() == 0x70);
 const _: () = assert!(size_of::<PlaneOut>() == 0x6c8);
 const _: () = assert!(size_of::<LayoutOut>() == 0x1b40);
 
-/// The mode a tail mip is reported in: the 256-byte one of its kind (3 for
-/// the render kind, which GFX10 lacks), the depth mode itself.
-fn tail_swizzle(swizzle: Swizzle) -> u32 {
-    match swizzle.0 {
-        2 | 6 | 10 | 18 | 22 | 26 => Swizzle::SW_256B_D.0,
-        23 | 27 => 3,
-        24 => swizzle.0,
-        _ => Swizzle::SW_256B_S.0,
-    }
-}
-
 fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
     let m = &l.mips[i];
     let bpe = u64::from(l.desc.element_bytes);
@@ -262,13 +251,16 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
             out.swizzle = l.desc.swizzle.0;
         }
         Some(t) => {
+            // As Microsoft's xg_xs.dll reports a tail mip (measured against
+            // its offline PC build, 10.0.26100.6247): in the texture's own
+            // mode, at its element position in the tail block.
             out.in_tail = 1;
             out.alignment = 256;
-            out.swizzle = tail_swizzle(l.desc.swizzle);
+            out.swizzle = l.desc.swizzle.0;
+            out.tail_position = t.x | t.y << 11;
             if l.thick {
                 // A 3D tail mip is placed by position, not by offset.
                 out.slice_size = l.alignment / u64::from(l.block[2]);
-                out.tail_position = t.x | t.y << 11;
             } else {
                 out.offset = u64::from(t.offset);
                 out.slice_size = slice;
@@ -455,6 +447,7 @@ pub struct PackedMips {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubresourceTiling {
     pub width: u32,
     pub height: u16,
@@ -468,19 +461,11 @@ const TILE: u64 = 64 << 10;
 /// count, first, subresource tilings)`, in 64 KiB tiles of plane 0, for 2D
 /// 64 KiB modes only (others fail, as on the console). The mip tail is the
 /// packed part, tile 0 of each slice; tilings list the standard mips of
-/// every slice in turn. With a tail the console's library lists two slices
-/// at most and zeroes all but the first; so do we (the title reads slice 0
-/// only).
-///
-/// Microsoft's offline PC library (xg_xs.dll) answers arrays with a tail
-/// otherwise: by D3D12 subresource number (mip + slice * mips), packed
-/// mips zeroed, the second slice's standard mips at their own numbers
-/// (FQY55kai/ZJOU-VICTORY 1f0fe1d96, 36955eeaa, fb021f72f). The run with
-/// those rules had the first room dark, the three runs since without them
-/// lit (the title asks for arrays of 2 to 64 slices with a tail, always
-/// from subresource 0 with room for 16): what the title needs is this
-/// answer, not the PC library's. For textures of one slice the two agree
-/// but for zeroed entries past the count.
+/// subresource (`mip + slice * mips`, as D3D12 counts them), zeroed for the
+/// packed mips. Measured against Microsoft's xg_xs.dll (offline PC build
+/// 10.0.26100.6247): it fills the room from `first` on and counts the
+/// standard mips whose subresource falls in it (with 16 entries of room, as
+/// the title passes, two slices of an array with a tail).
 extern "system" fn tiling(
     this: This,
     tiles: *mut u32,
@@ -499,7 +484,6 @@ extern "system" fn tiling(
         return E_NOTIMPL;
     }
     let standard = l.first_tail_mip;
-    let tail = standard < c.mips;
     let tail_tiles = match standard {
         0 => l.slice_size / TILE,
         s if s < c.mips => l.mips[s as usize - 1].offset / TILE,
@@ -524,29 +508,30 @@ extern "system" fn tiling(
             *s = [l.block[0] * block, l.block[1] * block, l.block[2]];
         }
         if let Some(n) = count.as_mut() {
-            let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
-            for i in 0..wanted {
-                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
-                let m = &l.mips[mip as usize];
-                let entry = if tail && slice > 0 {
-                    SubresourceTiling {
-                        width: 0,
-                        height: 0,
-                        depth: 0,
-                        start: 0,
-                    }
-                } else {
+            let room = (c.mips * l.slices).saturating_sub(first).min(*n);
+            let mut standard_in_room = 0;
+            for i in 0..room {
+                let (slice, mip) = ((first + i) / c.mips, (first + i) % c.mips);
+                let entry = if mip < standard && slice < l.slices {
+                    standard_in_room += 1;
+                    let m = &l.mips[mip as usize];
                     SubresourceTiling {
                         width: m.pitch / l.block[0],
                         height: (m.rows / l.block[1]) as u16,
                         depth: 1,
                         start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
                     }
+                } else {
+                    SubresourceTiling {
+                        width: 0,
+                        height: 0,
+                        depth: 0,
+                        start: 0,
+                    }
                 };
                 out.add(i as usize).write(entry);
             }
-            *n = wanted;
+            *n = standard_in_room;
         }
     }
     S_OK
@@ -698,6 +683,9 @@ mod tests {
         assert_eq!((p.standard_mips, p.tail_mips, p.element_bytes), (1, 8, 16));
         assert_eq!((p.mips[0].offset, p.mips[0].pitch_bytes), (65536, 1024));
         assert_eq!((p.mips[1].offset, p.mips[1].in_tail), (32768, 1));
+        // A tail mip in the texture's own mode, at x 32 of the tail block.
+        assert_eq!((p.mips[1].swizzle, p.mips[1].tail_position), (10, 32));
+        assert_eq!((p.mips[2].swizzle, p.mips[2].tail_position), (10, 32 << 11));
 
         type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
         type From =
@@ -782,44 +770,35 @@ mod tests {
         assert_eq!(release(c), 0);
     }
 
-    /// An array with a mip tail, as the title needs it (not as Microsoft's
-    /// PC library lists it, see `tiling`): slice 0's standard mips, then
-    /// slice 1's zeroed, counted together; nothing past them.
+    /// An array with a mip tail, as Microsoft's library lists it.
     #[test]
-    fn tiling_of_an_array_with_a_tail_lists_two_slices() {
+    fn tiling_counts_subresources_and_zeroes_packed_mips() {
         let mut d = desc(256, 256, 7, 28, 0x10a);
-        d.depth_or_array = 32;
+        d.depth_or_array = 3;
         let c = create(&d);
-        let marker = || SubresourceTiling {
-            width: 7,
-            height: 7,
-            depth: 7,
-            start: 7,
-        };
-        let mut subs: Vec<SubresourceTiling> = (0..16).map(|_| marker()).collect();
-        let (mut n, null) = (16u32, std::ptr::null_mut::<u8>());
-        let mut packed = PackedMips {
-            standard: 0,
-            packed: 0,
-            tiles: 0,
+        let zero = SubresourceTiling {
+            width: 0,
+            height: 0,
+            depth: 0,
             start: 0,
         };
-        let tiling: extern "system" fn(
-            This,
-            *mut u32,
-            *mut PackedMips,
-            *mut [u32; 3],
-            *mut u32,
-            u32,
-            *mut SubresourceTiling,
-        ) -> HRESULT = slot(c, 10);
-        let hr = tiling(c, null.cast(), &mut packed, null.cast(), &mut n, 0, subs.as_mut_ptr());
-        let s = usize::from(packed.standard);
-        assert!(s > 0 && s < 7, "a tail: {s} standard mips");
-        assert_eq!((hr, n as usize), (S_OK, 2 * s));
-        assert!(subs[..s].iter().all(|t| t.depth == 1));
-        assert!(subs[s..2 * s].iter().all(|t| (t.width, t.height, t.depth, t.start) == (0, 0, 0, 0)));
-        assert!(subs[2 * s..].iter().all(|t| t.start == 7), "nothing written past the count");
+        let mut subs = [zero; 8];
+        let (mut n, null) = (8u32, std::ptr::null_mut::<u8>());
+        let hr = tiling(
+            c,
+            null.cast(),
+            null.cast(),
+            null.cast(),
+            &mut n,
+            0,
+            subs.as_mut_ptr(),
+        );
+        // Room for 8 of the 21 subresources: slice 0's standard mips (0, 1),
+        // its packed mips zeroed, slice 1's mip 0 (7): three standard mips.
+        assert_eq!((hr, n), (S_OK, 3));
+        assert!(subs[..2].iter().all(|s| s.depth == 1));
+        assert!(subs[2..7].iter().all(|s| s.depth == 0 && s.start == 0));
+        assert_eq!(subs[7].depth, 1);
         assert_eq!(release(c), 0);
     }
 
