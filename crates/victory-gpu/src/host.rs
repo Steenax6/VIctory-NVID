@@ -5455,6 +5455,14 @@ impl Host {
             }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        // What landed in private title memory set the kernel's written
+        // bits there: taken now, while the ranges are closed to refreshes
+        // still (`crate::shadow::land_taken`; not for pieces merged out of
+        // the flights' own slots, `relay_card_inflight`).
+        if crate::shadow::land_taken() != 0 {
+            let landed: Vec<_> = pieces.iter().map(|(shadow, lo, hi, _)| (shadow.clone(), *lo, *hi)).collect();
+            crate::shadow::landed(&landed);
+        }
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are
         // (`fallback_fetched_mark`).
@@ -9024,6 +9032,7 @@ impl Meter {
             crate::beside::line(frames);
             crate::watch::events_line(frames);
             crate::watch::kernel_line();
+            crate::shadow::landed_line(frames);
         }
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;

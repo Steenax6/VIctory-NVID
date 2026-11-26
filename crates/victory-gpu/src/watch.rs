@@ -690,6 +690,80 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// For a landing that wrote private title memory (`crate::shadow::landed`):
+/// takes the kernel's written bits of `ranges` now, and notes the pages
+/// they name as written at an asking of its own, whose number is returned
+/// with the pages noted (each with what the journal now holds of it, in
+/// page order). Ranges that lie close together are one kernel asking; one
+/// that is not write-watched memory of one reservation is left as it is.
+///
+/// What it is for: the landing's write sets those bits, and the next
+/// refresh's asking took them for the title's, so the landing's own copy
+/// read the pages it had just been given (22.8 MB a frame in the first
+/// room). Taken here, right behind the write and with the journal's lock
+/// held as every asking holds it, the bits stand for "written up to now",
+/// by the landing or by the title; the note tells every other copy over
+/// the pages, exactly as the next asking would have; and the landing's
+/// copy can compare each page with its own bytes and count it taken if
+/// they are the same. A write of the title's after this sets the bit
+/// again and is found by the next asking, as ever.
+pub(crate) fn take_landed(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, Written)>) {
+    let mut pieces: Vec<(usize, usize)> =
+        ranges.iter().filter(|r| r.0 < r.1).map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE))).collect();
+    pieces.sort_unstable();
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    // As in `wrote`: an asking that stands moves with the note.
+    if j.kept {
+        j.ahead_asked = now;
+    }
+    let mut noted = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 <= last + LANDED_GAP && last.max(pieces[k].1) - first <= AHEAD_MAX {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        take_run(j, &pieces[i..k], now, &mut noted);
+        i = k;
+    }
+    (now, noted)
+}
+
+/// Pieces of one landing closer than this are one kernel asking
+/// ([`take_landed`]): 1 MiB. The pages between are asked about too, and
+/// what the title wrote there is noted a little earlier than it would
+/// have been.
+const LANDED_GAP: usize = (1 << 20) / PAGE;
+
+/// [`take_landed`] for `pieces` (page ranges in order): one kernel asking
+/// for all of them, by halves if it fails.
+fn take_run(j: &mut Journal, pieces: &[(usize, usize)], now: u64, noted: &mut Vec<(usize, Written)>) {
+    let Some(&(first, _)) = pieces.first() else {
+        return;
+    };
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if ask_kernel_as(j, first, last, now) {
+        j.written.each(first, last, |page, w| {
+            if w.at == now {
+                noted.push((page, *w));
+            }
+        });
+        return;
+    }
+    if pieces.len() < 2 {
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    take_run(j, a, now, noted);
+    take_run(j, b, now, noted);
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -712,6 +786,12 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+    let now = j.ahead_asked;
+    ask_kernel_as(j, first, last, now)
+}
+
+/// [`ask_kernel`], with what is found noted under asking `now`.
+fn ask_kernel_as(j: &mut Journal, first: usize, last: usize, now: u64) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -740,7 +820,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    let now = j.ahead_asked;
     note_found(j, count, now);
     true
 }
@@ -2495,7 +2574,7 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
 /// How many pages of `[at, at + len)` the kernel's write watch holds as
 /// written (up to a few), without taking the bits; `None` if the range is
 /// not write-watched memory of one reservation.
-fn watched_dirty(at: usize, len: usize) -> Option<usize> {
+pub(crate) fn watched_dirty(at: usize, len: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     let mut found = [0usize; 8];
     let mut count = found.len();

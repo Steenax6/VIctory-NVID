@@ -134,6 +134,30 @@ the two remembered the count and not the mapping), and a copy whose
 memory turned out not to be watched could be left out. Whether the 9
 finds were the check's own is what its next runs say; it is inferred.
 
+`VICTORY_LAND_TAKEN=1` (2026-11-26; off, not yet run; `=2` is its check):
+what shaders wrote into private title memory (which the kernel
+write-watches; no guard there) set the written bits of its pages, the
+next refresh took them for the title's, and the landing's own copy read
+the pages it had just been given: 22.8 MB a frame in the first room,
+read and found equal on the submitting thread. With the switch a landing
+that fetched 512 KiB or more of such memory takes the bits right behind
+its write (one kernel asking for the pieces that lie together, the
+journal's lock held) and notes the pages in the journal at once, so
+every other copy over them learns of the landing as before; its own copy
+compares each noted 4 KiB page with its CPU side on the landing thread,
+and a 64 KiB page whose noted pages all hold the copy's bytes counts as
+taken by that copy. A write of the title's behind the taking sets its
+bit again, one before it is in the bytes compared. `=2` takes and notes
+and marks nothing: the refresh reads as before and first compares each
+page `=1` would have passed by; one with other bytes, no bit and no
+later note is a find (0 is what `=1` needs; run it with
+`VICTORY_REFRESH_CHECK=1`, which samples every copy's refreshes against
+title memory). The line "landings' written bits taken in private title
+memory" says how many pages a frame the copy no longer reads, and the
+guards line's "equal to the CPU side, not sent up" should fall by about
+that. Each taking costs a kernel call of 30 to 70 microseconds on the
+landing thread.
+
 A read of the kernel's into title memory (`ReadFile`) now says when it is
 done, and blocks a check guarded again while the kernel was writing count
 as written once more: a file read without buffering goes on into such a
@@ -399,8 +423,10 @@ thread share the rest.
   last is sent): as it stands the title faults with it within two minutes,
   because waits between its queues are passed at the present; a variant
   that met them in order ran without a fault and no faster.
-- `VICTORY_HOT_BLOCKS=1`, `VICTORY_MERGE_FORGET=1`, `VICTORY_NAMED_WRITES=1`:
-  not yet tried in a run.
+- `VICTORY_HOT_BLOCKS=1`, `VICTORY_NAMED_WRITES=1`: not yet tried in a run.
+  (`VICTORY_MERGE_FORGET` is gone: it dropped the kernel's written bits a
+  landing set, and with them the title's of before the landing;
+  `VICTORY_LAND_TAKEN` takes them and notes them.)
 - The argument clamp between enhanced barriers (Zettrox/ztrx pull request
   #139): the same time on the card and in the title; not in this tree.
 - Page marks set by shaders for copy-backs (Marvisak/VIctory `cd94d35`):
