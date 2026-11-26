@@ -346,6 +346,157 @@ pub(crate) struct State {
     /// The threads in x of the dispatch being bound, if it counts threads
     /// (`victory_shader::emit::USER_DISPATCH_THREADS`).
     threads_x: Option<u32>,
+    /// What the list's draws made ready so far.
+    seen: Seen,
+}
+
+/// What a list's draws have made ready so far, so that its next draw does
+/// not make it ready again.
+///
+/// Every draw looked at every descriptor its shaders read through a table:
+/// the host slot's lock and the view's entry for the slot, then
+/// ([`readable`]) for a buffer view the copy of its memory and a step to
+/// bring it up to date, for a texture its host copy (four times, each under
+/// the texture's lock), whether it has a twin or shows a target's texels,
+/// its upload and its state in the list. The draws of a list read the same
+/// few views over and over (a frame of the first room asks 95,000 times for
+/// buffer ranges of which 21,700 are new to their list), and from the
+/// second time on all of that finds what it left: the slot made from the
+/// record that is there, the range noted, the upload asked for, the state
+/// the one the list has. 47 ms a frame of the recording threads went there,
+/// and 24 ms into the slots' part (the profile of 2026-11-26).
+///
+/// A view is known by the two words of its record (`descriptor::key_at`),
+/// which name one view of one resource for as long as that resource lives.
+/// What is remembered is trusted only while nothing has happened that
+/// could make the same question end otherwise ([`Seen::fresh`], asked at
+/// every draw), and a texture only while the list still has it in the
+/// state the view needs (asked each time). Left to be made ready every
+/// time, as before: a view of a texture with a colour twin, of one that
+/// shows a target's texels (`resource::alias_of`), of one copied back to
+/// the title, of the depth target the draw tests, and whatever could not be
+/// made ready.
+///
+/// `VICTORY_SEEN_CHECK=1` (diagnostics builds) makes everything ready every
+/// time as before and counts the times a view said to be ready was not:
+/// the recording then holds another step, upload, state or kept object
+/// than before. The frame lines say the count; it stays 0.
+#[derive(Default)]
+struct Seen {
+    /// What the entries were found under ([`Seen::fresh`]).
+    stamp: [u64; 6],
+    /// Title slots (their host heap and number) the list found made from
+    /// the record there and noted read through a table: that record's key.
+    slots: Plain<(usize, u32), u64>,
+    /// Views by the key of their record and the way they are read
+    /// ([`seen_way`]): what making them ready did.
+    views: Plain<(u64, u8), Made>,
+}
+
+/// What [`readable`] did for a view, for [`Seen`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Made {
+    /// Something a second time may not find done: made ready every time.
+    Again,
+    /// Nothing, whenever asked (a sampler).
+    Nothing,
+    /// A buffer view: its range is a step of the list (and declared
+    /// written, for a view shaders store through).
+    Buffer,
+    /// A texture moved to a state: the title's texture, its host copy (both
+    /// by address) and the state. Ready while the list has the copy in
+    /// that state and the draw does not test the texture as its depth.
+    Texture(usize, usize, u32),
+}
+
+/// Since the last frame line: views asked to be made ready through
+/// [`Seen`], those it knew ready, title slots it knew made, and the times
+/// what it knew was thrown away because something had changed; and since
+/// the start, the views it knew ready that `VICTORY_SEEN_CHECK=1` found
+/// were not.
+pub(crate) static SEEN_COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether what [`Seen`] knows ready is made ready all the same and
+/// compared (`VICTORY_SEEN_CHECK=1`, diagnostics builds).
+fn seen_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(feature = "diagnostics") && *ON.get_or_init(|| std::env::var_os("VICTORY_SEEN_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// With the frame line: what [`Seen`] saved the draws, per frame over
+/// `frames`.
+pub(crate) fn seen_line(frames: f64) {
+    let [asked, known, slots, thrown] = [0, 1, 2, 3].map(|i| SEEN_COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if asked == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "views of tables per frame: {asked:.0} asked to be made ready, {known:.0} of them known ready in their list; {slots:.0} \
+         slots known made; what the lists knew was thrown away {thrown:.1} times (a frame began, a title copy, a resource or a \
+         copy went); views known ready that were not, since the start: {}{}",
+        SEEN_COUNTS[4].load(Ordering::Relaxed),
+        if seen_check() { " (VICTORY_SEEN_CHECK=1: every one is made ready again and compared)" } else { " (not looked for: VICTORY_SEEN_CHECK=1)" }
+    );
+}
+
+/// The way a view is read, as [`Seen`] tells them apart: [`readable`] does
+/// the same for two asks of one view that agree in it.
+fn seen_way(kind: ResourceType) -> u8 {
+    match kind {
+        ResourceType::Srv => 1,
+        // (Declared written only for a shader that can store.)
+        ResourceType::Uav if STORES.get() || !write_skip() => 4,
+        ResourceType::Uav => 2,
+        ResourceType::Cbv => 8,
+        _ => 16,
+    }
+}
+
+impl Seen {
+    /// Nothing is known any more.
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.views.clear();
+        self.stamp = [0; 6];
+    }
+
+    /// Before a draw of `list` asks: what is known is thrown away if
+    /// anything happened since it was found that could make it wrong. A
+    /// frame began (slots are noted read through a table once a frame); the
+    /// recording goes into another host list, or had a step after which it
+    /// asks anew (`HostList::epoch`: a title copy, work of ours, a
+    /// read-back); a resource went with views of it
+    /// (`descriptor::forgotten`); a buffer came or went, or a copy went
+    /// (`shadow::changes`); a texture the host writes came or went
+    /// (`resource::targets_changed`: a view placed in its memory shows its
+    /// texels from then on, or no longer).
+    fn fresh(&mut self, list: &HostList) {
+        let now = [
+            crate::frame::current(),
+            std::ptr::from_ref(list) as u64,
+            list.epoch(),
+            crate::descriptor::forgotten(),
+            crate::shadow::changes(),
+            crate::resource::targets_changed(),
+        ];
+        if now != self.stamp {
+            if !(self.slots.is_empty() && self.views.is_empty()) {
+                SEEN_COUNTS[3].fetch_add(1, Ordering::Relaxed);
+                self.slots.clear();
+                self.views.clear();
+            }
+            self.stamp = now;
+        }
+    }
+
+    /// Whether the list has the view of record `key` ready for `way`.
+    fn known(&self, list: &HostList, key: u64, way: u8) -> bool {
+        match self.views.get(&(key, way)) {
+            Some(Made::Nothing | Made::Buffer) => true,
+            Some(&Made::Texture(resource, copy, state)) => TESTED_DEPTH.get().0 != resource && list.state_is(copy, state),
+            Some(Made::Again) | None => false,
+        }
+    }
 }
 
 impl Drop for State {
@@ -378,6 +529,7 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.seen.clear();
         self.tables_gone = true;
     }
 }
@@ -1306,6 +1458,8 @@ impl State {
     /// depth views are the ones the title set, not what their descriptors
     /// hold now (DexNom PR #48).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        // (Another host list: it has nothing of what this one was given.)
+        self.seen.clear();
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1571,6 +1725,7 @@ impl State {
         let l = &list.list;
         // What the slots made here showed before is retired at the end.
         let _together = crate::descriptor::host::Together::begin();
+        self.seen.fresh(list);
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -2610,7 +2765,7 @@ impl State {
             let tabled = crate::texture::is_staged(resource);
             clock.lap(c::P_MAKE);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                let _ = readable(list, sampled.kind, view);
             }
             clock.lap(c::P_RECORD);
             // A texture view the host refuses removes the device: name it.
@@ -3409,8 +3564,90 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+    /// Makes what a shader reads or writes through the view of record `key`
+    /// ready ([`readable`]), unless the list has it ready ([`Seen`]). `view`
+    /// is that view if the caller has it.
+    fn ready(&mut self, list: &HostList, kind: ResourceType, key: u64, view: Option<&View>) {
+        let way = seen_way(kind);
+        #[cfg(feature = "diagnostics")]
+        SEEN_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+        if self.seen.known(list, key, way) {
+            #[cfg(feature = "diagnostics")]
+            {
+                SEEN_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+                if seen_check() {
+                    let before = list.recorded();
+                    let found = view.cloned().or_else(|| crate::descriptor::view_of(key));
+                    if let Some(view) = &found {
+                        let _ = readable(list, kind, view);
+                    }
+                    let after = list.recorded();
+                    if after != before && SEEN_COUNTS[4].fetch_add(1, Ordering::Relaxed) < 16 {
+                        tracing::warn!(
+                            ?kind,
+                            way,
+                            was = ?self.seen.views.get(&(key, way)),
+                            ?before,
+                            ?after,
+                            view = ?found,
+                            "a view its list knew ready was not: making it ready again changed what the list holds"
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        let found;
+        let view = match view {
+            Some(view) => view,
+            None => {
+                found = crate::descriptor::view_of(key);
+                let Some(view) = &found else { return };
+                view
+            }
+        };
+        match readable(list, kind, view) {
+            Made::Again => {}
+            made => {
+                self.seen.views.insert((key, way), made);
+            }
+        }
+    }
+
+    /// Whether the list found title slot `index` of `host` made from the
+    /// record `handle` holds now, and noted it read through a table, in this
+    /// frame ([`Seen`]): then `mirror` and `texture_slot_tabled` would find
+    /// both done. With the record's key.
+    ///
+    /// The frame is asked here and not only when the draw began: the note
+    /// is one per slot and frame, and a frame that begins while a draw is
+    /// bound makes the draw note its slots for the new one (the check found
+    /// eight such slots in a run of 900 frames, noted for the frame before
+    /// only).
+    fn slot_known(&self, host: &crate::descriptor::host::HostHeap, index: u32, handle: u64) -> Option<u64> {
+        let key = crate::descriptor::key_at(handle)?;
+        let known = self.seen.slots.get(&(std::ptr::from_ref(host) as usize, index)) == Some(&key)
+            && host.made_from(index, key)
+            && crate::frame::current() == self.seen.stamp[0];
+        #[cfg(feature = "diagnostics")]
+        if known {
+            SEEN_COUNTS[2].fetch_add(1, Ordering::Relaxed);
+            // The check: a texture's slot is noted read in the frame the
+            // list knows it from (or in one that began this instant).
+            if seen_check()
+                && crate::descriptor::view_of(key).is_some_and(|view| crate::descriptor::host::is_texture_view(&view))
+                && !host.tabled_read_in(index, self.seen.stamp[0])
+                && !host.tabled_read_in(index, crate::frame::current())
+                && SEEN_COUNTS[4].fetch_add(1, Ordering::Relaxed) < 16
+            {
+                tracing::warn!(index, "a slot its list knew made and noted read through a table was not noted so");
+            }
+        }
+        known.then_some(key)
+    }
+
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -3420,12 +3657,27 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
-            }
+        if let Some(key) = self.slot_known(host, index, handle) {
+            self.ready(list, u.kind, key, None);
+            return;
+        }
+        let (Some(view), key) = host.mirror_key(index, handle, true) else {
+            return;
+        };
+        // (The record the slot is made from, unless another thread made it
+        // from another meanwhile: then nothing is noted.)
+        let made = host.made_from(index, key);
+        if made {
+            self.ready(list, u.kind, key, Some(&view));
+        } else {
+            let _ = readable(list, u.kind, &view);
+        }
+        // Up to date by this draw: not the texture pass's to make.
+        if crate::descriptor::host::is_texture_view(&view) {
+            host.texture_slot_tabled(index, true);
+        }
+        if made {
+            self.seen.slots.insert((std::ptr::from_ref(host) as usize, index), key);
         }
     }
 
@@ -3605,8 +3857,8 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                    if let Some(key) = crate::descriptor::key_at(handle) {
+                        self.ready(list, u.kind, key, None);
                     }
                 }
                 for k in selected {
@@ -3614,10 +3866,11 @@ impl State {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
+                    if let Some(key) = crate::descriptor::key_at(handle)
+                        && let Some(view) = crate::descriptor::view_of(key)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        self.ready(list, kind, key, Some(&view));
                     }
                 }
                 made.push((slot, first * 32));
@@ -3640,7 +3893,8 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let record = crate::descriptor::key_at(table + u64::from(k) * 32);
+                match record.and_then(crate::descriptor::view_of) {
                     Some(View::Constant(address, size)) => {
                         // Constants in memory shaders were seen to write,
                         // or in a copy in the card's memory: read from the
@@ -3690,8 +3944,8 @@ impl State {
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
-                        if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                        if let (Some(kind), Some(key)) = (kind, record) {
+                            self.ready(list, kind, key, Some(&view));
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3701,9 +3955,15 @@ impl State {
                         if let Some(title) = title_first
                             && crate::descriptor::host::is_texture_view(&view)
                         {
-                            host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                            let handle = table + u64::from(k) * 32;
+                            if kind.is_none() {
+                                host.texture_slot_tabled(title + k, false);
+                            } else if self.slot_known(host, title + k, handle).is_none() {
+                                host.texture_slot_tabled(title + k, true);
+                                let (made, key) = host.mirror_key(title + k, handle, true);
+                                if made.is_some() && host.made_from(title + k, key) {
+                                    self.seen.slots.insert((std::ptr::from_ref(host) as usize, title + k), key);
+                                }
                             }
                         }
                     }
@@ -4323,13 +4583,18 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn readable(list: &HostList, kind: ResourceType, view: &View) -> Made {
     const UNORDERED_ACCESS: u32 = 0x8;
+    if matches!(view, View::Sampler(_) | View::ConsoleSampler(_)) {
+        return Made::Nothing;
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
+    let mut made = Made::Again;
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+        made = Made::Buffer;
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
@@ -4350,8 +4615,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let source = crate::resource::alias_of(*resource as This);
+            let aliased = source.is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
@@ -4359,17 +4624,29 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 crate::texture::upload(list, *resource as This, t);
             }
             // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(*resource as This, false, false);
+            let twin = list.twin_use(*resource as This, false, false);
             // The depth target the draw only tests is read in both ways at
             // once: both read states, which its preparation asks for too.
             let (tested, _) = TESTED_DEPTH.get();
-            let state = if tested != 0 && tested == *resource {
+            let both = tested != 0 && tested == *resource;
+            let state = if both {
                 TESTED_DEPTH.set((tested, true));
                 DEPTH_READ | SHADER_RESOURCE
             } else {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // A second time finds all of this done while the list has the
+            // copy in that state ([`Seen`]): the upload is asked for once
+            // in a list, the rest asks nothing of a texture that has no
+            // twin and shows no other's texels.
+            if source.is_none()
+                && !twin
+                && !both
+                && let Some((copy, state)) = list.state_of(*resource as This)
+            {
+                made = Made::Texture(*resource, copy, state);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -4389,12 +4666,22 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // Some textures shaders write the title's CPU reads.
             list.texture_written(*resource as This, words.as_ref());
             // Unordered access to a depth texture is its colour twin's.
-            if !list.twin_use(*resource as This, true, true) {
+            let twin = list.twin_use(*resource as This, true, true);
+            if !twin {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            }
+            // As for a texture read: nothing more a second time, for one
+            // without a twin that is not copied back to the title.
+            if !twin
+                && !crate::texback::wanted(*resource as This)
+                && let Some((copy, state)) = list.state_of(*resource as This)
+            {
+                made = Made::Texture(*resource, copy, state);
             }
         }
         _ => {}
     }
+    made
 }
 
 /// The pixel shaders whose draws get their slots listed

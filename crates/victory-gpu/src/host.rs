@@ -869,11 +869,15 @@ mod tests {
         let list = host.new_list().unwrap();
         assert!(list.first_use(8), "the first draw uploads it");
         assert!(!list.first_use(8), "later draws find it done");
+        let epoch = list.epoch();
         list.defer_copy(std::ptr::null_mut(), std::ptr::null(), 0);
         assert!(list.first_use(8), "after a copy: again");
         assert!(!list.first_use(8));
+        assert_ne!(list.epoch(), epoch, "and what remembers a view made ready is told");
+        let epoch = list.epoch();
         list.defer(|| {});
         assert!(list.first_use(8), "after work that writes title memory: again");
+        assert_ne!(list.epoch(), epoch);
         list.close();
     }
 
@@ -1042,6 +1046,11 @@ pub(crate) struct HostList {
     /// indirect arguments.
     hoist_buffers: OnceLock<Option<(ID3D12Resource, ID3D12Resource)>>,
     hoist_readable: std::sync::atomic::AtomicBool,
+    /// Counts the steps after which the recording asks anew for what it
+    /// asked before: a title copy or work of ours (they empty `refreshed`
+    /// and `textures`), and a read-back. What remembers that a view was
+    /// made ready in this recording (`crate::draw::Seen`) asks this.
+    epoch: std::sync::atomic::AtomicU64,
     /// Memory the CPU maps (and its address) where the prelude's clamp
     /// leaves the diagnostics of the records it clamped
     /// (`crate::indirect::record_hoisted`), read when the next prelude is
@@ -4517,6 +4526,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 hoist_buffers: OnceLock::new(),
                 hoist_readable: std::sync::atomic::AtomicBool::new(false),
+                epoch: std::sync::atomic::AtomicU64::new(0),
                 hoist_notes: OnceLock::new(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
@@ -7701,6 +7711,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         deferred.refreshed.clear();
         // A texture sampled before the copy may lie in what it writes: the
         // next draw that samples it records its upload again, which the
@@ -7816,6 +7827,56 @@ impl HostList {
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+        // (A step recorded from here on is looked at for reading what this
+        // writes, `Deferred::reads_read_back`: asked anew.)
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// See the field: it moves when the recording must ask anew for what it
+    /// asked before.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// The host copy of title texture `resource` (by address) and the state
+    /// this list leaves it in so far, if the list names it.
+    pub(crate) fn state_of(&self, resource: crate::object::This) -> Option<(usize, u32)> {
+        let copy = std::sync::Arc::as_ptr(&crate::resource::host_copy(resource)?) as usize;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.get(&copy).map(|entry| (copy, entry.1))
+    }
+
+    /// Whether this list leaves the host texture `copy` (by address, as
+    /// [`HostList::state_of`] gives it) in `state` so far: a move to that
+    /// state would record nothing ([`HostList::transition`]).
+    pub(crate) fn state_is(&self, copy: usize, state: u32) -> bool {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.get(&copy).is_some_and(|entry| entry.1 == state)
+    }
+
+    /// Diagnostics: what the recording holds, as counts (its steps but the
+    /// declared shader writes, the uploads asked for, the textures and
+    /// ranges noted, the objects kept, the textures named and the sum of the
+    /// states they are left in): for the check that a view the list is said
+    /// to have made ready is one that making ready again changes nothing for
+    /// (`crate::draw::Seen`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn recorded(&self) -> [u64; 8] {
+        let (states, ends) = {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            (states.len() as u64, states.values().map(|entry| u64::from(entry.1)).sum())
+        };
+        let d = self.deferred();
+        [
+            d.copies.iter().filter(|step| !matches!(step, Step::GpuWrite(..))).count() as u64,
+            (d.texture_uploads.len() + d.card_checks.len() + d.card_writes.len()) as u64,
+            d.textures.len() as u64,
+            d.refreshed.len() as u64,
+            (d.kept.len() + d.back_wanted.len() + d.texture_aliases.len()) as u64,
+            states,
+            ends,
+            self.twins.lock().unwrap_or_else(|e| e.into_inner()).len() as u64,
+        ]
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -8234,6 +8295,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         deferred.refreshed.clear();
         // As after a copy ([`HostList::defer_copy`]).
         deferred.textures.clear();
@@ -9097,6 +9159,7 @@ impl Meter {
             );
         }
         crate::shadow::exact_line(frames);
+        crate::draw::seen_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);

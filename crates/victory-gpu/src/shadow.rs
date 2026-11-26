@@ -3053,7 +3053,11 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !gone.is_empty() {
+            COPIES_GONE.fetch_add(1, Ordering::Release);
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -5336,6 +5340,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        if !gone.is_empty() {
+            COPIES_GONE.fetch_add(1, Ordering::Release);
+        }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
@@ -5715,6 +5722,19 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// How often a copy went out of [`LOOSE`] or [`EXACT`]: the next ask for its
+/// memory finds or makes another. Bumped under the table's lock, after the
+/// change. (A copy made changes no answer given before it.)
+static COPIES_GONE: AtomicU64 = AtomicU64::new(0);
+
+/// A count that moves whenever an ask for the copy of some title memory
+/// ([`find`], [`exact`]) may be answered with another copy than before:
+/// [`BUFFERS_CHANGED`] and [`COPIES_GONE`] together. What remembers the
+/// copy a view found (`crate::draw::Seen`) asks this before it trusts that.
+pub(crate) fn changes() -> u64 {
+    BUFFERS_CHANGED.load(Ordering::Acquire) + COPIES_GONE.load(Ordering::Acquire)
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     // Shared, for the ask whose window is there (`let_go_idle` takes the
     // lock exclusive from its look to its removal, so none is handed out in
@@ -5869,9 +5889,13 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if map.len() >= MANY {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
+        let before = map.len();
         map.retain(|_, (shadow, used)| {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
+        if map.len() != before {
+            COPIES_GONE.fetch_add(1, Ordering::Release);
+        }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));

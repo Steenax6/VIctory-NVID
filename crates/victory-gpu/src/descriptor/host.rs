@@ -2139,6 +2139,14 @@ impl HostHeap {
         self.made.get(index as usize).map(|m| m.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Whether slot `index` is made from the record words `key`
+    /// (`super::key_at`), asked without its lock: a slot another thread is
+    /// making or taking away this instant is seen as it was or as it will
+    /// be, the two orders the lock allows.
+    pub(crate) fn made_from(&self, index: u32, key: u64) -> bool {
+        key != 0 && self.made_key(index) == Some(key)
+    }
+
     /// Notes slot `index` made from `key` (under its lock).
     fn set_made(&self, index: u32, key: u64) {
         if let Some(m) = self.made.get(index as usize) {
@@ -2346,6 +2354,13 @@ impl HostHeap {
         }
         tabled_out() && stamp & !TABLED_READ != 0
             && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES
+    }
+
+    /// Diagnostics: whether title slot `index` is noted read through a
+    /// table in frame `frame` ([`HostHeap::texture_slot_tabled`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn tabled_read_in(&self, index: u32, frame: u64) -> bool {
+        self.tabled_stamp(index) == ((frame as u32).wrapping_add(1) & !TABLED_READ) | TABLED_READ
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -3108,6 +3123,13 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_key(index, handle, for_draw).0
+    }
+
+    /// [`HostHeap::mirror`], with the words of the record it found at
+    /// `handle` as one number (`super::key_at`; whatever was there if no
+    /// view is returned).
+    pub(crate) fn mirror_key(&self, index: u32, handle: u64, for_draw: bool) -> (Option<View>, u64) {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3120,7 +3142,7 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return (None, 0);
         }
         // The slot's own lock, unless the write of a placed texture's view
         // makes other slots' views stale ([`HostHeap::note_buffer`]): then
@@ -3147,7 +3169,7 @@ impl HostHeap {
                 && self.made_key(index) == Some(key)
                 && let Some(view) = view_at(i, generation)
             {
-                return Some(view);
+                return (Some(view), key);
             }
         }
         let mut all = false;
@@ -3159,7 +3181,7 @@ impl HostHeap {
             let key = u64::from(generation) << 32 | u64::from(i);
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
             match self.mirror_locked(index, handle, key, view, for_draw, slot.exclusive()) {
-                Ok(view) => return view,
+                Ok(view) => return (view, key),
                 Err(NeedsAll) => {
                     drop(slot);
                     all = true;

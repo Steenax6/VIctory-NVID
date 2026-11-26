@@ -1238,6 +1238,23 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// How often [`TARGETS_AT`] changed: what [`alias_of`] answers for a
+/// texture changes with nothing else. Bumped under the table's lock.
+#[cfg(windows)]
+static TARGETS_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`TARGETS_CHANGED`].
+#[cfg(windows)]
+pub(crate) fn targets_changed() -> u64 {
+    TARGETS_CHANGED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// [`TARGETS_AT`] changed (called under its lock).
+#[cfg(windows)]
+fn targets_now_changed() {
+    TARGETS_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
@@ -3072,10 +3089,9 @@ fn hand_out_resource(
         // this one's.
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
-            TARGETS_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+            let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            targets.insert(resource.data() as u64, at);
+            targets_now_changed();
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -3103,6 +3119,7 @@ impl Drop for Resource {
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
                     targets.remove(&at);
+                    targets_now_changed();
                 }
             }
         }
@@ -3674,11 +3691,11 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
         // A temporary target at this address may have replaced this texture
         // in the table and been released since: put it back if the entry is
         // vacant.
-        TARGETS_AT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(address)
-            .or_insert(existing);
+        let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let std::collections::btree_map::Entry::Vacant(vacant) = targets.entry(address) {
+            vacant.insert(existing);
+            targets_now_changed();
+        }
         return Some(existing as This);
     }
     // SAFETY: 56 bytes in the description's layout.
