@@ -290,6 +290,7 @@ these are an NVIDIA card's.
 | `VICTORY_BACK_RUN_GAP=0` | every run of a copy-back is a write of its own; by default runs under 64 bytes apart are one write (upstream pull request #857) |
 | `VICTORY_WAVE_PAIRS=0` | no paired form for 64-lane programs on 32-lane cards (upstream pull request #854) |
 | `VICTORY_MESH_LINK=0` | mesh programs over 32 KiB are not linked with their pixel program (upstream pull request #854) |
+| `VICTORY_RELOOK_MS=20000` | how often a texture picked by index whose memory was not there is looked at again when nothing tells that it came (the runtime's mappings and the writes behind the guards do tell): every 20 s by default, 4 s before; slots looked at before and fresh ones are served in turns (fxceless/victory-fork pull request #1246) |
 | `VICTORY_GPU_TIMING=1` + `VICTORY_D3D12_DRED=1` | the card's time per command and per pass of ours (diagnostics build; submissions are waited for, so not for frame rate); `VICTORY_TIMING_LINES=<n>` lists that many commands |
 | `VICTORY_WINDOW_MAX=1920x1080` | largest size of the game window; unset, it is fitted to the screen's work area. The game's render targets keep their size |
 
