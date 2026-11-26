@@ -56,7 +56,7 @@ frame pressed for the game's next read.
 | `VICTORY_CARD_CONSTANTS` (2026-11-26; in every run since, not measured on its own) | constant buffers of fresh descriptor tables that lie in a host copy in the card's memory are bound there, not filled into upload memory behind the flights (theinkbit/victory-lot9-next ffd04e130) |
 | `VICTORY_HEAP_SYNC_FAST`, `VICTORY_DESCRIPTOR_STRIPES` | descriptor records the title copies into its heap are found by the write watch's 4 KiB pages and mirrored in runs; slots have striped locks, so recording threads no longer stand behind that pass |
 | `VICTORY_SHADOW_CACHE` | recording threads remember which host copy an address range has |
-| `VICTORY_USER_COPY`, `VICTORY_REFRESH_PARTS`, `VICTORY_REFRESH_4K`, `VICTORY_GUARD_4K`, `VICTORY_MARK_ONLY`, `VICTORY_VIEW_KNOWN`, `VICTORY_ABSENT_ONCE`, `VICTORY_ASK_SKIP_VIEWS`, `VICTORY_ALIAS_RUNS`, `VICTORY_SEND_CHANGED` | title memory is copied by the processor (a fault falls back to the kernel's copy), by 4 KiB pages and only where written; guards are not re-armed over other views; unmapped runs are remembered (`VICTORY_ABSENT_FRAMES`, 30); bytes the copy-back itself wrote are not sent up to the card again |
+| `VICTORY_USER_COPY`, `VICTORY_REFRESH_PARTS`, `VICTORY_REFRESH_4K`, `VICTORY_GUARD_4K`, `VICTORY_MARK_ONLY`, `VICTORY_VIEW_KNOWN`, `VICTORY_ABSENT_ONCE`, `VICTORY_ASK_SKIP_VIEWS`, `VICTORY_SEND_CHANGED` | title memory is copied by the processor (a fault falls back to the kernel's copy), by 4 KiB pages and only where written; guards are not re-armed over other views; unmapped runs are remembered (`VICTORY_ABSENT_FRAMES`, 30); bytes the copy-back itself wrote are not sent up to the card again |
 | `VICTORY_TEXTURE_DROP_LEVELS` (`0`, `auto`, `force1`, `force2`), `VICTORY_TEXTURE_PROMOTE_MB`, `VICTORY_RESERVED_REUSE`, `VICTORY_STAGE_LEFT_OUT`, `VICTORY_TILED_IDLE_MS`, `VICTORY_STAGING_POOL_MB` | large block-compressed title textures (1024 a side and more) are made as reserved textures and, past a line of host-copy bytes, without their one or two most detailed levels; their views clamp the level of detail, so the sizes shaders read stay the title's. On a 12 GB card the title's textures did not all fit: some 22,000 waited for room in every run, and which were there differed from run to run (the first room came up lit in one run, dark in the next). Now none is held back there. Reserved textures and staging buffers are reused, not made and released |
 | `VICTORY_PLACED_TEX=1` (opt-in; `play.ps1` sets it) | the other host textures of placed textures come out of 16 MiB heaps instead of an allocation each (fxceless/victory-fork pull request #903 with smaller heaps, filled fullest first): making one takes 9 us; about 1 GB of the card stays free inside the heaps after the cutscene |
 | `VICTORY_GROUP_SPLIT`, `VICTORY_GROUP_PIECES=2` | a dispatch that asks for more than 65,535 thread groups in x runs in pieces, each told where its groups start (pull request #976), indirect records too: one of the title's indirect lighting passes asks for about 75,000 and lost its tail, a band of stale blocks along the bottom of the picture |
@@ -626,7 +626,10 @@ two frames, on five threads that share three locks a slot).
   The longest send of a frame is the list that makes the heap's buffers
   ready: one flush of about 4,600 copies, almost all with nothing to
   copy, 7 to 13 ms; spread over threads they cost more than on one.
-- `VICTORY_HOT_BLOCKS=1`, `VICTORY_NAMED_WRITES=1`: not yet tried in a run.
+- `VICTORY_NAMED_WRITES=1`: not yet tried in a run. (`VICTORY_HOT_BLOCKS`,
+  blocks written often left open, was never run and is gone, and with it
+  the guards' changes of protection under their lock,
+  `VICTORY_GUARD_UNLOCKED=0` and `VICTORY_ALIAS_RUNS=0`.)
   (`VICTORY_MERGE_FORGET` is gone: it dropped the kernel's written bits a
   landing set, and with them the title's of before the landing;
   `VICTORY_LAND_TAKEN` takes them and notes them.)
