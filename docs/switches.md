@@ -100,6 +100,20 @@ census's "guarded blocks opened by the layer's own writes" should fall to
 nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
 pull request 3069; this tree's own code).
 
+`VICTORY_REFRESH_EVENTS` (2026-11-26; off, not run in the game yet): a
+copy in view memory is not asked about again while nothing happened in
+its memory since it was last brought up to date. What can make a guarded
+block count as written (a write that faults, one of ours that opens or
+marks it, a new mapping, a page the journal notes) raises a count for
+its 4 MiB of title memory, and a copy remembers the counts of the range
+it last brought up to date. `=2` is the check: every refresh is asked as
+before, and each one that `=1` would have left out and that found bytes
+to copy is counted and named ("a refresh found bytes to copy where no
+event was counted"); the line "refreshes by event" must say 0 of those
+in the prologue and at the open world's entry and in its bedroom before
+`=1` is used. Copies in private memory are asked as before: only the
+kernel knows what was written there.
+
 ## Pipelines
 
 `VICTORY_PIPELINE_EARLY_WORKERS=<n>` sets how many workers may make the

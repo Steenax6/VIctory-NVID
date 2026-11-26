@@ -87,6 +87,11 @@ pub(crate) struct Shadow {
     /// census (`crate::copystat::buffers`).
     #[cfg(feature = "diagnostics")]
     asked_by: AtomicU8,
+    /// The range last brought up to date by asking, and the events counted
+    /// in it just before (`crate::watch::events`): with
+    /// `VICTORY_REFRESH_EVENTS`, a refresh inside it at the same count has
+    /// nothing to ask.
+    events_seen: Mutex<(usize, usize, u64)>,
 }
 
 /// Who asks for a refresh of a copy ([`Shadow::refresh_as`]): a draw for
@@ -3222,6 +3227,7 @@ impl Shadow {
             place: None,
             #[cfg(feature = "diagnostics")]
             asked_by: AtomicU8::new(0),
+            events_seen: Mutex::new((0, 0, 0)),
         }
     }
 
@@ -3943,6 +3949,20 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // By event (`crate::watch::events_mode`), for a range in view
+        // memory: whether anything happened in the range last brought up
+        // to date since it was, if this one lies inside it.
+        let by_event = crate::watch::events_mode();
+        let looked = (by_event != 0 && crate::inplace::view_at(from).is_some() && crate::inplace::view_at(to - 1).is_some())
+            .then(|| {
+                let (a, b, then) = *self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
+                let inside = a <= from && to <= b;
+                (inside, inside && crate::watch::events(a, b) == then, crate::watch::events(from, to))
+            });
+        if by_event == 1 && matches!(looked, Some((true, true, _))) {
+            crate::watch::event_checked(true, true, None, (self.start, self.len), from, to);
+            return 0;
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             let copied = if refresh_parts() || refresh_kernel_pages() {
                 crate::watch::writes_fine(from, to, true).map(|(now, written)| self.copy_stale_fine(from, to, now, &written))
@@ -3950,6 +3970,17 @@ impl Shadow {
                 crate::watch::writes(from, to, true).map(|(now, written)| self.copy_stale(from, to, now, &written))
             };
             if let Some(copied) = copied {
+                if let Some((inside, quiet, now)) = looked {
+                    crate::watch::event_checked(quiet, inside, Some(copied), (self.start, self.len), from, to);
+                    // The count from before the asking: what the asking
+                    // itself noted has this range asked once more.
+                    let mut seen = self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
+                    // A range inside the one known keeps the wider one
+                    // while nothing happened in it.
+                    if !(inside && quiet) {
+                        *seen = (from, to, now);
+                    }
+                }
                 self.watched.store(1, Ordering::Relaxed);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]

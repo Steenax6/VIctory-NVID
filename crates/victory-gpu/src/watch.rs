@@ -167,9 +167,129 @@ impl Pages {
     }
 }
 
+/// Whether a copy in view memory is brought up to date only when
+/// something happened in its memory since it last was
+/// (`VICTORY_REFRESH_EVENTS`): 0, unset: it asks the guards every time, as
+/// before; 1: it does not ask while nothing happened; 2: it asks as before,
+/// and every refresh that 1 would have left out and that found bytes to
+/// copy is counted and named (the check: 0 of them is what 1 needs).
+///
+/// A submission brings some 6,350 ranges of copies up to date a frame in
+/// the first room and about 5,900 of them find nothing written (the census
+/// of 2026-11-26). For a range in view memory each of those is a look at
+/// every guarded 64 KiB block of it under the guards' lock. What can make
+/// a block count as written is known where it happens: a write that
+/// faults, a write of ours that opens or marks it, the runtime mapping
+/// its memory anew, a page the journal notes. Each raises a count for its
+/// 4 MiB of title memory ([`event`]), and a copy remembers the counts of
+/// the range it last brought up to date: the same counts, nothing to ask.
+/// Private memory is not left out: only the kernel knows what was written
+/// there, and it must be asked.
+pub(crate) fn events_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_EVENTS").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// The title memory one count of [`EVENTS`] stands for.
+const EVENT_SPAN: usize = 4 << 20;
+/// What happened in each 4 MiB of title memory (the first 1 TiB each its
+/// own count, memory above shares them): raised, never lowered.
+static EVENTS: [std::sync::atomic::AtomicU32; 1 << 18] = [const { std::sync::atomic::AtomicU32::new(0) }; 1 << 18];
+
+/// Something at `at` came to count as written, or the guards over it
+/// changed.
+fn event(at: usize) {
+    EVENTS[(at / EVENT_SPAN) & (EVENTS.len() - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`event`] for all of `[at, at + len)`.
+fn event_range(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / EVENT_SPAN, at.saturating_add(len - 1) / EVENT_SPAN);
+    // (No more counts than there are.)
+    for span in (first..=last).take(EVENTS.len()) {
+        EVENTS[span & (EVENTS.len() - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The counts of `[start, end)` together: the same number as at an earlier
+/// call means nothing happened there between the two.
+pub(crate) fn events(start: usize, end: usize) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    let (first, last) = (start / EVENT_SPAN, (end - 1) / EVENT_SPAN);
+    (first..=last)
+        .take(EVENTS.len())
+        .map(|span| u64::from(EVENTS[span & (EVENTS.len() - 1)].load(std::sync::atomic::Ordering::Relaxed)))
+        .sum()
+}
+
+/// Since the last frame line, of the refreshes of ranges in view memory
+/// with [`events_mode`] on: those with nothing happened since the range
+/// was last brought up to date (left out, or with the check asked all the
+/// same) and nothing to copy; those of them that had bytes to copy all the
+/// same (the check's finds: an event that was not counted); those asked
+/// because something had happened; and those asked because the range was
+/// not inside the one last brought up to date.
+static EVENT_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A refresh of `[from, to)` of the copy `[start, start + len)` in view
+/// memory was looked at: `quiet` whether nothing had happened there since
+/// it was last brought up to date, `inside` whether it lay in the range
+/// that was, `copied` the bytes the asking found to copy (`None`: it was
+/// left out).
+pub(crate) fn event_checked(quiet: bool, inside: bool, copied: Option<usize>, copy: (u64, u64), from: usize, to: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let place = match (inside, quiet, copied) {
+        (false, _, _) => 3,
+        (true, false, _) => 2,
+        (true, true, Some(n)) if n > 0 => 1,
+        (true, true, _) => 0,
+    };
+    EVENT_CHECKS[place].fetch_add(1, Relaxed);
+    if place == 1 {
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SAID.fetch_add(1, Relaxed) < 32 {
+            tracing::warn!(
+                copy = format_args!("{:#x}+{:#x}", copy.0, copy.1),
+                range = format_args!("{from:#x}..{to:#x}"),
+                copied = copied.unwrap_or(0),
+                "a refresh found bytes to copy where no event was counted since the range was last brought up to date: with VICTORY_REFRESH_EVENTS=1 the copy would have kept the bytes from before"
+            );
+        }
+    }
+}
+
+/// With the frame line.
+pub(crate) fn events_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mode = events_mode();
+    if mode == 0 {
+        return;
+    }
+    let [quiet, wrong, happened, outside] = [0, 1, 2, 3].map(|i| EVENT_CHECKS[i].swap(0, Relaxed));
+    tracing::info!(
+        "refreshes by event, of ranges in view memory, per frame (VICTORY_REFRESH_EVENTS={mode}): {:.0} with nothing happened since \
+         the range was last brought up to date ({}); {:.0} asked because something had; {:.0} asked because the range was not \
+         inside that one; since the last line {wrong} that the check found with bytes to copy and no event (0 is what =1 needs)",
+        quiet as f64 / frames,
+        if mode == 1 { "left out" } else { "asked all the same: the check" },
+        happened as f64 / frames,
+        outside as f64 / frames,
+    );
+}
+
 /// Notes in `written` that asking `now` found `page` written in the kernel
 /// pages `mask`.
 fn note(written: &mut Pages, page: usize, now: u64, mask: u16) {
+    event(page.wrapping_mul(PAGE));
     match written.get_mut(page) {
         None => {
             written.insert(page, Written { at: now, before: 0, mask });
@@ -1350,6 +1470,7 @@ fn reopen_stray(g: &mut Guards, at: usize) -> bool {
         return false;
     }
     g.clean.remove(&block);
+    event(block.wrapping_mul(BLOCK));
     g.dirty.remove(&block);
     g.partly.remove(&block);
     true
@@ -1360,7 +1481,9 @@ fn reopen_stray(g: &mut Guards, at: usize) -> bool {
 fn settle(g: &mut Guards, failed: &Failed, epoch: Option<Epoch>) {
     for &block in &failed.runs {
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         count(2);
         if block < uncommitted_end(block) {
             g.absent.insert(block);
@@ -1373,11 +1496,14 @@ fn settle(g: &mut Guards, failed: &Failed, epoch: Option<Epoch>) {
     }
     for &block in &failed.aliases {
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
     }
     for &block in &failed.rearm {
         // As `rearm_tail`: no longer guarded (reported written already).
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
     }
 }
 
@@ -1886,6 +2012,7 @@ fn mark_block(g: &mut Guards, block: usize, mask: u16) -> bool {
 fn note_dirty(g: &mut Guards, block: usize, mask: u16) {
     if g.clean.contains(&block) {
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         if mask != FULL {
             g.dirty.insert(block, mask);
         } else {
@@ -1978,6 +2105,7 @@ fn rearm_tail(g: &mut Guards, block: usize) -> bool {
         return true;
     }
     g.protected.remove(&block);
+    event(block.wrapping_mul(BLOCK));
     false
 }
 
@@ -1991,7 +2119,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.dirty.remove(&block);
         g.partly.remove(&block);
         let mut old = 0;
@@ -2322,6 +2452,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // What a copy knew of this memory is no longer so.
+    event_range(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -2331,7 +2463,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
+        event(block.wrapping_mul(BLOCK));
         g.clean.remove(&block);
+        event(block.wrapping_mul(BLOCK));
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -3784,6 +3918,55 @@ mod tests {
         // SAFETY: the first view, read-write once the handler has opened it.
         unsafe { ((one + 8) as *mut u8).write(1) };
         assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 0)]));
+        crate::beside::section_made(section);
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// Whatever makes a guarded block count as written raises the count of
+    /// its memory ([`events`], what `VICTORY_REFRESH_EVENTS` goes by), at
+    /// the view written through and at every other view of the pages: a
+    /// write of the title's that faults, a write of ours beside the
+    /// guards, the memory mapped anew. (Counts are by 4 MiB and other
+    /// tests' memory may share them: only that they rise is asked.)
+    #[test]
+    fn what_makes_a_guarded_block_count_as_written_is_an_event() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        crate::inplace::title_memory_section(section, SIZE as u64, true);
+        let seen = |view: usize| events(view, view + SIZE);
+        let clean = || {
+            guard(one, one + SIZE, None);
+            guard(two, two + SIZE, None);
+            assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()));
+            assert_eq!(guard(two, two + SIZE, None), Some(Vec::new()));
+            (seen(one), seen(two))
+        };
+        // A write of the title's through one view.
+        let (a, b) = clean();
+        // SAFETY: the first view, read-write once the handler has opened it.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert!(seen(one) > a, "the view written through");
+        assert!(seen(two) > b, "the other view of its pages");
+        // A write of ours beside the guards.
+        let (a, b) = clean();
+        let place = crate::beside::find(two + BLOCK + 16, 32).expect("a place in a view of our own");
+        assert_eq!(place.write(two + BLOCK + 16, &[9; 32]), 32);
+        written_beside(two + BLOCK + 16, 32, crate::writes::Cause::Back);
+        assert!(seen(two) > b);
+        assert!(seen(one) > a);
+        // The memory mapped anew (here: told so).
+        let (a, _) = clean();
+        title_memory_remapped(one, SIZE);
+        crate::inplace::title_memory_view(one, SIZE, section, 0);
+        assert!(seen(one) > a);
+        // The counts of a range are those of every 4 MiB it touches.
+        let far = 0x7_e000_0000usize;
+        let before = (events(far, far + 1), events(far, far + 3 * EVENT_SPAN), events(far + EVENT_SPAN, far + 2 * EVENT_SPAN));
+        event_range(far + EVENT_SPAN - 1, 2);
+        assert_eq!(events(far, far + 1), before.0 + 1);
+        assert_eq!(events(far, far + 3 * EVENT_SPAN), before.1 + 2);
+        assert_eq!(events(far + EVENT_SPAN, far + 2 * EVENT_SPAN), before.2 + 1);
+        assert_eq!(events(far, far), 0);
         crate::beside::section_made(section);
         drop_views(section, &[one, two], SIZE);
     }
