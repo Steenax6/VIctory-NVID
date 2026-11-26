@@ -1127,16 +1127,19 @@ extern "system" fn present(
         let shown_resource = resource as usize;
         let show = move || {
             let resource = shown_resource as This;
-            let (Some(texture), Some(host)) = (crate::resource::host_resource(resource), crate::host::host()) else {
+            let Some(host) = crate::host::host() else {
                 return;
             };
-            const COPY_SOURCE: u32 = 0x800;
-            let state = crate::resource::host_transition(resource, COPY_SOURCE)
-                .map_or(COPY_SOURCE, |(_, before)| before);
-            let shown = host.present(texture, state, frame);
-            crate::resource::host_transition(resource, state);
+            // The copy to the back buffer moves the texture to the copy
+            // source state as any list does (its prelude, at submission,
+            // from the state the submissions before it left): taking the
+            // shared state here and putting it back after the present let a
+            // submission prepared meanwhile on another thread start from the
+            // wrong state, and the write-back undid the state it left
+            // (Marvisak/VIctory pull request #3204).
+            let shown = host.present(resource, frame);
             #[cfg(feature = "diagnostics")]
-            blinks(frame, resource, state, shown);
+            blinks(frame, resource, 0x800, shown);
             #[cfg(not(feature = "diagnostics"))]
             let _ = shown;
         };

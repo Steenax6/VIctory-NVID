@@ -2630,8 +2630,12 @@ pub(crate) fn placed_textures() -> u64 {
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
-/// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
+/// resource and the state it leaves, if that is a change. For tests that
+/// record barriers by hand: lists move textures through their own states
+/// and preludes (`HostList::transition`), which keep the order of the
+/// submissions; changing the shared state outside them is what made the
+/// present start lists prepared meanwhile from a wrong state.
+#[cfg(all(windows, test))]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let (host, _) = hosted(this, true)?;
@@ -4228,6 +4232,39 @@ mod tests {
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]
+    /// The present's copy (Marvisak/VIctory pull request #3204): recorded
+    /// before another submission that moves the texture and submitted after
+    /// it, the copy starts from the state that submission left, and leaves
+    /// the texture in the copy source state, which the tracker then holds.
+    /// Before, the present took the shared state at recording and wrote it
+    /// back after its own submission, over what the other one had left.
+    #[test]
+    fn a_copy_recorded_before_another_submission_starts_from_the_state_it_left() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        let mut image = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &texture(4, 4, 28, 1), COPY_DEST, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let state = || host_copy(image).unwrap().state.load(std::sync::atomic::Ordering::Relaxed);
+        let present = host.new_list().unwrap();
+        crate::list::ensure_state(&present, image, COPY_SOURCE);
+        present.close();
+        let other = host.new_list().unwrap();
+        crate::list::ensure_state(&other, image, SHADER_RESOURCE);
+        other.close();
+        host.execute(&[&other]);
+        assert_eq!(state(), SHADER_RESOURCE, "the other submission's state is the texture's");
+        host.execute(&[&present]);
+        assert_eq!(state(), COPY_SOURCE, "the copy leaves the texture where it copied from");
+    }
+
     #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
