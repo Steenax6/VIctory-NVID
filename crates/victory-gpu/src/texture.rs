@@ -201,7 +201,8 @@ enum PartIs {
     /// The title's, and none of its pages is there: its levels are zeros
     /// on the host until some come.
     Zeros,
-    /// Not the title's: neither read nor written on the host.
+    /// Not the title's, or shown by no view with none of its pages
+    /// there: neither read nor written on the host.
     Left,
 }
 
@@ -226,6 +227,13 @@ fn part_is(cut: bool, of_part: u32, end: u64, [first, limit]: [u64; 2], there: i
         PartIs::Left
     } else if there() {
         PartIs::Read
+    } else if cut && !viewed {
+        // No view shows it and none of it is there: nothing to bring, and
+        // no zeros for it either. (It was staged and copied as zeros: of
+        // the levels that so went up in two runs, a quarter ever got
+        // bytes; the others were levels below the first one viewed that
+        // the title had not mapped, 2.3 GB of staging in one of the runs.)
+        PartIs::Left
     } else {
         PartIs::Zeros
     }
@@ -4235,9 +4243,12 @@ mod digest_tests {
         assert_eq!(part_is(true, 0b0100, 0x5000, judged, || true), PartIs::Read, "a level that ends where the next texture starts");
         assert_eq!(part_is(true, 0b0010, 0x5001, judged, never), PartIs::Left);
         assert_eq!(part_is(true, 0b0001, 0x40_0000, judged, never), PartIs::Left);
-        // Its pages not there: zeros, for what is the title's.
+        // Its pages not there: zeros for a level a view shows; a level no
+        // view shows is left, whether another texture starts in it or not.
         assert_eq!(part_is(true, 0b1000, 0x2000, judged, || false), PartIs::Zeros);
-        assert_eq!(part_is(true, 0b0100, 0x5000, judged, || false), PartIs::Zeros);
+        assert_eq!(part_is(true, 0b1111_1000, 0x1000, judged, || false), PartIs::Zeros);
+        assert_eq!(part_is(true, 0b0100, 0x5000, judged, || false), PartIs::Left);
+        assert_eq!(part_is(true, 0b0001, 0x40_0000, [3, u64::MAX], || false), PartIs::Left);
         // No neighbour inside: every level is the title's.
         assert_eq!(part_is(true, 0b0001, 0x40_0000, [3, u64::MAX], || true), PartIs::Read);
         // No view says from where (level 0): all of it, wherever others start.

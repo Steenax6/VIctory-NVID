@@ -564,8 +564,9 @@ pub(crate) fn lines(frames: f64) {
     let l: [u64; 14] = std::array::from_fn(|k| BY_LEVEL[k].load(Relaxed));
     tracing::info!(
         "texture uploads level by level, since the start (the pass's and those of textures read through tables): {} MB \
-         of title memory read, {} MB not read because it is not the title's (levels above the first one viewed, where \
-         another texture starts), {} MB not read because its pages are not there ({} MB of staging zeroed for those), \
+         of title memory read, {} MB not read because no view shows it (levels above the first one viewed, where \
+         another texture starts or nothing is there), {} MB of levels a view shows not read because none of their pages \
+         is there ({} MB of staging zeroed for those), \
          {} MB not read because the host copy is made without those levels, {} MB read through the kernel of levels \
          only partly there; {} levels went up as zeros because nothing of them was there, {} of them got their bytes \
          since; {} times a level a view may show was left with nothing on the host at an upload's decision though \
