@@ -1255,6 +1255,37 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the view heap's table of view addresses (only
+                        // with the structure builder asked for: without it such
+                        // a draw is dropped, as the program was before).
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|h| h.addresses());
+                        let Some((gpu, buffer)) = table else {
+                            once!(
+                                "a shader takes view addresses from the view heap, which has no table of them \
+                                 (VICTORY_BVH_BUILDER=1 makes it): the draw is dropped"
+                            );
+                            return false;
+                        };
+                        // The list may outlive the title's heap object, which owns the table.
+                        list.keep(buffer);
+                        // SAFETY: an open list; the list holds the table.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -3987,7 +4018,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 /// world's ray-traced pass walked from address 0 instead of the structure
 /// (Marvisak/VIctory#2098). Any other view: the first byte of the memory
 /// it reads, or 0.
-fn view_address(view: &View) -> u64 {
+pub(crate) fn view_address(view: &View) -> u64 {
     match view {
         View::Shader(_, Some(desc))
             if desc[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 =>

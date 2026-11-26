@@ -69,6 +69,12 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps, with the structure builder asked for: the title address
+    /// of the buffer or ray-tracing structure view at each title slot, for
+    /// shaders that take it out of a descriptor they pick by an index they
+    /// compute (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload
+    /// buffer of two dwords a slot, its GPU address and its mapping.
+    addresses: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1078,6 +1084,21 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        // (16 MiB of upload memory a view heap: only for the builder's runs,
+        // whose structures the programs that read it walk.)
+        let addresses = (!sampler && crate::pipeline::builder_allowed())
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "view addresses by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let queued: std::sync::Arc<[std::sync::atomic::AtomicU64]> =
             (0..count.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
         let h = HostHeap {
@@ -1095,6 +1116,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            addresses,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::new(TextureQueue { queued: Some(queued.clone()), ..TextureQueue::default() }),
@@ -1294,6 +1316,30 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The table of view addresses by title slot (view heaps, with the
+    /// builder asked for): its GPU address and its buffer, for a list to
+    /// hold.
+    pub(crate) fn addresses(&self) -> Option<(u64, &ID3D12Resource)> {
+        self.addresses.as_ref().map(|a| (a.1, &a.0))
+    }
+
+    /// Notes the title address of the view now at title slot `index` in
+    /// [`HostHeap::addresses`].
+    fn note_address(&self, index: u32, address: u64) {
+        if let Some((_, _, data)) = &self.addresses
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping (two dwords a slot); a shader that
+            // reads while we write may see half of the new address, as a
+            // console shader may read a descriptor the CPU is writing.
+            unsafe {
+                let at = (*data as *mut u32).add(2 * index as usize);
+                at.write_volatile(address as u32);
+                at.add(1).write_volatile((address >> 32) as u32);
+            }
+        }
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1863,6 +1909,7 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
+        self.note_address(index, view.map_or(0, crate::draw::view_address));
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
@@ -1896,6 +1943,7 @@ impl HostHeap {
         buffer.then(|| Quick {
             index,
             stride: if self.sampler { None } else { view_stride(view) },
+            address: if self.sampler { 0 } else { crate::draw::view_address(view) },
             null: (!self.sampler).then(|| null_kind(view)),
             viewed: true,
         })
@@ -1935,6 +1983,11 @@ impl HostHeap {
                 for q in run.iter().filter(|q| q.index < victory_shader::emit::SLOT_STRIDES_COUNT) {
                     // SAFETY: inside the mapping (as in `note_buffer`).
                     unsafe { (*data as *mut u32).add(q.index as usize).write_volatile(q.stride.unwrap_or(0)) };
+                }
+            }
+            if self.addresses.is_some() {
+                for q in run.iter() {
+                    self.note_address(q.index, q.address);
                 }
             }
             {
@@ -2071,7 +2124,7 @@ impl HostHeap {
                     // `note_buffer` of nothing.
                     None if !self.sampler => {
                         kinds[PICKED_GONE] += 1;
-                        Some(Quick { index, stride: None, null: Some(NullKind::Plain), viewed: false })
+                        Some(Quick { index, stride: None, address: 0, null: Some(NullKind::Plain), viewed: false })
                     }
                     None => None,
                 };
@@ -4003,6 +4056,8 @@ pub(crate) struct Quick {
     index: u32,
     /// Its element stride ([`view_stride`]); `None` in sampler heaps.
     stride: Option<u32>,
+    /// The title address it starts at (`crate::draw::view_address`).
+    address: u64,
     /// The null view its host slot gets; `None` in sampler heaps.
     null: Option<NullKind>,
     /// Whether the record had the tag of a view (for the look again under
