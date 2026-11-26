@@ -1168,7 +1168,7 @@ impl Deferred {
 fn plan_protect(g: &mut Guards, from: usize, to: usize, later: &mut Deferred, epoch: Option<Epoch>) {
     let mut at = from;
     while at < to {
-        let (end, view) = view_run(at, to);
+        let (end, view) = kind_run(g, at, to);
         if view {
             plan_protect_run(g, at, end, later);
         } else {
@@ -1546,7 +1546,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
 fn protect_here(g: &mut Guards, from: usize, to: usize, epoch: Option<Epoch>) {
     let mut at = from;
     while at < to {
-        let (end, view) = view_run(at, to);
+        let (end, view) = kind_run(g, at, to);
         if view {
             protect_run(g, at, end, epoch);
         } else {
@@ -1556,6 +1556,27 @@ fn protect_here(g: &mut Guards, from: usize, to: usize, epoch: Option<Epoch>) {
         }
         at = end;
     }
+}
+
+/// [`view_run`], without asking Windows for blocks the guards know as
+/// view memory already (`Guards::views`: made read-only or noted absent
+/// since the runtime last mapped or unmapped them). The blocks a check
+/// arms again every frame are such blocks (written since their last
+/// check), so the default path asks no more than before; only blocks not
+/// known yet (a range guarded the first time, blocks just remapped) are
+/// asked about, once per region.
+fn kind_run(g: &Guards, block: usize, to: usize) -> (usize, bool) {
+    let mut end = block;
+    for &known in g.views.range(block..to) {
+        if known != end {
+            break;
+        }
+        end += 1;
+    }
+    if end > block {
+        return (end, true);
+    }
+    view_run(block, to)
 }
 
 /// From `block` on (to `to` at most): the end of the run of blocks whose
