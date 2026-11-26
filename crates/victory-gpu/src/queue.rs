@@ -649,6 +649,11 @@ fn release_held_now(all: bool) {
                         held.insert(0, Held::Running);
                         drop(held);
                         let backs = crate::list::thin::backs(&recordings);
+                        // As at the title's submit call for lists recorded
+                        // in the call: the refreshes of a pass over picked
+                        // buffer views one of them started go into it
+                        // before anything looks at its steps.
+                        crate::list::picked_in(&backs);
                         let parts = crate::list::detach_parts(&backs);
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
