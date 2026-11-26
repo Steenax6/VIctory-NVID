@@ -706,7 +706,8 @@ pub(super) fn first_lane_reads_alike(p: &Program, st: &Structured, plain: &[Valu
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them), an atomic being both: refused, unless the
+/// region's accesses are all atomics of one commuting kind that return nothing.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
@@ -737,25 +738,45 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // per region: LDS reads, LDS writes
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    let lds_op = |i: &Inst| {
+        let name = i.name();
+        (matches!(i.fields, Fields::Ds { .. }) && !name.starts_with("ds_swizzle") && !name.contains("permute"))
+            .then_some(name)
+    };
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
         }
         let r = find(&mut region, b);
-        for i in &block.insts {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
+        for name in block.insts.iter().filter_map(lds_op) {
             if name.starts_with("ds_read") {
                 reads[r] = true;
             } else {
                 writes[r] = true;
+                // An atomic reads the word it changes: two different ones on one word do not
+                // commute (a minimum, then an add), and one that returns the old value reads
+                // what the other half may or may not have written yet.
+                reads[r] |= !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
+    for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+        // (atomics of one commuting kind that return nothing, alone in the region: the two
+        // halves leave the same word in either order)
+        let mut ops = (0..n)
+            .filter(|&b| !all[b] && find(&mut region, b) == r)
+            .flat_map(|b| p.blocks[b].insts.iter().filter_map(lds_op))
+            .collect::<Vec<_>>()
+            .into_iter();
+        let commuting = ops.next().is_some_and(|op| {
+            matches!(
+                op,
+                "ds_add_u32" | "ds_sub_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32" | "ds_min_i32" | "ds_max_i32" | "ds_min_u32" | "ds_max_u32"
+            ) && ops.all(|next| next == op)
+        });
+        if !commuting {
+            return None;
+        }
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
@@ -11047,6 +11068,48 @@ mod tests {
         for runs in [[8, 4, 1], [4, 4, 1], [8, 8, 1], [16, 2, 1], [16, 16, 1], [4, 4, 4], [2, 2, 16], [64, 1, 1], [256, 1, 1]] {
             assert!(!super::may_tile(runs), "{runs:?}");
         }
+    }
+
+    /// In a lane branch of a console wave64 program, two LDS atomics on one word: run as two
+    /// host waves, the halves meet only around the branch (`super::lds_meetings`). An atomic
+    /// minimum and then an add do not commute, nor does an add that returns the old value with
+    /// anything: the region is refused. Two atomics of one commuting kind that return nothing
+    /// leave the same word in any order (realblastex/flamingo 89e5d6c3d, after
+    /// avatarmanz/VIctory-7900XTX #204).
+    #[test]
+    fn lds_atomics_in_a_lane_branch_meet_only_where_they_commute() {
+        let meets = |first: u32, second: u32| {
+            let words: [u32; 13] = [
+                0x7E12_0280, // v_mov_b32 v9, 0 (address and data)
+                0x7E04_0281, // v_mov_b32 v2, 1
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz past both accesses
+                0x36 << 26 | first << 18,
+                9 << 8 | 9, // ds_<first> v9, v9
+                0x36 << 26 | second << 18,
+                2 << 8 | 9,  // ds_<second> v9, v2
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                0x36 << 26 | 0x36 << 18,
+                5 << 24 | 9, // ds_read_b32 v5, v9
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let p = ir::build(&code, true, 16).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            super::lds_meetings(&p, &st, &all).is_some()
+        };
+        const ADD: u32 = 0x00;
+        const MIN_U32: u32 = 0x07;
+        const WRITE_B32: u32 = 0x0D;
+        const ADD_RTN: u32 = 0x20;
+        assert!(!meets(MIN_U32, ADD), "ds_min_u32 then ds_add_u32");
+        assert!(!meets(ADD_RTN, ADD_RTN), "two ds_add_rtn_u32");
+        assert!(!meets(ADD, WRITE_B32), "ds_add_u32 then ds_write_b32");
+        assert!(meets(ADD, ADD), "two ds_add_u32");
+        assert!(meets(MIN_U32, MIN_U32), "two ds_min_u32");
+        assert!(meets(WRITE_B32, WRITE_B32), "two ds_write_b32");
     }
 
     /// A program's constant table starts after its instructions, unless a
