@@ -3169,6 +3169,14 @@ impl Shadow {
     /// [`Shadow::refresh`] for `who` (one of the `ASKED_BY_` bits): what a
     /// diagnostics build counts the refresh under. Nothing else differs.
     pub(crate) fn refresh_as(self: &Arc<Self>, list: &HostList, address: u64, len: u64, who: u8) {
+        let len = self.asked(address, len, who);
+        list.defer_refresh(self, address as usize, len as usize);
+    }
+
+    /// The bytes a refresh of `len` bytes at `address` asked by `who` brings
+    /// up to date: `len` cut at the copy's end. A diagnostics build counts
+    /// the asking under `who`.
+    pub(crate) fn asked(&self, address: u64, len: u64, who: u8) -> u64 {
         let len = len.min(self.start + self.len - address);
         #[cfg(feature = "diagnostics")]
         {
@@ -3181,7 +3189,7 @@ impl Shadow {
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = who;
-        list.defer_refresh(self, address as usize, len as usize);
+        len
     }
 
     /// Diagnostics: the askers the copy had ([`Shadow::refresh_as`]), taken.

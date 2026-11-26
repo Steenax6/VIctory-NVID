@@ -899,6 +899,59 @@ mod tests {
 
     use super::*;
 
+    /// The refreshes of a pass a recording started beside it are put among
+    /// the list's steps where the pass was started, in front of what was
+    /// recorded after it, and only once ([`HostList::picked_in`]); the
+    /// declared writes taken out before them by a quarantine move the place
+    /// with them.
+    #[test]
+    fn a_pass_beside_the_recording_refreshes_where_it_was_started() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let memory = crate::resource::Memory::zeroed(1 << 16, 4096).expect("a test buffer");
+        let start = memory.address();
+        crate::shadow::register(start as usize, start, 1 << 16);
+        let copy = crate::shadow::find(start, 1 << 16).expect("a host copy");
+        let steps = |list: &HostList| -> Vec<(char, usize)> {
+            list.deferred()
+                .copies
+                .iter()
+                .map(|step| match step {
+                    Step::Refresh(_, address, _) => ('r', *address - start as usize),
+                    Step::GpuWrite(_, address, _) => ('w', *address - start as usize),
+                    Step::Fill(..) => ('f', 0),
+                    _ => ('?', 0),
+                })
+                .collect()
+        };
+        for quarantined in [false, true] {
+            list.defer_gpu_write(&copy, start as usize + 0x100, 16);
+            list.defer_refresh(&copy, start as usize + 0x200, 16);
+            list.defer_picked(crate::draw::Picked::done(vec![(copy.clone(), start + 0x1000, 64), (copy.clone(), start + 0x2000, 1 << 20)]));
+            list.defer_refresh(&copy, start as usize + 0x300, 16);
+            if quarantined {
+                list.quarantine();
+            }
+            list.defer_refresh(&copy, start as usize + 0x400, 16);
+            let before = steps(&list);
+            list.picked_in();
+            let mut expected = before.clone();
+            let at = if quarantined { 1 } else { 2 };
+            expected.splice(at..at, [('r', 0x1000), ('r', 0x2000)]);
+            assert_eq!(steps(&list), expected, "quarantined: {quarantined}");
+            // (Cut at the copy's end, as a refresh asked of the copy is.)
+            let cut = list.deferred().copies.iter().any(|step| matches!(step, Step::Refresh(_, address, len) if *address == start as usize + 0x2000 && *len == (1 << 16) - 0x2000));
+            assert!(cut);
+            list.picked_in();
+            assert_eq!(steps(&list), expected, "taken once");
+            list.close();
+            list.reset();
+        }
+        list.close();
+        drop(copy);
+        crate::shadow::unregister(start as usize, start);
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -2188,6 +2241,12 @@ struct Deferred {
     /// structure builder, so nothing its shaders write is copied back into
     /// title memory ([`HostList::quarantine`]).
     quarantined: bool,
+    /// The pass over the view heap's picked buffer views this recording
+    /// started (`crate::draw::Picked`), with how many steps and how many
+    /// read-backs were recorded before it: the refreshes of what the pass
+    /// finds are put among `copies` there before the list is submitted
+    /// ([`HostList::picked_in`]).
+    picked: Option<(usize, usize, std::sync::Arc<crate::draw::Picked>)>,
 }
 
 impl Deferred {
@@ -2199,13 +2258,20 @@ impl Deferred {
     /// a run whether the title does it. Nothing to look at for the lists
     /// without read-backs.
     fn reads_read_back(&self, at: usize, len: usize) {
-        if self.backs.is_empty() {
+        self.reads_read_back_of(self.backs.len(), at, len);
+    }
+
+    /// [`Deferred::reads_read_back`] for a step that belongs behind the
+    /// first `backs` read-backs of the list only.
+    fn reads_read_back_of(&self, backs: usize, at: usize, len: usize) {
+        if backs == 0 {
             return;
         }
         let end = at.saturating_add(len);
         if self
             .backs
             .iter()
+            .take(backs)
             .filter_map(|&(_, to, shape)| read_back_span(to, shape))
             .any(|(from, to)| from < end && at < to)
         {
@@ -7650,6 +7716,38 @@ impl HostList {
         }
     }
 
+    /// The recording started the pass over the view heap's picked buffer
+    /// views here (`crate::draw::Picked`): the refreshes of the ranges the
+    /// pass finds are steps of this list from this place on, put in before
+    /// the list is submitted ([`HostList::picked_in`]).
+    pub(crate) fn defer_picked(&self, pass: std::sync::Arc<crate::draw::Picked>) {
+        let mut deferred = self.deferred();
+        deferred.picked = Some((deferred.copies.len(), deferred.backs.len(), pass));
+    }
+
+    /// Before the list is submitted: the refreshes of the pass the
+    /// recording started ([`HostList::defer_picked`]) become its steps, at
+    /// the place the pass was started, as [`HostList::defer_refresh`]
+    /// recorded them there when the pass ran in the recording. Waits for
+    /// the pass. (Not noted in `refreshed`: an ask for the same range of the
+    /// same copy later in the list is then a second step, which a
+    /// submission joins with the first.)
+    pub(crate) fn picked_in(&self) {
+        let Some((at, backs, pass)) = self.deferred().picked.take() else {
+            return;
+        };
+        let found = pass.found();
+        let mut deferred = self.deferred();
+        let mut steps = Vec::with_capacity(found.len());
+        for (shadow, address, len) in found {
+            let len = shadow.asked(address, len, crate::shadow::ASKED_BY_PICKED);
+            deferred.reads_read_back_of(backs, address as usize, len as usize);
+            steps.push(Step::Refresh(shadow, address as usize, len as usize));
+        }
+        let at = at.min(deferred.copies.len());
+        deferred.copies.splice(at..at, steps);
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -7678,6 +7776,14 @@ impl HostList {
         let mut deferred = self.deferred();
         if !deferred.quarantined {
             deferred.quarantined = true;
+            // (The steps a pass's refreshes go behind are fewer by the ones
+            // taken out before them: `defer_picked`.)
+            let before = deferred.picked.as_ref().map_or(0, |picked| {
+                deferred.copies.iter().take(picked.0).filter(|step| matches!(step, Step::GpuWrite(..))).count()
+            });
+            if let Some(picked) = &mut deferred.picked {
+                picked.0 -= before;
+            }
             deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
         }
     }
@@ -8956,11 +9062,16 @@ impl Meter {
             }
         }
         {
-            let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            let [texture_us, slots, waited_us, beside_us] =
+                [0, 1, 2, 3].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is what the recording thread that \
+                 starts it spends): {:.1} ms in its pass over textures picked by index; {:.0} buffer slots looked at by its pass \
+                 over buffer views, {:.1} ms on that pass's own thread, {:.1} ms submissions waited for it",
                 texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
+                slots as f64 / frames,
+                beside_us as f64 / 1e3 / frames,
+                waited_us as f64 / 1e3 / frames
             );
         }
         crate::shadow::exact_line(frames);

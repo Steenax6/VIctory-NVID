@@ -490,6 +490,11 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        // A pass over a view heap's buffer views that runs beside the
+        // recording holds the heap by address (`crate::draw::Picked`).
+        if self.host.get().is_some_and(Option::is_some) && !self.samplers() {
+            crate::draw::picked_settled();
+        }
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
