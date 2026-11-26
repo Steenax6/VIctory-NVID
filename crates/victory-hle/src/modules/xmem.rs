@@ -1139,6 +1139,20 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        // Told while the view is still there, not after. The GPU side keeps
+        // host copies of title textures and refreshes them lazily: once
+        // told, the next refresh of a texture here reads its memory again.
+        // Told after the unmap, that read finds the pages gone and the copy
+        // stands them as zeros (`victory_gpu` `copy_mapped`), so a texture
+        // the title has stopped mapping but whose host copy is still drawn
+        // from can go up with holes. The runs with the order reversed
+        // (fxceless/victory-fork pull request #1005, taken and taken out
+        // again) lost the lettering on the jumpsuit in the first room, the
+        // runs with this order kept it (that this is the path it took is
+        // read from the code, not traced). That pull request's concern, guards noted clean
+        // over memory that is then gone, does no harm here: a copy kept of
+        // what the memory held is what a texture should show, and whatever
+        // the title maps here next is told by `map`.
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
