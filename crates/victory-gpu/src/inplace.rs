@@ -286,8 +286,26 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
-    v.sections.insert(section, (bytes, committed));
+    {
+        let mut v = views();
+        v.sections.insert(section, (bytes, committed));
+    }
+    // A view of our own of an earlier section with this handle is none of
+    // this one's.
+    crate::beside::section_made(section);
+}
+
+/// The bytes of the section the runtime made with this handle.
+pub(crate) fn section_bytes(section: usize) -> Option<u64> {
+    views().sections.get(&section).map(|&(bytes, _)| bytes)
+}
+
+/// The title view that holds address `at`: where it begins, its bytes, its
+/// section's handle and the offset of its first byte in the section.
+pub(crate) fn view_at(at: usize) -> Option<(usize, usize, usize, u64)> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+    (at - base < bytes).then_some((base, bytes, section, offset))
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from

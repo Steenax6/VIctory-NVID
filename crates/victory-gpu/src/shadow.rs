@@ -4632,7 +4632,16 @@ impl Shadow {
             // the old merge left out its whole run), and so is one the card's
             // bytes did not change in title memory.
             let (hull_lo, hull_hi) = (stretches[0].0, stretches[stretches.len() - 1].1);
-            crate::watch::writing_as(start + hull_lo, hull_hi - hull_lo, crate::writes::Cause::Back);
+            // Beside the guards (`crate::beside`), where one view of ours
+            // shows all of it: the guards stay as they are, and the blocks
+            // are counted written once the bytes are there. Else the
+            // guards are opened first, as ever.
+            let place =
+                if crate::beside::mode() != 0 { crate::beside::find(start + hull_lo, hull_hi - hull_lo) } else { None };
+            let mut went_beside = false;
+            if place.is_none() {
+                crate::watch::writing_as(start + hull_lo, hull_hi - hull_lo, crate::writes::Cause::Back);
+            }
             let mut written = 0;
             let mut put = 0;
             let mut race = races.into_iter();
@@ -4646,10 +4655,25 @@ impl Shadow {
                 }
                 crate::host::shaders_write(start + a, t);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + a, t, "card relay");
-                write_title(start + a, t);
+                match &place {
+                    Some(place) => {
+                        let done = place.write(start + a, t);
+                        went_beside |= done > 0;
+                        if done < n {
+                            // (A page of our view that is not there, or
+                            // the check's doubt: this stretch as before.)
+                            crate::watch::writing_as(start + a + done, n - done, crate::writes::Cause::Back);
+                            write_title(start + a + done, &t[done..]);
+                        }
+                    }
+                    None => write_title(start + a, t),
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::buffers::landed(start + a, n);
                 written += n;
+            }
+            if went_beside {
+                crate::watch::written_beside(start + hull_lo, hull_hi - hull_lo, crate::writes::Cause::Back);
             }
             if merge_forget() {
                 crate::watch::forgot(start + hull_lo, hull_hi - hull_lo);

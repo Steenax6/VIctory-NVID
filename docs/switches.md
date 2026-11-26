@@ -80,6 +80,22 @@ of 74-78, the frame line's copies from 17.5 to 26 ms, the picture the same
 frame on an RTX 4070). A line with the frame-rate line says how many copies
 went where, by size.
 
+`VICTORY_LAND_BESIDE=1` (2026-11-26; off, not measured in the game yet):
+what shaders wrote goes into title memory through a view of the layer's
+own of the same pages, beside the guards, wherever the title's address is
+a view of physical pages; the guarded blocks under it count as written
+and stay read-only. Until now a landing opened every guarded block it
+wrote into and the block's next check guarded it again: in the first room
+all 781 guarded blocks opened a frame were opened by landings, none by
+the title, with 3.8 ms a frame of the landing thread and 4.6 ms of the
+submitting thread in changes of protection (census and profile of
+2026-11-26). `=2` also reads every such write back through the title's
+address and counts those that are not there. With it the line "landings
+beside the guards per frame" says how many writes went that way, and the
+census's "guarded blocks opened by the layer's own writes" should fall to
+nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
+pull request 3069; this tree's own code).
+
 ## Pipelines
 
 `VICTORY_PIPELINE_EARLY_WORKERS=<n>` sets how many workers may make the

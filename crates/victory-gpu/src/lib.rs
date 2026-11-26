@@ -19,6 +19,8 @@
 mod adapter;
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod beside;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

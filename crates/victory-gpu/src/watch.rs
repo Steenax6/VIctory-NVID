@@ -2068,6 +2068,23 @@ pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
     crate::descriptor::host::remapped(at, len, cause);
 }
 
+/// After a write of the layer's own into title memory `[at, at + len)` that
+/// went through a view of its own of the same pages (`crate::beside`): the
+/// guarded blocks there, and at every other view of their pages, count as
+/// written and stay read-only ([`mark_only`]), so every host copy over
+/// them takes them again at its next check, as after [`writing_as`] opened
+/// them, without the two changes of protection. Called once the bytes are
+/// there: a check between the write and this takes them a second time, one
+/// before the write would have noted the block clean with the old bytes.
+pub(crate) fn written_beside(at: usize, len: usize, cause: crate::writes::Cause) {
+    {
+        let mut g = guards();
+        mark_with_views(&mut g, at, at.saturating_add(len));
+    }
+    // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, len, cause);
+}
+
 /// What the journal and the guards hold of title memory `[start, end)`
 /// against the asking numbered `asked` (the one a texture's upload read
 /// after, `crate::texture` `Staging::asked`), asked without changing
@@ -3724,6 +3741,51 @@ mod tests {
         writing(other + BLOCK / 2, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(0), pages(1)]));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A write of the layer's own that went beside the guards, through a
+    /// view of its own of the pages (`crate::beside`, [`written_beside`]):
+    /// the next check of every guarded view of the pages reports them
+    /// written, the bytes are there, and no view was opened for it.
+    #[test]
+    fn a_write_beside_the_guards_is_reported_at_every_view_and_opens_none() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        crate::inplace::title_memory_section(section, SIZE as u64, true);
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        let protection = |at: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE, None), Some(vec![pages(two, 0), pages(two, 1)]));
+        assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(two, two + SIZE, None), Some(Vec::new()), "nothing written yet");
+        // The bytes first, then the guards are told.
+        let place = crate::beside::find(one + BLOCK + 16, 32).expect("a place in a view of our own");
+        assert_eq!(place.write(one + BLOCK + 16, &[7; 32]), 32);
+        written_beside(one + BLOCK + 16, 32, crate::writes::Cause::Back);
+        assert_eq!(protection(one + BLOCK), PAGE_READONLY, "the view written at stays guarded");
+        assert_eq!(protection(two + BLOCK), PAGE_READONLY, "and so does the other view of its pages");
+        // SAFETY: both views are readable.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts((one + BLOCK + 16) as *const u8, 32), [7; 32]);
+            assert_eq!(std::slice::from_raw_parts((two + BLOCK + 16) as *const u8, 32), [7; 32]);
+        }
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE, None), Some(vec![pages(two, 1)]), "the other view's copy takes them too");
+        assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE, None), Some(Vec::new()));
+        // A write of the title's afterwards faults and is seen, as ever.
+        // SAFETY: the first view, read-write once the handler has opened it.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 0)]));
+        crate::beside::section_made(section);
+        drop_views(section, &[one, two], SIZE);
     }
 
     /// Both views of the pages are checked, each for a copy of its own
