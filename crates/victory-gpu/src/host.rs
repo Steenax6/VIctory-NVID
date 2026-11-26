@@ -8164,16 +8164,28 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // The copies and fills are timed by stretches of them: the clock is
+        // read where a stretch begins and where it ends, not around every
+        // one. A frame of the first room has 12,800 copies and fills, most
+        // of them next to each other, and a clock read around each was
+        // still 1 ms of the submitting thread a frame (the profile of
+        // 2026-11-26: `Instant::now` 0.83, `elapsed` 0.19 under
+        // `run_deferred`). The sum is the same: a stretch is the steps'
+        // bodies back to back (Marvisak/VIctory pull request 3096 times
+        // its preparing in parts too).
+        let mut stretch: Option<(std::time::Instant, usize)> = None;
+        let end_stretch = |stretch: &mut Option<(std::time::Instant, usize)>| {
+            if let Some((started, copied)) = stretch.take() {
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
+        };
         for step in &self.deferred().copies {
-            // The clock is read for the steps that are timed, the copies
-            // and the fills (and, with diagnostics, the title's own work),
-            // not for every step: a frame of the first room has 12,800
-            // copies and fills and 21,700 refreshes besides the declared
-            // writes and the textures, and the clock was 1.7 ms of the
-            // submitting thread's 69 ms a frame (the profile of 2026-11-26;
-            // Marvisak/VIctory pull request 3096 does the same in its own
-            // preparing).
-            let (started, copied) = match step {
+            // (A refresh only joins the batch here: it stays in the stretch.)
+            if !matches!(step, Step::Copy(..) | Step::Fill(..) | Step::Refresh(..)) {
+                end_stretch(&mut stretch);
+            }
+            let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     // Left to the submission's landing (`copy_goes_late`).
                     if let Some(at) = batch.late.iter().position(|c| *c == (dst, src, len)) {
@@ -8181,7 +8193,7 @@ impl HostList {
                         batch.went_late.push((dst, src, len));
                         continue;
                     }
-                    let started = std::time::Instant::now();
+                    stretch.get_or_insert_with(|| (std::time::Instant::now(), 0));
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8202,10 +8214,10 @@ impl HostList {
                     // And the texture pass, by a number taken now that the
                     // bytes are there: an upload that read before is stale.
                     crate::descriptor::host::title_copied(dst, len);
-                    (started, len)
+                    len
                 }
                 &Step::Fill(dst, src, len) => {
-                    let started = std::time::Instant::now();
+                    stretch.get_or_insert_with(|| (std::time::Instant::now(), 0));
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8214,7 +8226,7 @@ impl HostList {
                         crate::copystat::buffers::cpu_read(src, len);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    (started, len)
+                    len
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8269,9 +8281,11 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            if let Some((_, bytes)) = stretch.as_mut() {
+                *bytes += copied;
+            }
         }
+        end_stretch(&mut stretch);
     }
 }
 
