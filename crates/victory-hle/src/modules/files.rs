@@ -530,6 +530,19 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // guard over all the views of a page protects other views from other
 // threads) fails that `ReadFile`, and the title's retry opens it again;
 // `fread` has no such retry and reads beside instead (see there).
+//
+// A block guarded again while the kernel is writing is another matter: a
+// read through the system's cache fails there as above, but one whose
+// pages the kernel locked when it began (a file opened without buffering)
+// writes on into a block the GPU side has just noted unwritten, with no
+// fault. So a read that finished says so (`victory_gpu::kernel_wrote`):
+// the blocks guarded meanwhile count as written once more. A read that is
+// left pending cannot say when it is done; the title imports neither
+// `GetOverlappedResult` nor a completion port, so none is expected, and
+// one that comes is counted and said.
+
+/// Reads the title started that came back pending, since the start.
+static PENDING_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -538,10 +551,36 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, SetLastError};
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // SAFETY: reads and sets this thread's last error only.
+    let error = unsafe { GetLastError() };
+    if done != 0 {
+        // SAFETY: the title's own out pointer, written by the host just
+        // now; without one (an overlapped read that finished at once) the
+        // whole buffer counts.
+        let bytes = if read.is_null() { len } else { unsafe { read.read_unaligned() }.min(len) };
+        if !buffer.is_null() {
+            victory_gpu::kernel_wrote(buffer as usize, bytes as usize);
+        }
+    } else if error == ERROR_IO_PENDING {
+        let n = PENDING_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(
+                n,
+                buffer = format_args!("{buffer:p}"),
+                len,
+                "a read of the title's is pending: if it writes memory the GPU side guards again before it is done, the host copies there keep older bytes (nothing tells of its end)"
+            );
+        }
+    }
+    // The title asks for the read's error, not for what the notice left.
+    // SAFETY: as above.
+    unsafe { SetLastError(error) };
+    done
 }
 
 /// The host CRT reads large requests straight into the caller's buffer

@@ -129,8 +129,23 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
+/// The host pipeline if it is made (or, for a draw, is made within the
+/// frame's budget); queues it on first use. A compute pipeline is made
+/// before this returns, whatever the budget.
+///
+/// A draw dropped for want of its pipeline is drawn again in the next
+/// frame. A dispatch may not be: the title runs some compute passes once,
+/// when a scene changes, and what they leave is read for as long as the
+/// scene lasts. So a compute pipeline that is not made yet is made on the
+/// calling thread, or waited for while a worker makes it: a wait of
+/// seconds at most, the first time a program is met (the pipeline library
+/// has it in the next run), against a picture that stays wrong
+/// (fxceless/victory-fork pull request #1312, Exopus-0x65f7ad0: a program
+/// that took 4.4 s to make on a machine short of memory had its one
+/// dispatch dropped after the half second of budget, and the picture was
+/// wrong for more than 80 s after it). Until now a dispatch waited within
+/// the budget like a draw, and was dropped ("a dispatch without a host
+/// pipeline dropped") and not repeated.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
@@ -139,9 +154,36 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.graphics.is_none() {
+            // Made here, or waited for while a worker makes it.
+            let started = Instant::now();
+            p.make();
+            COMPUTE_WAITS[0].fetch_add(1, Ordering::Relaxed);
+            COMPUTE_WAITS[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Since the start: compute pipelines a dispatch stood for until they were
+/// made ([`ready`]), and the microseconds it stood.
+static COMPUTE_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// With the frame line, when a dispatch has stood for its pipeline since
+/// the line before.
+pub(crate) fn compute_waits_line() {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let n = COMPUTE_WAITS[0].load(Ordering::Relaxed);
+    if SAID.swap(n, Ordering::Relaxed) == n {
+        return;
+    }
+    tracing::info!(
+        "compute pipelines a dispatch stood for until they were made, since the start: {n}, {:.1} ms in all (a dispatch is not \
+         dropped for want of its pipeline; a draw still is, past VICTORY_PIPELINE_WAIT_MS a frame)",
+        COMPUTE_WAITS[1].load(Ordering::Relaxed) as f64 / 1e3
+    );
 }
 
 /// `p` made for render targets of `targets` instead of the formats the
@@ -509,11 +551,24 @@ fn drained() {
 mod tests {
     use super::*;
 
-    /// A first use queues the pipeline and, within the budget, gets the
-    /// worker's answer (here: no host pipeline for no shaders).
+    /// A dispatch's pipeline is made before its first use returns, whoever
+    /// has it: a worker that took it and has not begun does not make the
+    /// dispatch go without (here: no host pipeline for no shaders, but the
+    /// answer is there).
+    #[test]
+    fn a_compute_pipeline_is_made_before_its_first_use_returns() {
+        let p = Pending::new(Vec::new(), None);
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        assert!(ready(&p).is_none());
+        assert!(matches!(p.made.get(), Some(None)), "made on the calling thread");
+    }
+
+    /// A draw's first use queues the pipeline and, within the budget, gets
+    /// the worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
+        let p = Arc::new(Pending::new(Vec::new(), Some(Box::default())));
         assert!(ready(&p).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
@@ -554,7 +609,8 @@ mod tests {
 
     #[test]
     fn pending_pipeline_is_recorded_for_the_next_launch() {
-        let mut p = Pending::new(Vec::new(), None);
+        // (A draw's: a dispatch's would be made by its first use.)
+        let mut p = Pending::new(Vec::new(), Some(Box::default()));
         p.key = "pending-pipeline-test".to_owned();
         // Simulate a worker that has taken the job but cannot finish it yet.
         p.queue_state.store(MAKING, Ordering::Relaxed);

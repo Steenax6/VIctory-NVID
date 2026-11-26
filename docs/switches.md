@@ -103,21 +103,90 @@ census's "guarded blocks opened by the layer's own writes" should fall to
 nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
 pull request 3069; this tree's own code).
 
-`VICTORY_REFRESH_EVENTS` (2026-11-26; off: its check `=2` found 7 refreshes with
-bytes to copy and no event in the prologue's 205 s and 2 in the open
-world's first 130 s, so `=1` would have left writes out): a
+`VICTORY_REFRESH_EVENTS` (2026-11-26; off until its check has run again): a
 copy in view memory is not asked about again while nothing happened in
 its memory since it was last brought up to date. What can make a guarded
 block count as written (a write that faults, one of ours that opens or
 marks it, a new mapping, a page the journal notes) raises a count for
-its 4 MiB of title memory, and a copy remembers the counts of the range
-it last brought up to date. `=2` is the check: every refresh is asked as
-before, and each one that `=1` would have left out and that found bytes
-to copy is counted and named ("a refresh found bytes to copy where no
-event was counted"); the line "refreshes by event" must say 0 of those
-in the prologue and at the open world's entry and in its bedroom before
-`=1` is used. Copies in private memory are asked as before: only the
-kernel knows what was written there.
+its 4 MiB of title memory, with the lock held under which an asking
+sees it, and a copy remembers the counts of the range it last brought up
+to date. A range that held blocks not committed is asked once in every 30
+frames all the same (`VICTORY_ABSENT_FRAMES`): a block committed with
+nothing told is found by looking, as before. `=2` is the check: every
+refresh is asked as before, and each one that `=1` would have left out
+and that found bytes to copy is counted and named ("a refresh found bytes
+to copy where no event was counted", with the block the guards reported
+and what it was to them); the line "refreshes by event" must say 0 of
+those in the prologue and at the open world's entry and in its bedroom
+before `=1` is used. Copies in private memory are asked as before: only
+the kernel knows what was written there.
+
+The check's first form found 7 such refreshes in the prologue's 205 s and
+2 in the open world's first 130 s. It decided that nothing had happened
+before the asking took its locks and counted whatever the asking then
+found; a write whose fault or mark was counted in that moment was a find,
+though `=1` asks for it at the next refresh. It decides with the locks
+held now, and the line counts the others apart ("whose event was counted
+between the refresh's look and its asking"). Reading the code for a
+writer the events miss found two places, both put right: a mapping's
+count was raised before the guards' lock was taken (a refresh between
+the two remembered the count and not the mapping), and a copy whose
+memory turned out not to be watched could be left out. The runs after
+that (s_y2_p_check, 205 s, and s_we_y2_check, 130 s) had 0 finds in
+every line, and 0 of the others too: so the 9 were not the check's own
+moment, as first supposed, but went with the event side as it is now
+(the mapping's count, or the ranges with absent blocks, which are asked
+once in 30 frames and whose finds at that asking were not told apart
+then). The line now counts those askings as well: the ones that found
+blocks that had been absent, which is what they are for, and the ones
+that found other bytes no event had announced, which must be 0 too.
+
+`VICTORY_LAND_TAKEN=1` (2026-11-26; off, not yet run; `=2` is its check):
+what shaders wrote into private title memory (which the kernel
+write-watches; no guard there) set the written bits of its pages, the
+next refresh took them for the title's, and the landing's own copy read
+the pages it had just been given: 22.8 MB a frame in the first room,
+read and found equal on the submitting thread. With the switch a landing
+that fetched 512 KiB or more of such memory takes the bits right behind
+its write (one kernel asking for the pieces that lie together, the
+journal's lock held) and notes the pages in the journal at once, so
+every other copy over them learns of the landing as before; its own copy
+compares each noted 4 KiB page with its CPU side on the landing thread,
+and a 64 KiB page whose noted pages all hold the copy's bytes counts as
+taken by that copy. A write of the title's behind the taking sets its
+bit again, one before it is in the bytes compared. `=2` takes and notes
+and marks nothing: the refresh reads as before and first compares each
+page `=1` would have passed by; one with other bytes, no bit and no
+later note is a find (0 is what `=1` needs; run it with
+`VICTORY_REFRESH_CHECK=1`, which samples every copy's refreshes against
+title memory). The line "landings' written bits taken in private title
+memory" says how many pages a frame the copy no longer reads, and the
+guards line's "equal to the CPU side, not sent up" should fall by about
+that. Each taking costs a kernel call of 30 to 70 microseconds on the
+landing thread.
+
+`VICTORY_REFRESH_CHECK=1` (a diagnostic, slow): after every refresh the
+first 256 bytes of each 64 KiB block of it are read from title memory
+and compared with the copy. A block DirectStorage is filling differs for
+as long as the read takes (it writes the pages through a view of the
+runtime's own and tells the guards when it is done), and that is as it
+should be: the open world's entry had 1,024 blocks "stale three times in
+a row" in 130 s, all in 4 MiB windows, while 14,000 such reads came in.
+So the line "refresh check, since the start" tells the looks apart:
+those under a read the title has submitted and that is not done; those
+with none; blocks that differed three times in a row with none (named,
+with what the guards hold of the block); of them, those that matched
+again once a write behind the guards was told there and those that
+matched again with none told; and blocks that differed for two seconds
+with nothing told. Only the last are copies that keep old bytes; each is
+named a second time.
+
+A read of the kernel's into title memory (`ReadFile`) now says when it is
+done, and blocks a check guarded again while the kernel was writing count
+as written once more: a file read without buffering goes on into such a
+block with no fault, and the host copies there kept the bytes of the
+moment they looked. The line "reads of the kernel's into title memory
+that finished" counts those blocks; no switch.
 
 ## Pipelines
 
@@ -136,7 +205,11 @@ are not cached yet (default: half the logical processors, at most 8). With
 to 6-12 s; 16 was no better than the default.
 
 `VICTORY_PIPELINE_WAIT_MS=24`: a shorter per-frame wait for pipelines still
-being built (objects can go missing meanwhile).
+being built (objects can go missing meanwhile). It bounds draws only: a
+dispatch stands for its compute pipeline until it is made, since a
+compute pass the title runs once is not run again (fxceless/victory-fork
+pull request #1312); the line "compute pipelines a dispatch stood for"
+says how many and how long.
 
 ## Textures the game reads back
 
@@ -377,8 +450,10 @@ thread share the rest.
   last is sent): as it stands the title faults with it within two minutes,
   because waits between its queues are passed at the present; a variant
   that met them in order ran without a fault and no faster.
-- `VICTORY_HOT_BLOCKS=1`, `VICTORY_MERGE_FORGET=1`, `VICTORY_NAMED_WRITES=1`:
-  not yet tried in a run.
+- `VICTORY_HOT_BLOCKS=1`, `VICTORY_NAMED_WRITES=1`: not yet tried in a run.
+  (`VICTORY_MERGE_FORGET` is gone: it dropped the kernel's written bits a
+  landing set, and with them the title's of before the landing;
+  `VICTORY_LAND_TAKEN` takes them and notes them.)
 - The argument clamp between enhanced barriers (Zettrox/ztrx pull request
   #139): the same time on the card and in the title; not in this tree.
 - Page marks set by shaders for copy-backs (Marvisak/VIctory `cd94d35`):

@@ -87,11 +87,16 @@ pub(crate) struct Shadow {
     /// census (`crate::copystat::buffers`).
     #[cfg(feature = "diagnostics")]
     asked_by: AtomicU8,
-    /// The range last brought up to date by asking, and the events counted
-    /// in it just before (`crate::watch::events`): with
+    /// The range last brought up to date by asking, with the events counted
+    /// in it just before (`crate::watch::Seen`): with
     /// `VICTORY_REFRESH_EVENTS`, a refresh inside it at the same count has
     /// nothing to ask.
-    events_seen: Mutex<(usize, usize, u64)>,
+    events_seen: Mutex<crate::watch::Seen>,
+    /// The check of `VICTORY_LAND_TAKEN=2`: pages of title memory a
+    /// landing would have noted taken by this copy, with the landing's
+    /// asking ([`Shadow::landed_pages`]); looked at by the refresh that
+    /// reads them.
+    landed_check: Mutex<std::collections::HashMap<usize, u64>>,
 }
 
 /// Who asks for a refresh of a copy ([`Shadow::refresh_as`]): a draw for
@@ -3227,7 +3232,8 @@ impl Shadow {
             place: None,
             #[cfg(feature = "diagnostics")]
             asked_by: AtomicU8::new(0),
-            events_seen: Mutex::new((0, 0, 0)),
+            events_seen: Mutex::default(),
+            landed_check: Mutex::default(),
         }
     }
 
@@ -3749,6 +3755,20 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        // Title memory is read into one buffer a thread, kept between
+        // calls: a zeroed 64 KiB made for every call that looks at a page
+        // was most of such a call's own time (Marvisak/VIctory pull request
+        // 3246, lhnizdo, does the same for its marked pages' copy-back).
+        // Every byte of it that is used was read from title memory first.
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        TITLE.with(|title| self.merge_under_writes_into(address, len, runs_left, &mut title.borrow_mut()))
+    }
+
+    /// [`Shadow::merge_under_writes`]; `title` is room to read title
+    /// memory into.
+    fn merge_under_writes_into(&self, address: usize, len: usize, runs_left: &mut usize, title: &mut Vec<u8>) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -3771,9 +3791,6 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        // Made when a page is to be looked at: most calls find none, and a
-        // zeroed 64 KiB each was most of their own time.
-        let mut title: Vec<u8> = Vec::new();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -3790,8 +3807,8 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_runs_in(base, &copied, (start, end), a, e, &written, refresh_kernel_pages())
             };
-            if !stale.is_empty() && title.is_empty() {
-                title = vec![0u8; PAGE];
+            if !stale.is_empty() && title.len() < PAGE {
+                title.resize(PAGE, 0);
             }
             for (page, runs) in stale {
                 let mut taken = true;
@@ -3950,35 +3967,53 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         // By event (`crate::watch::events_mode`), for a range in view
-        // memory: whether anything happened in the range last brought up
+        // memory of a copy that is asked about at all (one whose memory
+        // nothing watches is copied whole every time, whatever the
+        // counts): whether anything happened in the range last brought up
         // to date since it was, if this one lies inside it.
+        use crate::watch::{Checked, Look, Seen};
         let by_event = crate::watch::events_mode();
-        let looked = (by_event != 0 && crate::inplace::view_at(from).is_some() && crate::inplace::view_at(to - 1).is_some())
+        let watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
+        let looked = (by_event != 0 && watched && crate::inplace::view_at(from).is_some() && crate::inplace::view_at(to - 1).is_some())
             .then(|| {
-                let (a, b, then) = *self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
-                let inside = a <= from && to <= b;
-                (inside, inside && crate::watch::events(a, b) == then, crate::watch::events(from, to))
+                let seen = *self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
+                let inside = seen.holds(from, to);
+                // (The counts of this range, from before its asking.)
+                (seen, inside, inside && seen.quiet(), Seen::before(from, to))
             });
-        if by_event == 1 && matches!(looked, Some((true, true, _))) {
-            crate::watch::event_checked(true, true, None, (self.start, self.len), from, to);
+        if by_event == 1 && matches!(looked, Some((_, true, true, _))) {
+            let left_out = Checked { inside: true, quiet: true, quiet_locked: true, uncounted: true, copied: None };
+            crate::watch::event_checked(left_out, (self.start, self.len), from, to, None);
             return 0;
         }
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+        if watched {
+            // The asking looks at the counts again with its locks held:
+            // what it finds is then what they stand for.
+            let mut look = Look { seen: looked.map(|l| l.0), ..Look::default() };
             let copied = if refresh_parts() || refresh_kernel_pages() {
-                crate::watch::writes_fine(from, to, true).map(|(now, written)| self.copy_stale_fine(from, to, now, &written))
+                crate::watch::writes_fine_look(from, to, true, &mut look).map(|(now, written)| self.copy_stale_fine(from, to, now, &written))
             } else {
-                crate::watch::writes(from, to, true).map(|(now, written)| self.copy_stale(from, to, now, &written))
+                crate::watch::writes_fine_look(from, to, true, &mut look)
+                    .map(|(now, written)| (now, written.into_iter().map(|(p, w)| (p, w.at)).collect::<Vec<_>>()))
+                    .map(|(now, written)| self.copy_stale(from, to, now, &written))
             };
             if let Some(copied) = copied {
-                if let Some((inside, quiet, now)) = looked {
-                    crate::watch::event_checked(quiet, inside, Some(copied), (self.start, self.len), from, to);
-                    // The count from before the asking: what the asking
+                if let Some((_, inside, quiet, before)) = looked {
+                    let checked = Checked {
+                        inside,
+                        quiet,
+                        quiet_locked: inside && look.quiet,
+                        uncounted: inside && look.uncounted,
+                        copied: Some(copied),
+                    };
+                    crate::watch::event_checked(checked, (self.start, self.len), from, to, Some(&look));
+                    // The counts from before the asking: what the asking
                     // itself noted has this range asked once more.
                     let mut seen = self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
                     // A range inside the one known keeps the wider one
                     // while nothing happened in it.
                     if !(inside && quiet) {
-                        *seen = (from, to, now);
+                        *seen = before.after(&look);
                     }
                 }
                 self.watched.store(1, Ordering::Relaxed);
@@ -4006,21 +4041,33 @@ impl Shadow {
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
     /// refresh of `[from, to)` that trusted the write watch or the guards,
     /// the first 256 bytes of every 64 KiB block of it are read from title
-    /// memory and compared with the copy. A block that differs on three
-    /// refreshes in a row was changed with nothing to tell of it (a write
-    /// through another view of its pages, as DirectStorage's page
-    /// destinations make) and the card reads old bytes there: said with
-    /// the copy and the address. One that differs once is a write of the
-    /// title's that arrived between the refresh and the look.
+    /// memory and compared with the copy. One that differs once is a write
+    /// of the title's that arrived between the refresh and the look.
+    ///
+    /// One that differs on three refreshes in a row was said to have
+    /// changed "with nothing to tell of it". That is not so for a block a
+    /// read of the title's is filling: DirectStorage writes a destination's
+    /// pages through a view of the runtime's own for as long as the read
+    /// and its decoding take, and the guards are told when it is done
+    /// (`crate::watch::title_memory_written`); until then every host copy
+    /// over the pages holds the bytes from before, and a copy is brought up
+    /// to date several times in one submission. The open world's entry had
+    /// 1,024 such blocks in 130 s (run s_we_y2_check), all of them in
+    /// 4 MiB windows, at the rate the reads came in. So the looks are told
+    /// apart ([`REFRESH_CHECKED`], [`refresh_check_line`]): those under a
+    /// read the title has submitted and that is not done
+    /// (`crate::writes::in_flight_over`) count for nothing; a block that
+    /// differs three times in a row with no such read is said, with what
+    /// the guards hold of it; when it matches again it is counted by
+    /// whether a write behind the guards was told there meanwhile; and one
+    /// that has differed for two seconds with nothing told is said once
+    /// more: that one is a copy that keeps old bytes.
     fn refresh_check(&self, from: usize, to: usize) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !refresh_checked() {
             return;
         }
         const SAMPLE: usize = 256;
-        // Blocks found differing: how many refreshes in a row.
-        static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
-        static SAID: AtomicU64 = AtomicU64::new(0);
+        static SAID: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
         let start = self.start as usize;
         let mut title = [0u8; SAMPLE];
         let mut at = from;
@@ -4031,25 +4078,61 @@ impl Shadow {
                 // so these bytes are inside the copy's mapping.
                 let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
-                let map = map.get_or_insert_with(Default::default);
                 if copy == &title[..n] {
-                    map.remove(&at);
+                    if let Some(was) = map.remove(&at)
+                        && was.times >= 3
+                    {
+                        REFRESH_CHECKED[if was.told { 3 } else { 4 }].fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if crate::writes::in_flight_over(at as u64, (at + n) as u64) {
+                    REFRESH_CHECKED[0].fetch_add(1, Ordering::Relaxed);
                 } else {
-                    let times = map.entry(at).or_insert(0);
-                    *times += 1;
-                    if *times == 3 {
-                        let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+                    REFRESH_CHECKED[1].fetch_add(1, Ordering::Relaxed);
+                    let d = map.entry(at).or_insert_with(|| Differing {
+                        times: 0,
+                        since: std::time::Instant::now(),
+                        told: false,
+                        long: false,
+                    });
+                    d.times += 1;
+                    let named = |what: &str, said: u64, d: &Differing| {
+                        tracing::warn!(
+                            said,
+                            copy = self.id,
+                            copy_start = format_args!("{start:#x}"),
+                            copy_bytes = self.len,
+                            address = format_args!("{at:#x}"),
+                            refreshed = format_args!("{from:#x}..{to:#x}"),
+                            on_the_card = self.card.is_some(),
+                            window = self.window,
+                            refreshes = d.times,
+                            ms = d.since.elapsed().as_millis() as u64,
+                            guards = crate::watch::guard_state(at),
+                            copy_zeros = copy.iter().all(|&b| b == 0),
+                            title_zeros = title[..n].iter().all(|&b| b == 0),
+                            "{what} (VICTORY_REFRESH_CHECK=1)"
+                        );
+                    };
+                    if d.times == 3 {
+                        REFRESH_CHECKED[2].fetch_add(1, Ordering::Relaxed);
+                        let said = SAID[0].fetch_add(1, Ordering::Relaxed) + 1;
                         if said <= 64 || said.is_power_of_two() {
-                            tracing::warn!(
+                            named(
+                                "a host copy of title memory differs from it after its refresh, three times in a row, with no read of the title's known in flight there",
                                 said,
-                                copy = self.id,
-                                copy_start = format_args!("{start:#x}"),
-                                copy_bytes = self.len,
-                                address = format_args!("{at:#x}"),
-                                refreshed = format_args!("{from:#x}..{to:#x}"),
-                                on_the_card = self.card.is_some(),
-                                window = self.window,
-                                "a host copy of title memory is stale after its refresh, three times in a row:                                  the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
+                                d,
+                            );
+                        }
+                    }
+                    if d.times >= 3 && !d.long && !d.told && d.since.elapsed() >= std::time::Duration::from_secs(2) {
+                        d.long = true;
+                        REFRESH_CHECKED[5].fetch_add(1, Ordering::Relaxed);
+                        let said = SAID[1].fetch_add(1, Ordering::Relaxed) + 1;
+                        if said <= 64 || said.is_power_of_two() {
+                            named(
+                                "a host copy of title memory has differed from it for two seconds of refreshes, and nothing was told of a write there: the copy keeps old bytes",
+                                said,
+                                d,
                             );
                         }
                     }
@@ -4163,6 +4246,7 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         let (parts, kernel_pages) = (refresh_parts(), refresh_kernel_pages());
+        let landed_check = land_taken() == 2;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -4188,6 +4272,9 @@ impl Shadow {
             let at = page * PAGE;
             let inside = ((at.max(start) - at) as u32, ((at + PAGE).min(end) - at) as u32);
             let seg = ((at.max(from) - at) as u32, ((at + PAGE).min(to) - at) as u32);
+            if landed_check {
+                self.landed_checked(page, last, write.map_or(0, |w| w.mask), seg);
+            }
             let held = if parts { partial.get(&i).map(|(p, r)| (*p, r.as_slice())) } else { None };
             let (need, after) = page_plan(inside, seg, taken, held, last, before, mask);
             for (lo, hi) in need {
@@ -4249,7 +4336,15 @@ impl Shadow {
             while at < to {
                 let n = (STEP - at % STEP).min(to - at);
                 let read = &mut scratch[..n];
-                read.fill(0);
+                // Not zeroed first (0.5 ms a frame of the submitting
+                // thread in the profile of 2026-11-26): the copy writes
+                // every byte of it, the title's or, for a page that is not
+                // there, zero. Only the diagnostics mode that measures by
+                // leaving the copy out writes nothing.
+                #[cfg(feature = "diagnostics")]
+                if crate::copystat::mode() == 2 {
+                    read.fill(0);
+                }
                 crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, n, false);
                 // SAFETY: inside the mapping (`[at, at + n)` is within the
                 // buffer); only the submitting thread writes these bytes.
@@ -4637,6 +4732,133 @@ impl Shadow {
         n
     }
 
+    /// For [`landed`]: `noted` are the 64 KiB pages a landing's taking of
+    /// the kernel's bits noted written at asking `now` (in page order, with
+    /// the kernel pages of each), `runs` the title memory the landing
+    /// wrote of this copy (address, end; closed to refreshes still). A
+    /// page of the copy whose noted kernel pages all lie in the runs and
+    /// hold the bytes the CPU side holds, and that the copy had taken
+    /// whole after the write before, is noted taken at `now` (`mode` 1) or
+    /// kept for the check (`mode` 2).
+    fn landed_pages(&self, noted: &[(usize, crate::watch::Written)], runs: &[(usize, usize)], now: u64, mode: u8) {
+        thread_local! {
+            static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let first = noted.partition_point(|&(page, _)| page < base);
+        // The pages that hold what the CPU side holds: (page, the asking
+        // that found it written before this one, kernel pages).
+        let mut same: Vec<(usize, u64, u32)> = Vec::new();
+        let (mut outside, mut differed) = (0u64, 0u64);
+        {
+            // The CPU side's lock, as the merge holds it: what else writes
+            // these bytes of it (title bytes put in under shader writes)
+            // holds it too, and no refresh writes a range not done with.
+            let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            READ.with(|read| {
+                let mut read = read.borrow_mut();
+                read.resize(KERNEL_PAGE, 0);
+                for &(page, w) in noted[first..].iter().take_while(|&&(page, _)| page * PAGE < end) {
+                    let mut holds = w.mask != 0;
+                    for k in (0..16).filter(|k| w.mask & (1 << k) != 0) {
+                        let (lo, hi) = (page * PAGE + k * KERNEL_PAGE, page * PAGE + (k + 1) * KERNEL_PAGE);
+                        if lo < start || hi > end || !runs.iter().any(|&(a, e)| a <= lo && hi <= e) {
+                            outside += 1;
+                            holds = false;
+                            break;
+                        }
+                        // SAFETY: `[lo, hi)` lies inside the copy (checked
+                        // above), so inside the mapping of its CPU side.
+                        let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start).cast_const(), KERNEL_PAGE) };
+                        if !crate::host::read_into(lo as *const u8, &mut read[..]) || read[..] != *held {
+                            differed += 1;
+                            holds = false;
+                            break;
+                        }
+                    }
+                    if holds {
+                        same.push((page, w.before, w.mask.count_ones()));
+                    }
+                }
+            });
+        }
+        LANDED[4].fetch_add(outside, Ordering::Relaxed);
+        LANDED[5].fetch_add(differed, Ordering::Relaxed);
+        if same.is_empty() {
+            return;
+        }
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut check = (mode == 2).then(|| self.landed_check.lock().unwrap_or_else(|e| e.into_inner()));
+        for (page, before, kernel_pages) in same {
+            let Some(taken) = copied.get_mut(page - base) else {
+                continue;
+            };
+            // Taken whole after the write before this one: with the noted
+            // pages equal, the copy holds the page as of this asking.
+            if *taken == 0 || *taken < before {
+                LANDED[6].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            LANDED[2].fetch_add(1, Ordering::Relaxed);
+            LANDED[3].fetch_add(u64::from(kernel_pages) * KERNEL_PAGE as u64, Ordering::Relaxed);
+            match check.as_mut() {
+                Some(check) => {
+                    check.insert(page, now);
+                }
+                None => *taken = (*taken).max(now),
+            }
+        }
+    }
+
+    /// The check of [`land_taken`], at a refresh that is about to read
+    /// `page` (last noted written at `last`, in the kernel pages `mask`)
+    /// between offsets `seg` of it: if the landing that noted it would
+    /// have had the copy pass the page by, title memory there is compared
+    /// with the CPU side first.
+    fn landed_checked(&self, page: usize, last: u64, mask: u16, seg: (u32, u32)) {
+        let Some(stamp) = self.landed_check.lock().unwrap_or_else(|e| e.into_inner()).remove(&page) else {
+            return;
+        };
+        LANDED[8].fetch_add(1, Ordering::Relaxed);
+        // A later note: the page was written again and found so; with the
+        // switch on it would be read now as well.
+        if last != stamp {
+            LANDED[9].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let start = self.start as usize;
+        let mut read = [0u8; KERNEL_PAGE];
+        for k in (0..16usize).filter(|k| mask & (1 << k) != 0) {
+            let (lo, hi) = ((k * KERNEL_PAGE).max(seg.0 as usize), ((k + 1) * KERNEL_PAGE).min(seg.1 as usize));
+            if lo >= hi {
+                continue;
+            }
+            let at = page * PAGE + lo;
+            // SAFETY: `seg` lies inside the copy's part of the page
+            // (`copy_stale_fine`), so inside the mapping of its CPU side.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), hi - lo) };
+            if !crate::host::read_into(at as *const u8, &mut read[..hi - lo]) || read[..hi - lo] == *held {
+                continue;
+            }
+            // Other bytes than the copy's. Written since the taking (the
+            // kernel holds the bit, and the next asking notes it)?
+            if crate::watch::watched_dirty(page * PAGE + k * KERNEL_PAGE, KERNEL_PAGE).is_some_and(|n| n > 0) {
+                LANDED[9].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if LANDED[10].fetch_add(1, Ordering::Relaxed) < 32 && SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+                tracing::warn!(
+                    copy = format_args!("{:#x}+{:#x}", self.start, self.len),
+                    at = format_args!("{at:#x}"),
+                    "a page a landing's copy would have passed by holds other bytes than the copy, and nothing wrote it since the landing took its bits: with VICTORY_LAND_TAKEN=1 the copy would have kept its own"
+                );
+            }
+            return;
+        }
+    }
+
     /// [`Shadow::card_merge_relay`] with [`fast_merge`]: the same merge,
     /// byte for byte, of what the card changed; but only the stretches
     /// where the fetched bytes differ from the CPU's side
@@ -4783,9 +5005,6 @@ impl Shadow {
             if went_beside {
                 crate::watch::written_beside(start + hull_lo, hull_hi - hull_lo, crate::writes::Cause::Back);
             }
-            if merge_forget() {
-                crate::watch::forgot(start + hull_lo, hull_hi - hull_lo);
-            }
             written
         })
     }
@@ -4805,18 +5024,195 @@ fn fast_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_MERGE").is_none_or(|v| v != "0"))
 }
 
-/// With [`fast_merge`]: whether the merge clears the write-watch bits its
-/// own write set (`crate::watch::forgot`, as `crate::host::copy_mapped`
-/// does for the title's buffer copies; `VICTORY_MERGE_FORGET=1`, off by
-/// default). Left set, the next refresh takes the merged pages for the
-/// title's and copies them into the CPU's side and up to the card again
-/// (likely much of the 94 MB a frame sent up). The risk: a title write to
-/// the same 4 KiB page between the merge's write and the clearing is not
-/// seen by the next refresh, and the copies keep the older bytes until
-/// the title writes the page again.
-fn merge_forget() -> bool {
+/// Whether every refresh's copy is sampled against title memory afterwards
+/// (`VICTORY_REFRESH_CHECK=1`, a diagnostic; `Shadow::refresh_check`).
+pub(crate) fn refresh_checked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_FORGET").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// What the refresh check holds of a block (by the address of its sample)
+/// that a copy was found to differ in, with no read of the title's in
+/// flight over it.
+struct Differing {
+    /// Refreshes in a row that found it so.
+    times: u32,
+    /// Since the first of them.
+    since: std::time::Instant,
+    /// Whether a write behind the guards was told there meanwhile
+    /// ([`refresh_check_told`]).
+    told: bool,
+    /// Whether it was said to have differed for long.
+    long: bool,
+}
+
+static DIFFERING: Mutex<BTreeMap<usize, Differing>> = Mutex::new(BTreeMap::new());
+
+/// The refresh check, since the start: looks that found a block other than
+/// title memory under a read of the title's in flight, and with none;
+/// blocks that differed three times in a row with none; of them, those
+/// that matched again after a write behind the guards was told there, and
+/// those that matched again with none told; blocks that differed for two
+/// seconds with nothing told.
+static REFRESH_CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// A write behind the guards into title memory `[at, at + len)` is done
+/// and told (`crate::watch::title_memory_written`): the blocks the refresh
+/// check holds as differing there were under it. Not to be called with the
+/// guards' lock held.
+pub(crate) fn refresh_check_told(at: usize, len: usize) {
+    if !refresh_checked() || len == 0 {
+        return;
+    }
+    let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
+    // (A sample is a block's first bytes, or a refresh's.)
+    for (_, d) in map.range_mut(at.saturating_sub(255)..at.saturating_add(len)) {
+        d.told = true;
+    }
+}
+
+/// With the frame line, while the refresh check is on.
+pub(crate) fn refresh_check_line() {
+    if !refresh_checked() {
+        return;
+    }
+    let [flying, none, thrice, told, untold, long] = [0, 1, 2, 3, 4, 5].map(|i| REFRESH_CHECKED[i].load(Ordering::Relaxed));
+    let still = DIFFERING.lock().unwrap_or_else(|e| e.into_inner()).values().filter(|d| d.times >= 3).count();
+    tracing::info!(
+        "refresh check, since the start (VICTORY_REFRESH_CHECK=1): {flying} looks found a copy's block other than title memory \
+         while a read the title had submitted was writing there (the guards are told when it is done); {none} with no such read \
+         known; {thrice} blocks differed three times in a row with none, of them {told} matched again once a write behind the \
+         guards was told there, {untold} matched again with none told, {still} differ now; {long} differed for two seconds with \
+         nothing told (those are copies that keep old bytes; each is named)"
+    );
+}
+
+/// Whether a landing takes the kernel's written bits of the private title
+/// memory it wrote, right behind its write, and counts the pages that then
+/// hold what its copy holds as taken by that copy (`VICTORY_LAND_TAKEN=1`;
+/// `=2`: the check; off by default until measured).
+///
+/// Private title memory is write-watched by the kernel, not guarded. A
+/// landing's write sets the pages' bits like any write, the next refresh's
+/// asking finds them, and the landing's own copy reads the pages it has
+/// just been given and compares them with its CPU side: the same bytes,
+/// 22.8 MB a frame in the first room (the census of 2026-11-26, "read and
+/// found equal"), on the submitting thread.
+///
+/// With the switch ([`landed`]): once a landing's pieces are merged, the
+/// bits of what it wrote in private memory are taken (one asking for the
+/// pieces that lie together, `crate::watch::take_landed`) and the pages
+/// they name are noted in the journal at once, as the next asking would
+/// have noted them: every other host copy over those pages learns of the
+/// landing there, as before. The landing's copy then reads each noted
+/// 4 KiB page on the landing thread and compares it with its CPU side; a
+/// 64 KiB page whose noted pages all lie in what the landing wrote, all
+/// compare equal, and which the copy had taken before, is noted taken by
+/// that copy at the landing's asking, and its next refresh passes it by.
+/// Any other page is left to the refresh, as before. A write of the
+/// title's behind the taking sets its bit again; one before it is in the
+/// bytes compared. So there is no moment in which a write is lost, which
+/// `VICTORY_MERGE_FORGET` had (it dropped the bits, the title's of before
+/// the landing among them; it was never run and is gone).
+///
+/// The cost is the taking: a kernel call that resets written bits takes
+/// 30 to 70 microseconds whatever the range, with the journal's lock held
+/// as for every asking. So only landings that fetched [`LANDED_MIN`] bytes
+/// of private memory or more take them (the buffers shaders rewrite whole
+/// are most of the echo); the rest is left to the refresh.
+///
+/// The check (`=2`) takes and notes as `=1` and marks nothing: the refresh
+/// reads the pages as before, and for each page `=1` would have marked it
+/// compares title memory with the CPU side first. A page that differs,
+/// whose bit the kernel does not hold (nothing wrote it since the taking)
+/// and of which the journal holds no later note, is one `=1` would have
+/// left with other bytes than the title's: counted and named, 0 is what
+/// `=1` needs. With `VICTORY_REFRESH_CHECK=1` beside it every copy's
+/// refreshes are sampled against title memory as well: the note made at
+/// the landing must leave no other copy behind.
+pub(crate) fn land_taken() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LAND_TAKEN").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// The bytes of private title memory a landing must have fetched for it
+/// to take the kernel's bits ([`land_taken`]): a taking costs about what
+/// reading and comparing that much costs.
+const LANDED_MIN: usize = 512 << 10;
+
+/// Since the last frame line ([`land_taken`]): landings that took the
+/// bits, kernel pages noted by them, 64 KiB pages noted taken (or, with
+/// the check, that would have been), the bytes of the kernel pages in
+/// them (the echo that is not read again), pages left to the refresh
+/// because a noted kernel page lay outside what the landing wrote, because
+/// one differed from the CPU side, because the copy had not taken the page
+/// before; landings below [`LANDED_MIN`]; and for the check, since the
+/// start: pages a refresh looked at, those written again since (the
+/// kernel's bit, or a later note), and the finds.
+static LANDED: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// A landing merged the fetched pieces `pieces` (copy, offsets in it)
+/// into title memory and the copies' CPU sides, and their ranges are
+/// still closed to refreshes: see [`land_taken`].
+pub(crate) fn landed(pieces: &[(Arc<Shadow>, usize, usize)]) {
+    let mode = land_taken();
+    if mode == 0 {
+        return;
+    }
+    // The pieces in private memory, as title addresses.
+    let mut private: Vec<(&Arc<Shadow>, usize, usize)> = pieces
+        .iter()
+        .filter(|(shadow, lo, hi)| lo < hi && shadow.card.is_some() && shadow.place.is_none())
+        .map(|(shadow, lo, hi)| (shadow, shadow.start as usize + lo, shadow.start as usize + hi))
+        .filter(|&(_, lo, _)| crate::inplace::view_at(lo).is_none())
+        .collect();
+    let bytes: usize = private.iter().map(|p| p.2 - p.1).sum();
+    if bytes < LANDED_MIN {
+        LANDED[7].fetch_add(u64::from(bytes > 0), Ordering::Relaxed);
+        return;
+    }
+    let ranges: Vec<(usize, usize)> =
+        private.iter().map(|&(_, lo, hi)| (lo / KERNEL_PAGE * KERNEL_PAGE, hi.next_multiple_of(KERNEL_PAGE))).collect();
+    let (now, noted) = crate::watch::take_landed(&ranges);
+    LANDED[0].fetch_add(1, Ordering::Relaxed);
+    LANDED[1].fetch_add(noted.iter().map(|(_, w)| u64::from(w.mask.count_ones())).sum(), Ordering::Relaxed);
+    if noted.is_empty() {
+        return;
+    }
+    // Copy by copy, each with what the landing wrote of it.
+    private.sort_unstable_by_key(|&(shadow, lo, _)| (Arc::as_ptr(shadow) as usize, lo));
+    for of_one in private.chunk_by(|a, b| Arc::ptr_eq(a.0, b.0)) {
+        let runs: Vec<(usize, usize)> = of_one.iter().map(|&(_, lo, hi)| (lo, hi)).collect();
+        of_one[0].0.landed_pages(&noted, &runs, now, mode);
+    }
+}
+
+/// The kernel's page: what its written bits stand for.
+const KERNEL_PAGE: usize = 4096;
+
+/// With the frame line.
+pub(crate) fn landed_line(frames: f64) {
+    let mode = land_taken();
+    if mode == 0 {
+        return;
+    }
+    let [takings, kernel_pages, marked, bytes, outside, differed, not_taken, small] =
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| LANDED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let [looked, written_since, finds] = [8, 9, 10].map(|i| LANDED[i].load(Ordering::Relaxed));
+    tracing::info!(
+        "landings' written bits taken in private title memory, per frame (VICTORY_LAND_TAKEN={mode}): {takings:.1} landings took \
+         them ({small:.1} fetched too little there and left them to the refresh), {kernel_pages:.0} 4 KiB pages noted; {marked:.0} \
+         pages of 64 KiB {} by the landing's copy, {:.2} MB it does not read again; left to the refresh: {outside:.0} with a noted \
+         page outside what the landing wrote, {differed:.0} that differ from the copy (the title wrote there), {not_taken:.0} the \
+         copy had not taken before; the check, since the start: {looked} such pages looked at by a refresh, {written_since} \
+         written again since, {finds} with other bytes than the copy's and nothing to say so (0 is what =1 needs)",
+        if mode == 1 { "noted taken" } else { "that would be noted taken" },
+        bytes / 1e6,
+    );
 }
 
 /// Equal bytes over which [`Shadow::card_merge_relay_fast`] joins changed
@@ -5690,6 +6086,103 @@ mod card_merge_tests {
         assert!(!super::note_changed(&mut dirty, 16, 32));
         assert!(!super::note_changed(&mut dirty, 100, 200));
         assert_eq!(dirty, [(8, 32), (100, 200)]);
+    }
+
+    /// A landing's taking of the kernel's written bits
+    /// (`VICTORY_LAND_TAKEN`), on a copy of write-watched memory: the page
+    /// that holds only what the landing wrote is noted taken by its copy;
+    /// one the title wrote too, and one the landing did not write, are left
+    /// to the refresh; the journal names all three to every other asker.
+    /// The check marks nothing, and finds a page whose bytes are not the
+    /// copy's with nothing written since, and not one written since.
+    #[test]
+    fn a_landings_pages_are_taken_where_they_hold_the_copys_bytes() {
+        use super::{KERNEL_PAGE, LANDED, PAGE};
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 4 * PAGE;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(title, 0);
+        let mut side = vec![0u8; LEN];
+        let mut shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, title as u64, LEN as u64);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            size: 0,
+            flagged: Mutex::default(),
+            me: std::sync::OnceLock::new(),
+        });
+        // Both sides get `value` at `at`, as a landing's merge leaves them;
+        // or title memory alone, as a write of the title's does.
+        let put = |at: usize, value: u8, both: bool| {
+            // SAFETY: inside the allocation and inside `side`, which nothing
+            // else touches in this test.
+            unsafe {
+                ((title + at) as *mut u8).write_volatile(value);
+                if both {
+                    shadow.data.add(at).write(value);
+                }
+            }
+        };
+        // The copy has taken everything, as of an asking that found nothing.
+        let (taken, found) = crate::watch::writes_fine(title, title + LEN, false).expect("watched");
+        assert_eq!(found, []);
+        shadow.copied.lock().unwrap().fill(taken);
+        // A landing writes pages 1 and 2; the title writes page 2 beside
+        // it, and page 3.
+        put(PAGE + 2 * KERNEL_PAGE + 5, 7, true);
+        put(PAGE + 3 * KERNEL_PAGE, 8, true);
+        put(2 * PAGE + 4 * KERNEL_PAGE, 9, true);
+        put(2 * PAGE + 5 * KERNEL_PAGE + 1, 10, false);
+        put(3 * PAGE + 1, 11, false);
+        let runs = [(title + PAGE, title + 3 * PAGE)];
+        let (now, noted) = crate::watch::take_landed(&runs);
+        assert!(now > taken);
+        let page = |k: usize| title / PAGE + k;
+        assert_eq!(noted.iter().map(|n| (n.0, n.1.mask)).collect::<Vec<_>>(), [(page(1), 0b1100), (page(2), 0b11_0000)]);
+        shadow.landed_pages(&noted, &runs, now, 1);
+        assert_eq!(*shadow.copied.lock().unwrap(), [taken, now, taken, taken], "page 1 alone holds the copy's bytes");
+        // Every other asker finds the landing's pages in the journal, and
+        // the title's page 3 by the kernel's bit, which nobody took.
+        let (later, found) = crate::watch::writes_fine(title, title + LEN, false).expect("watched");
+        assert_eq!(found.iter().map(|f| (f.0, f.1.at)).collect::<Vec<_>>(), [(page(1), now), (page(2), now), (page(3), later)]);
+        // The check: nothing is marked, the page is kept to be looked at.
+        put(PAGE + 8, 12, true);
+        let (again, noted) = crate::watch::take_landed(&runs);
+        shadow.landed_pages(&noted, &runs, again, 2);
+        assert_eq!(shadow.copied.lock().unwrap()[1], now, "the check marks nothing");
+        let counts = || [8, 9, 10].map(|i| LANDED[i].load(Relaxed));
+        let before = counts();
+        // The page as the landing left it: looked at, no find.
+        shadow.landed_checked(page(1), again, 0b1, (0, PAGE as u32));
+        assert_eq!(counts(), [before[0] + 1, before[1], before[2]]);
+        // Other bytes in the copy than in title memory, and nothing wrote
+        // the page since the taking: a find.
+        shadow.landed_pages(&noted, &runs, again, 2);
+        // SAFETY: inside `side`.
+        unsafe { shadow.data.add(PAGE + 8).write(13) };
+        shadow.landed_checked(page(1), again, 0b1, (0, PAGE as u32));
+        assert_eq!(counts(), [before[0] + 2, before[1], before[2] + 1]);
+        // Written by the title since the taking: the kernel holds the bit,
+        // and the next asking will name it. No find.
+        // SAFETY: as above.
+        unsafe { shadow.data.add(PAGE + 8).write(12) };
+        shadow.landed_pages(&noted, &runs, again, 2);
+        put(PAGE + 9, 14, false);
+        shadow.landed_checked(page(1), again, 0b1, (0, PAGE as u32));
+        assert_eq!(counts(), [before[0] + 3, before[1] + 1, before[2] + 1]);
+        drop(shadow);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
     }
 
     /// The mixed landing the fetch inside flights must survive, on a real

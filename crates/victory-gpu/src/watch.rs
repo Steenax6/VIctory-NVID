@@ -21,7 +21,9 @@
 //! at the guarded address (the guard makes every view of the page
 //! read-only, [`open`] gives them all back; not a page of more than
 //! [`MANY_VIEWS`] views). A
-//! system call writing into a guarded block fails (none is known to).
+//! system call writing into a guarded block fails; the runtime opens the
+//! blocks before the title's file reads ([`writing`]) and says when a read
+//! is done ([`kernel_wrote`]), for the blocks guarded again meanwhile.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -182,9 +184,29 @@ impl Pages {
 /// faults, a write of ours that opens or marks it, the runtime mapping
 /// its memory anew, a page the journal notes. Each raises a count for its
 /// 4 MiB of title memory ([`event`]), and a copy remembers the counts of
-/// the range it last brought up to date: the same counts, nothing to ask.
-/// Private memory is not left out: only the kernel knows what was written
-/// there, and it must be asked.
+/// the range it last brought up to date ([`Seen`]): the same counts,
+/// nothing to ask. Private memory is not left out: only the kernel knows
+/// what was written there, and it must be asked.
+///
+/// Every count is raised with the lock held under which the thing counted
+/// becomes true for an asking (the guards' lock, the journal's), so a look
+/// at the counts without a lock errs to one side only: a change the look
+/// did not see is counted after it, and the next refresh asks.
+///
+/// One thing has no event: a block noted absent (not committed) that is
+/// committed with nothing told (the title committing part of a reservation
+/// of its own; whatever the runtime maps is told). An asking finds that
+/// when the guards look such blocks up again, once in [`absent_frames`]
+/// frames, so a copy whose range held absent blocks asks once in each such
+/// stretch ([`Seen::quiet`]) and learns of it as late as it did before.
+///
+/// The check (2) decides with the locks held ([`Look::quiet`]). Its first
+/// form decided before the asking took them, and whatever the asking then
+/// found counted as a find: 7 in the prologue and 2 at the open world's
+/// entry (runs s_g9_p_check and s_we_g9_check of 2026-11-26), every one a
+/// copy shaders or the title write. A write whose fault or mark was
+/// counted in that moment is such a find, and with 1 the next refresh
+/// would have asked for it; those are counted apart now.
 pub(crate) fn events_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_EVENTS").as_deref().map(str::trim) {
@@ -231,37 +253,180 @@ pub(crate) fn events(start: usize, end: usize) -> u64 {
         .sum()
 }
 
+/// The frames an answer about absent blocks holds for, numbered: what the
+/// guards' cache of absent runs goes by ([`absent_once`]).
+fn absent_stretch() -> u64 {
+    crate::frame::current() / absent_frames()
+}
+
+/// [`Seen::absent`] of a range that must be asked every time: its absent
+/// blocks are looked up at every check (no cache), or the kernel's write
+/// watch answered for it and not the guards.
+const EVERY_TIME: u64 = u64::MAX;
+
+/// What a copy in view memory remembers of the range it last brought up to
+/// date by asking ([`events_mode`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Seen {
+    /// The range.
+    from: usize,
+    to: usize,
+    /// [`events`] of it, taken just before that asking.
+    events: u64,
+    /// If blocks of it were noted absent after that asking: the stretch of
+    /// frames ([`absent_stretch`]) in which that was looked up, or
+    /// [`EVERY_TIME`].
+    absent: Option<u64>,
+}
+
+impl Seen {
+    /// What an asking of `[from, to)` that begins now leaves a copy to
+    /// remember, once `look` has been through it: call before the asking.
+    pub(crate) fn before(from: usize, to: usize) -> Seen {
+        Seen { from, to, events: events(from, to), absent: None }
+    }
+
+    /// [`Seen::before`] with what the asking learned of absent blocks.
+    pub(crate) fn after(self, look: &Look) -> Seen {
+        Seen { absent: look.absent, ..self }
+    }
+
+    /// Whether `[from, to)` lies in the range.
+    pub(crate) fn holds(&self, from: usize, to: usize) -> bool {
+        self.from <= from && to <= self.to
+    }
+
+    /// Whether nothing happened in the range since it was brought up to
+    /// date, as far as the counts say now: a refresh inside it then has
+    /// nothing to ask. With absent blocks in it, only within the frames
+    /// their lookup holds for.
+    pub(crate) fn quiet(&self) -> bool {
+        self.uncounted() && self.absent.is_none_or(|stretch| stretch == absent_stretch())
+    }
+
+    /// Whether nothing was counted in the range since it was brought up to
+    /// date, whatever the frames of its absent blocks' lookup say. (Not
+    /// for a range that is asked every time: counts say nothing of it.)
+    pub(crate) fn uncounted(&self) -> bool {
+        self.from < self.to && events(self.from, self.to) == self.events && self.absent != Some(EVERY_TIME)
+    }
+}
+
+/// What an asking is handed by a copy in view memory and tells it besides
+/// the pages written ([`writes_fine_look`]).
+#[derive(Debug, Default)]
+pub(crate) struct Look {
+    /// In, for the check: what the copy remembers.
+    pub(crate) seen: Option<Seen>,
+    /// Out: [`Seen::quiet`] of `seen`, taken with the journal's lock held
+    /// and (for view memory) the guards', before the asking took anything:
+    /// nothing can be counted between this look and what the asking finds.
+    pub(crate) quiet: bool,
+    /// Out: [`Seen::uncounted`] of `seen`, taken at the same moment.
+    pub(crate) uncounted: bool,
+    /// Out: [`Seen::absent`] for the range asked.
+    pub(crate) absent: Option<u64>,
+    /// Out, for the check's warning: the first block the guards reported
+    /// written, the kernel pages of it, and what it was to them.
+    pub(crate) found: Option<(usize, u16, &'static str)>,
+    /// Out: whether the guards reported a block that was not one noted
+    /// absent and found there now (what has no event, and is looked for
+    /// once in [`absent_frames`] frames).
+    pub(crate) other: bool,
+}
+
+impl Look {
+    fn found(&mut self, block: usize, mask: u16, what: &'static str, arrived: bool) {
+        self.found.get_or_insert((block, mask, what));
+        self.other |= !arrived;
+    }
+
+    /// Looks at what the copy remembers, with the asking's locks held.
+    fn look(&mut self) {
+        self.quiet = self.seen.is_some_and(|seen| seen.quiet());
+        self.uncounted = self.seen.is_some_and(|seen| seen.uncounted());
+    }
+}
+
 /// Since the last frame line, of the refreshes of ranges in view memory
 /// with [`events_mode`] on: those with nothing happened since the range
 /// was last brought up to date (left out, or with the check asked all the
 /// same) and nothing to copy; those of them that had bytes to copy all the
 /// same (the check's finds: an event that was not counted); those asked
-/// because something had happened; and those asked because the range was
-/// not inside the one last brought up to date.
-static EVENT_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// because something had happened; those asked because the range was not
+/// inside the one last brought up to date; (the check) those that had
+/// nothing happened when the refresh looked, had something counted before
+/// the asking held its locks, and found bytes to copy; and those asked
+/// because the frames their absent blocks' lookup holds for had passed,
+/// with nothing counted, that found bytes to copy: in blocks that had been
+/// absent and nowhere else (what the turn is for), and elsewhere (bytes no
+/// event announced, which 1 takes that many frames late).
+static EVENT_CHECKS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
-/// A refresh of `[from, to)` of the copy `[start, start + len)` in view
-/// memory was looked at: `quiet` whether nothing had happened there since
-/// it was last brought up to date, `inside` whether it lay in the range
-/// that was, `copied` the bytes the asking found to copy (`None`: it was
-/// left out).
-pub(crate) fn event_checked(quiet: bool, inside: bool, copied: Option<usize>, copy: (u64, u64), from: usize, to: usize) {
+/// What a refresh of a range in view memory came to ([`event_checked`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Checked {
+    /// Whether the range lay in the one last brought up to date.
+    pub(crate) inside: bool,
+    /// Whether nothing had happened there when the refresh looked, without
+    /// a lock (what 1 goes by).
+    pub(crate) quiet: bool,
+    /// The same with the asking's locks held ([`Look::quiet`]); as `quiet`
+    /// where nothing was asked.
+    pub(crate) quiet_locked: bool,
+    /// Whether nothing was counted there, with the asking's locks held and
+    /// whatever the frames of its absent blocks say ([`Look::uncounted`]).
+    pub(crate) uncounted: bool,
+    /// The bytes the asking found to copy (`None`: it was left out).
+    pub(crate) copied: Option<usize>,
+}
+
+/// A refresh of `[from, to)` of the copy `[start, start + len)` (`copy`)
+/// in view memory was looked at; `look`: its asking's, if it asked.
+pub(crate) fn event_checked(c: Checked, copy: (u64, u64), from: usize, to: usize, look: Option<&Look>) {
     use std::sync::atomic::Ordering::Relaxed;
-    let place = match (inside, quiet, copied) {
+    let bytes = c.copied.is_some_and(|n| n > 0);
+    let found = look.and_then(|look| look.found);
+    // Whether all the guards reported were blocks that had been absent
+    // (and they reported some: bytes with nothing reported are a note in
+    // the journal).
+    let arrivals = found.is_some() && look.is_some_and(|look| !look.other);
+    let place = match (c.inside, c.quiet, c.quiet_locked) {
         (false, _, _) => 3,
-        (true, false, _) => 2,
-        (true, true, Some(n)) if n > 0 => 1,
-        (true, true, _) => 0,
+        (true, true, true) if bytes => 1,
+        (true, true, true) => 0,
+        // Counted between the look and the asking: 1 leaves this refresh
+        // out and asks at the next.
+        (true, true, false) if bytes => 4,
+        // Asked for its absent blocks' sake alone, and bytes were there.
+        (true, false, false) if bytes && c.uncounted => {
+            if arrivals {
+                5
+            } else {
+                6
+            }
+        }
+        (true, _, _) => 2,
     };
     EVENT_CHECKS[place].fetch_add(1, Relaxed);
-    if place == 1 {
+    if place == 1 || place == 6 {
         static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if SAID.fetch_add(1, Relaxed) < 32 {
+            let found = match found {
+                Some((block, mask, what)) => format!("the guards reported block {:#x} (kernel pages {mask:#06x}): {what}", block.wrapping_mul(BLOCK)),
+                None => "the guards reported nothing: a note in the journal later than the copy's own".to_string(),
+            };
             tracing::warn!(
                 copy = format_args!("{:#x}+{:#x}", copy.0, copy.1),
                 range = format_args!("{from:#x}..{to:#x}"),
-                copied = copied.unwrap_or(0),
-                "a refresh found bytes to copy where no event was counted since the range was last brought up to date: with VICTORY_REFRESH_EVENTS=1 the copy would have kept the bytes from before"
+                copied = c.copied.unwrap_or(0),
+                found,
+                "a refresh found bytes to copy where no event was counted since the range was last brought up to date (looked at with the asking's locks held): with VICTORY_REFRESH_EVENTS=1 the copy would have kept the bytes from before{}",
+                if place == 6 {
+                    " until its absent blocks were looked up again (it was asked for their sake, and these are not those blocks)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -274,14 +439,20 @@ pub(crate) fn events_line(frames: f64) {
     if mode == 0 {
         return;
     }
-    let [quiet, wrong, happened, outside] = [0, 1, 2, 3].map(|i| EVENT_CHECKS[i].swap(0, Relaxed));
+    let [quiet, wrong, happened, outside, between, arrived, late] = [0, 1, 2, 3, 4, 5, 6].map(|i| EVENT_CHECKS[i].swap(0, Relaxed));
     tracing::info!(
         "refreshes by event, of ranges in view memory, per frame (VICTORY_REFRESH_EVENTS={mode}): {:.0} with nothing happened since \
          the range was last brought up to date ({}); {:.0} asked because something had; {:.0} asked because the range was not \
-         inside that one; since the last line {wrong} that the check found with bytes to copy and no event (0 is what =1 needs)",
+         inside that one; since the last line {wrong} that the check found with bytes to copy and no event, looked at with the \
+         asking's locks held (0 is what =1 needs), and {between} with bytes to copy whose event was counted between the \
+         refresh's look and its asking (=1 asks for those at the next refresh; the check's first form took them for finds); \
+         of the ranges asked only because the frames their absent blocks' lookup holds for had passed, {arrived} found blocks \
+         that had been absent there with nothing told (what that asking is for) and {late} found other bytes no event had \
+         announced (0 is what =1 needs: it takes those up to VICTORY_ABSENT_FRAMES frames late, and never in a range with no \
+         absent block)",
         quiet as f64 / frames,
         if mode == 1 { "left out" } else { "asked all the same: the check" },
-        happened as f64 / frames,
+        (happened + arrived + late) as f64 / frames,
         outside as f64 / frames,
     );
 }
@@ -536,12 +707,21 @@ pub(crate) fn ask_once_end() {
     }
 }
 
-/// We wrote title memory `[at, at + len)` while a submission's one asking
-/// stands (the title's buffer copies, done at submission): its pages count
-/// as written after that asking, so the refreshes that follow copy them.
+/// We wrote title memory `[at, at + len)` (the title's buffer copies, done
+/// at submission): its pages count as written from now on, so the
+/// refreshes that follow copy them.
+///
+/// Whether or not a submission's one asking stands. The copy clears the
+/// kernel's written bits of its destination ([`forgot`]), so this note is
+/// all that tells of it: it was made only while an asking stood, and a
+/// copy made after a step that ended the asking, or in a submission that
+/// asked the kernel about nothing, was told to nobody. A host copy of its
+/// destination that was brought up to date later kept the bytes from
+/// before it, and with them whatever the title had written into the same
+/// 4 KiB pages since the last asking.
 pub(crate) fn wrote(at: usize, len: usize) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
+    if len == 0 {
         return;
     }
     j.asked += 1;
@@ -551,10 +731,86 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // copy that takes it (copied at `now`, written at `now + 1`): copied
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
-    j.ahead_asked = now;
+    if j.kept {
+        j.ahead_asked = now;
+    }
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         note(&mut j.written, page, now, FULL);
     }
+}
+
+/// For a landing that wrote private title memory (`crate::shadow::landed`):
+/// takes the kernel's written bits of `ranges` now, and notes the pages
+/// they name as written at an asking of its own, whose number is returned
+/// with the pages noted (each with what the journal now holds of it, in
+/// page order). Ranges that lie close together are one kernel asking; one
+/// that is not write-watched memory of one reservation is left as it is.
+///
+/// What it is for: the landing's write sets those bits, and the next
+/// refresh's asking took them for the title's, so the landing's own copy
+/// read the pages it had just been given (22.8 MB a frame in the first
+/// room). Taken here, right behind the write and with the journal's lock
+/// held as every asking holds it, the bits stand for "written up to now",
+/// by the landing or by the title; the note tells every other copy over
+/// the pages, exactly as the next asking would have; and the landing's
+/// copy can compare each page with its own bytes and count it taken if
+/// they are the same. A write of the title's after this sets the bit
+/// again and is found by the next asking, as ever.
+pub(crate) fn take_landed(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, Written)>) {
+    let mut pieces: Vec<(usize, usize)> =
+        ranges.iter().filter(|r| r.0 < r.1).map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE))).collect();
+    pieces.sort_unstable();
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    // As in `wrote`: an asking that stands moves with the note.
+    if j.kept {
+        j.ahead_asked = now;
+    }
+    let mut noted = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 <= last + LANDED_GAP && last.max(pieces[k].1) - first <= AHEAD_MAX {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        take_run(j, &pieces[i..k], now, &mut noted);
+        i = k;
+    }
+    (now, noted)
+}
+
+/// Pieces of one landing closer than this are one kernel asking
+/// ([`take_landed`]): 1 MiB. The pages between are asked about too, and
+/// what the title wrote there is noted a little earlier than it would
+/// have been.
+const LANDED_GAP: usize = (1 << 20) / PAGE;
+
+/// [`take_landed`] for `pieces` (page ranges in order): one kernel asking
+/// for all of them, by halves if it fails.
+fn take_run(j: &mut Journal, pieces: &[(usize, usize)], now: u64, noted: &mut Vec<(usize, Written)>) {
+    let Some(&(first, _)) = pieces.first() else {
+        return;
+    };
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if ask_kernel_as(j, first, last, now) {
+        j.written.each(first, last, |page, w| {
+            if w.at == now {
+                noted.push((page, *w));
+            }
+        });
+        return;
+    }
+    if pieces.len() < 2 {
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    take_run(j, a, now, noted);
+    take_run(j, b, now, noted);
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -579,6 +835,12 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+    let now = j.ahead_asked;
+    ask_kernel_as(j, first, last, now)
+}
+
+/// [`ask_kernel`], with what is found noted under asking `now`.
+fn ask_kernel_as(j: &mut Journal, first: usize, last: usize, now: u64) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -607,7 +869,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    let now = j.ahead_asked;
     note_found(j, count, now);
     true
 }
@@ -641,11 +902,23 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 
 /// [`writes`], with what the journal knows of where in each page.
 pub(crate) fn writes_fine(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, Written)>)> {
+    writes_fine_look(start, end, guarded, &mut Look::default())
+}
+
+/// [`writes_fine`] for a copy that goes by events ([`events_mode`]):
+/// `look` takes what the copy remembers and brings back what the asking
+/// learned beside the pages.
+pub(crate) fn writes_fine_look(start: usize, end: usize, guarded: bool, look: &mut Look) -> Option<(u64, Vec<(usize, Written)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // Where the kernel's write watch answers (here and below) no event
+    // tells of a write: such a range is asked every time. The guards' own
+    // look, with their lock too, replaces this one.
+    look.look();
+    look.absent = Some(EVERY_TIME);
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((j.ahead_asked, entries(j, first, last)));
@@ -690,7 +963,7 @@ pub(crate) fn writes_fine(start: usize, end: usize, guarded: bool) -> Option<(u6
         // While the submission's one asking stands, what the guards found
         // unmapped stays so for it (see [`absent_once`]).
         let epoch = once().then_some(Epoch { submission: j.once_id, standing: j.kept });
-        let written = guard_fine(first * PAGE, last * PAGE, epoch);
+        let written = guard_fine(first * PAGE, last * PAGE, epoch, look);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
@@ -1120,15 +1393,15 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// [`guard_fine`] without the kernel pages: the pages written.
 #[cfg(test)]
 fn guard(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<usize>> {
-    guard_fine(start, end, epoch).map(|w| w.into_iter().map(|(page, _)| page).collect())
+    guard_fine(start, end, epoch, &mut Look::default()).map(|w| w.into_iter().map(|(page, _)| page).collect())
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 /// `epoch`: the submission the check is made for, with [`once`]
-/// ([`absent_once`], [`hot_blocks`]).
-fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<(usize, u16)>> {
+/// ([`absent_once`], [`hot_blocks`]). `look`: see [`Look`].
+fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -> Option<Vec<(usize, u16)>> {
     count(10);
     #[cfg(feature = "diagnostics")]
     if let Some(e) = epoch {
@@ -1154,6 +1427,11 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<(usi
         }
         g = guards();
     }
+    // With this lock and the journal's (the caller's) nothing is counted
+    // until the check is through: what it finds below is what these counts
+    // stand for.
+    look.look();
+    look.absent = None;
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -1174,7 +1452,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<(usi
     let mut uncommitted_until = first;
     // Unmapped blocks found so stay so for the frame ([`absent_once`]);
     // blocks that would not be protected, for the submission.
-    let absent_epoch = epoch.filter(|_| absent_once()).map(|_| crate::frame::current() / absent_frames());
+    let absent_epoch = epoch.filter(|_| absent_once()).map(|_| absent_stretch());
     let unguardable_epoch = epoch.filter(|_| absent_once()).map(|e| e.submission);
     let hot_epoch = epoch.filter(|_| hot_blocks());
     // With `VICTORY_GUARD_UNLOCKED`: the changes of protection this check
@@ -1188,6 +1466,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<(usi
         }
         let is_clean = word & (1 << (block % 64)) != 0;
         let mut open = block < last && !is_clean;
+        let mut arrived = false;
         if open && g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
@@ -1206,7 +1485,15 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<(usi
             }
             open = block >= uncommitted_until;
             if open {
+                // There now, and nothing told of it (a mapping the runtime
+                // tells takes the block out of the absent ones): no event
+                // was counted for this.
                 g.absent.remove(&block);
+                arrived = true;
+            } else {
+                // Still absent, by a lookup that holds for some frames
+                // (or is made at every check): see [`Seen::quiet`].
+                look.absent = Some(absent_epoch.unwrap_or(EVERY_TIME));
             }
         }
         if open {
@@ -1222,6 +1509,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<(usi
                         }
                         count(8);
                         written.push((block, FULL));
+                        look.found(block, FULL, "left open for a while (VICTORY_HOT_BLOCKS)", false);
                     }
                     if let Some(from) = run.take() {
                         protect(&mut g, from, block, epoch);
@@ -1240,6 +1528,16 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<(usi
                 // the kernel pages that may have been written.
                 let mask = g.dirty.remove(&block).unwrap_or(FULL);
                 written.push((block, mask));
+                look.found(
+                    block,
+                    mask,
+                    if arrived {
+                        "noted absent, there now with nothing told of it, and guarded meanwhile as another view of its pages"
+                    } else {
+                        "guarded and counted written (a fault, a write of ours, or guarded as another view of its pages)"
+                    },
+                    arrived,
+                );
                 if defer {
                     if g.partly.remove(&block) {
                         later.rearm.push(block);
@@ -1251,6 +1549,16 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>) -> Option<Vec<(usi
             };
             if !g.protected.contains(&block) && !written.last().is_some_and(|&(b, _)| b == block) {
                 written.push((block, FULL));
+                look.found(
+                    block,
+                    FULL,
+                    if arrived {
+                        "noted absent, and there now with nothing told of it"
+                    } else {
+                        "not guarded (opened, mapped anew, never taken, or not to be guarded)"
+                    },
+                    arrived,
+                );
             }
             if rearmed {
                 g.clean.insert(block);
@@ -1448,12 +1756,23 @@ fn plan_protect_run(g: &mut Guards, from: usize, to: usize, later: &mut Deferred
 /// know but do not hold guarded ([`unlocked_guards`]): if the block is
 /// read-only (a check made it so after something opened it), makes it
 /// writable and notes it written; true if that was done.
+///
+/// Known to the guards, or lying in a view the runtime told of
+/// (`crate::inplace::view_at`). A check notes its blocks guarded, lets
+/// the lock go and then changes their protection; a mapping of the
+/// runtime's that takes the lock in between drops all the guards knew of
+/// the blocks, and the check's call then makes the new view read-only
+/// with nothing left to say it was ours. The title's first write there
+/// faulted, found no guard, and went on as an access violation of the
+/// title's. The runtime maps the title's views read-write and nothing but
+/// a guard makes one read-only, so a read-only block of such a view is a
+/// guard's.
 fn reopen_stray(g: &mut Guards, at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
     };
     let block = at / BLOCK;
-    if g.protected.contains(&block) || !g.views.contains(&block) {
+    if g.protected.contains(&block) || !(g.views.contains(&block) || crate::inplace::view_at(at).is_some()) {
         return false;
     }
     // SAFETY: plain data filled in by the query.
@@ -2198,6 +2517,67 @@ pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
     crate::descriptor::host::remapped(at, len, cause);
 }
 
+/// Since the start: reads of the kernel's into title memory that finished
+/// ([`kernel_wrote`]), their bytes, and the blocks under them that a check
+/// had guarded again while the kernel was still writing.
+pub(crate) static KERNEL_WROTE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The kernel has written title memory `[at, at + len)`: a read of the
+/// title's into its own memory, of which [`writing`] was told before it
+/// began, is done. The runtime calls it (as `kernel_wrote`).
+///
+/// [`writing`] opens the guarded blocks, and nothing holds them open: a
+/// check that comes while the kernel is still writing reports them
+/// written, guards them again and has its copy read what is there so far.
+/// A read through the system's cache fails on such a block (and the title
+/// reads again); one that had the pages locked when it began (a file
+/// opened without buffering) goes on into them, with no fault and nothing
+/// counted, and every host copy over them kept the bytes of the moment it
+/// looked. So the blocks guarded again count as written once more now
+/// that the bytes are all there, at every view of their pages
+/// ([`mark_with_views`], or opened where [`mark_only`] is off), and the
+/// write is numbered for the texture pass as DirectStorage's are
+/// ([`title_memory_written`]). Upstream holds such blocks open over the
+/// read and marks them at its end (its c75fdba; pull request 3231 there
+/// carries that to overlapped reads, which this title does not import).
+pub fn kernel_wrote(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    {
+        let mut g = guards();
+        let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
+        KERNEL_WROTE[0].fetch_add(1, Relaxed);
+        KERNEL_WROTE[1].fetch_add(len as u64, Relaxed);
+        KERNEL_WROTE[2].fetch_add(guarded, Relaxed);
+        if guarded != 0 {
+            if mark_only() {
+                mark_with_views(&mut g, at, end);
+            } else {
+                open(&mut g, at, end);
+            }
+        }
+    }
+    title_memory_written(at, len, false);
+}
+
+/// With the frame line, once the kernel has read into title memory.
+pub(crate) fn kernel_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [reads, bytes, guarded] = [0, 1, 2].map(|i| KERNEL_WROTE[i].load(Relaxed));
+    if reads == 0 {
+        return;
+    }
+    tracing::info!(
+        "reads of the kernel's into title memory that finished, since the start: {reads} ({} MB); {guarded} blocks under them \
+         had been guarded again while the kernel was writing and count as written once more (without that, {guarded} blocks \
+         of host copies with the bytes of the moment they were looked at)",
+        bytes >> 20
+    );
+}
+
 /// After a write of the layer's own into title memory `[at, at + len)` that
 /// went through a view of its own of the same pages (`crate::beside`): the
 /// guarded blocks there, and at every other view of their pages, count as
@@ -2264,7 +2644,7 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
 /// How many pages of `[at, at + len)` the kernel's write watch holds as
 /// written (up to a few), without taking the bits; `None` if the range is
 /// not write-watched memory of one reservation.
-fn watched_dirty(at: usize, len: usize) -> Option<usize> {
+pub(crate) fn watched_dirty(at: usize, len: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     let mut found = [0usize; 8];
     let mut count = found.len();
@@ -2367,6 +2747,23 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     // A placed texture there changed with no descriptor written.
     crate::descriptor::host::page_written(at, len, pages);
+    // The refresh check: what it holds as differing there was under this
+    // write (the guards' lock is let go by now).
+    crate::shadow::refresh_check_told(at, len);
+}
+
+/// What the guards hold of the block of `at`, in words (for the refresh
+/// check's warnings).
+pub(crate) fn guard_state(at: usize) -> &'static str {
+    let g = guards();
+    let block = at / BLOCK;
+    match (g.protected.contains(&block), g.clean.contains(&block)) {
+        (true, true) => "guarded, not written since it was taken",
+        (true, false) => "guarded, counted written",
+        _ if g.absent.contains(&block) => "noted absent",
+        _ if g.views.contains(&block) => "view memory, not guarded now",
+        _ => "not known to the guards (private memory, or never taken)",
+    }
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -2458,9 +2855,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    // What a copy knew of this memory is no longer so.
-    event_range(at, len);
     let mut g = guards();
+    // What a copy knew of this memory is no longer so: counted with the
+    // guards' lock held, as everything is that changes what a check finds.
+    // Counted before the lock was taken, a refresh could look at the
+    // counts after this one and be checked before the blocks noted absent
+    // here were dropped below (a drop that counts nothing by itself): its
+    // copy then remembered counts that held the event and not the change,
+    // and was never asked about the memory mapped here.
+    event_range(at, len);
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -3119,6 +3522,33 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// A write of ours whose kernel bits were dropped ([`forgot`], as a
+    /// title buffer copy made at submission drops them) is told to the
+    /// journal whether or not a submission's asking stands: the next
+    /// asking names its page, written after the asking before.
+    #[test]
+    fn a_write_of_ours_is_noted_with_no_asking_standing() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 2 * PAGE);
+        forget(start, end);
+        let (first, found) = writes_fine(start, end, false).expect("watched");
+        assert_eq!(found, []);
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
+        forgot(p + PAGE + 8, 1);
+        wrote(p + PAGE + 8, 1);
+        let (_, found) = writes_fine(start, end, false).expect("watched");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, p / PAGE + 1);
+        assert!(found[0].1.at > first && found[0].1.mask == FULL);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// Asked again at the same number, the journal joins the pages; an
     /// answer numbered before the last noted keeps the later number and no
     /// longer says where.
@@ -3231,7 +3661,7 @@ mod tests {
         };
         assert_ne!(view, 0);
         let block = view / BLOCK;
-        assert_eq!(guard_fine(view, view + BLOCK, None), Some(vec![(block, FULL)]));
+        assert_eq!(guard_fine(view, view + BLOCK, None, &mut Look::default()), Some(vec![(block, FULL)]));
         // SAFETY: inside our view; the write faults and opens the tail.
         unsafe { ((view + 5 * KERNEL_PAGE + 8) as *mut u8).write_volatile(1) };
         assert!(guards().protected.contains(&block), "the pages below stay guarded");
@@ -3239,11 +3669,11 @@ mod tests {
         unsafe { ((view + 9 * KERNEL_PAGE) as *mut u8).write_volatile(1) };
         // SAFETY: as above, below it: faults, opens from there on.
         unsafe { ((view + 2 * KERNEL_PAGE) as *mut u8).write_volatile(1) };
-        assert_eq!(guard_fine(view, view + BLOCK, None), Some(vec![(block, FULL << 2)]));
-        assert_eq!(guard_fine(view, view + BLOCK, None), Some(Vec::new()), "armed again whole");
+        assert_eq!(guard_fine(view, view + BLOCK, None, &mut Look::default()), Some(vec![(block, FULL << 2)]));
+        assert_eq!(guard_fine(view, view + BLOCK, None, &mut Look::default()), Some(Vec::new()), "armed again whole");
         // SAFETY: as above; faults again: armed whole.
         unsafe { ((view + 15 * KERNEL_PAGE) as *mut u8).write_volatile(1) };
-        assert_eq!(guard_fine(view, view + BLOCK, None), Some(vec![(block, 1 << 15)]));
+        assert_eq!(guard_fine(view, view + BLOCK, None, &mut Look::default()), Some(vec![(block, 1 << 15)]));
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, BLOCK);
@@ -3268,7 +3698,7 @@ mod tests {
         };
         assert_ne!(view, 0);
         let block = view / BLOCK;
-        assert!(guard_fine(view, view + BLOCK, None).is_some());
+        assert!(guard_fine(view, view + BLOCK, None, &mut Look::default()).is_some());
         {
             // As if opened by another thread and armed again by a check
             // that made its call afterwards.
@@ -3280,10 +3710,42 @@ mod tests {
         unsafe { ((view + 100) as *mut u8).write_volatile(9) };
         // SAFETY: as above.
         assert_eq!(unsafe { ((view + 100) as *const u8).read_volatile() }, 9);
-        assert_eq!(guard_fine(view, view + BLOCK, None), Some(vec![(block, FULL)]));
+        assert_eq!(guard_fine(view, view + BLOCK, None, &mut Look::default()), Some(vec![(block, FULL)]));
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, BLOCK);
+    }
+
+    /// The same when a mapping dropped all the guards knew of the block
+    /// between a check's note and its late call: the block lies in a view
+    /// the runtime told of, read-only by that call alone, and the title's
+    /// write there is opened and reported, not left to fault unanswered.
+    #[test]
+    fn a_block_armed_after_it_was_mapped_anew_is_opened_by_its_fault() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        if !unlocked_guards() {
+            return;
+        }
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let block = (one + BLOCK) / BLOCK;
+        // (A check of the other view: the handler is there.)
+        assert!(guard(two, two + SIZE, None).is_some());
+        // Mapped anew, as the runtime tells it: nothing is known of it.
+        title_memory_remapped(one, SIZE);
+        crate::inplace::title_memory_view(one, SIZE, section, 0);
+        assert!(!guards().views.contains(&block));
+        // The check's late call.
+        let mut old = 0;
+        // SAFETY: a block of our own view; only its protection changes.
+        assert_ne!(unsafe { VirtualProtect((one + BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) }, 0);
+        // SAFETY: inside the view, read-only now: the write faults.
+        unsafe { ((one + BLOCK + 100) as *mut u8).write_volatile(9) };
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((one + BLOCK + 100) as *const u8).read_volatile() }, 9);
+        let written = guard(one, one + SIZE, None).expect("view memory");
+        assert!(written.contains(&block), "reported written");
+        drop_views(section, &[one, two], SIZE);
     }
 
     #[test]
@@ -3974,6 +4436,167 @@ mod tests {
         assert_eq!(events(far + EVENT_SPAN, far + 2 * EVENT_SPAN), before.2 + 1);
         assert_eq!(events(far, far), 0);
         crate::beside::section_made(section);
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// An asking says, with its locks held, whether anything was counted
+    /// in the range a copy remembers since it was brought up to date, and
+    /// what the guards held of the first block they report: what the check
+    /// of `VICTORY_REFRESH_EVENTS=2` goes by. (Other tests' memory may
+    /// share a count: "nothing counted" is asked until it is seen once.)
+    #[test]
+    fn an_asking_says_whether_anything_was_counted_and_what_it_found() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let ask = |seen: Seen| {
+            let mut look = Look { seen: Some(seen), ..Look::default() };
+            assert!(guard_fine(one, one + SIZE, None, &mut look).is_some());
+            look
+        };
+        ask(Seen::default());
+        // Nothing happens: the asking finds nothing, and says nothing was
+        // counted.
+        let still = (0..1000).any(|_| {
+            let look = ask(Seen::before(one, one + SIZE));
+            assert_eq!(look.found, None);
+            assert_eq!(look.absent, None);
+            look.quiet
+        });
+        assert!(still, "an asking with nothing counted before it");
+        // A write of the title's through the other view of the pages is
+        // counted where the copy looks: no longer quiet, and the asking
+        // names the block.
+        let seen = Seen::before(one, one + SIZE);
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((two + BLOCK + 8) as *mut u8).write(1) };
+        assert!(!seen.quiet());
+        let look = ask(seen);
+        assert!(!look.quiet && !look.uncounted);
+        assert_eq!(look.found.map(|f| f.0), Some((one + BLOCK) / BLOCK));
+        assert!(look.other, "a block that was there all along");
+        // A range a copy never brought up to date holds nothing.
+        assert!(!Seen::default().holds(one, one + SIZE) && !Seen::default().quiet());
+        assert!(seen.holds(one + 8, one + SIZE) && !seen.holds(one, one + SIZE + 1));
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// A range with a block noted absent is asked again when the guards
+    /// look such blocks up again (here, with no cache: every time): a
+    /// block committed with nothing told is found by that asking alone.
+    #[test]
+    fn a_range_with_absent_blocks_is_asked_again_when_they_are_looked_up() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3,
+            PAGE_NOACCESS, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a fresh placeholder of two blocks and a pagefile section
+        // of two.
+        let (p, section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (p, section)
+        };
+        let map = |block: usize| {
+            // SAFETY: splits the placeholder at the block and maps the
+            // section's block there.
+            let view = unsafe {
+                VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    (p + block * BLOCK) as *const _,
+                    (block * BLOCK) as u64,
+                    BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(view.Value as usize, p + block * BLOCK);
+        };
+        map(0);
+        let ask = || {
+            let mut look = Look::default();
+            let written = guard_fine(p, p + 2 * BLOCK, None, &mut look).expect("view memory");
+            (written, look)
+        };
+        ask();
+        // Block 1 is not there: the copy must ask again.
+        let (written, look) = ask();
+        assert_eq!(written, Vec::new());
+        assert_eq!(look.absent, Some(EVERY_TIME));
+        let seen = Seen::before(p, p + 2 * BLOCK).after(&look);
+        assert!(!seen.quiet(), "looked up at every check: asked every time");
+        // Within the frames a lookup holds for, it need not; past them it
+        // must.
+        let far = 0x7_d000_0000usize;
+        let held = |stretch: u64| Seen { absent: Some(stretch), ..Seen::before(far, far + BLOCK) };
+        assert!((0..1000).any(|_| held(absent_stretch()).quiet()));
+        assert!(!held(absent_stretch() + (1 << 40)).quiet());
+        // Past them nothing need have been counted: such a range is asked
+        // for its absent blocks' sake alone.
+        assert!((0..1000).any(|_| held(absent_stretch() + (1 << 40)).uncounted()));
+        assert!(!seen.uncounted(), "a range asked every time has no counts to go by");
+        // Mapped with nothing told: the asking finds it, and says how.
+        map(1);
+        let (written, look) = ask();
+        assert_eq!(written, vec![((p + BLOCK) / BLOCK, FULL)]);
+        assert_eq!(look.found.map(|f| f.2), Some("noted absent, and there now with nothing told of it"));
+        assert!(!look.other, "nothing but the block that had been absent");
+        assert_eq!(look.absent, None);
+        title_memory_remapped(p, 2 * BLOCK);
+        // SAFETY: the two views mapped above, and the section's handle.
+        unsafe {
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: p as *mut _ });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: (p + BLOCK) as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    /// A read of the kernel's into guarded memory: the blocks are opened
+    /// for it; one a check guards again while the kernel is still writing
+    /// counts as written once more when the read says it is done, at every
+    /// view of its pages.
+    #[test]
+    fn a_block_guarded_again_under_a_kernel_read_counts_as_written_at_its_end() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        guard(one, one + SIZE, None);
+        guard(two, two + SIZE, None);
+        assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE, None), Some(Vec::new()));
+        // The read begins; a check comes before it is done and takes the
+        // block as it is.
+        writing(one + BLOCK, 64);
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE, None), Some(vec![pages(two, 1)]));
+        let before = KERNEL_WROTE[2].load(Relaxed);
+        // The read is done: both views' copies take the block again.
+        kernel_wrote(one + BLOCK, 64);
+        assert!(KERNEL_WROTE[2].load(Relaxed) > before, "counted as a block guarded under the read");
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE, None), Some(vec![pages(two, 1)]));
+        assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()));
+        // A read into a block no check touched meanwhile marks nothing new:
+        // the block is open, and its next check reports it as ever.
+        writing(one, 64);
+        kernel_wrote(one, 64);
+        assert_eq!(guard(one, one + SIZE, None), Some(vec![pages(one, 0)]));
         drop_views(section, &[one, two], SIZE);
     }
 
