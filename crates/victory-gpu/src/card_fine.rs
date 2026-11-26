@@ -801,12 +801,16 @@ mod tests {
         fence: ID3D12Fence,
         sent: u64,
         event: HANDLE,
+        /// Held to the end, after everything above is let go: on the
+        /// software adapter the tests run one at a time (`crate::host::warp_alone`).
+        _alone: Option<std::sync::MutexGuard<'static, ()>>,
     }
 
     impl Gpu {
         /// The card if there is one (`warp`: false), else the software
         /// adapter.
         fn new(warp: bool) -> Option<Gpu> {
+            let alone = warp.then(crate::host::warp_alone);
             // SAFETY: plain DXGI and D3D12 creation calls.
             unsafe {
                 let mut device: Option<ID3D12Device> = None;
@@ -837,6 +841,7 @@ mod tests {
                     fence,
                     sent: 0,
                     event,
+                    _alone: alone,
                 })
             }
         }

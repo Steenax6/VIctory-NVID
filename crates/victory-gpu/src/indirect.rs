@@ -1037,10 +1037,14 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// Held to the end, after everything above is let go: the tests on
+        /// the software adapter run one at a time (`crate::host::warp_alone`).
+        _alone: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let alone = crate::host::warp_alone();
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -1079,6 +1083,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _alone: alone,
                 })
             }
         }

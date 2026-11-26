@@ -5159,6 +5159,8 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
     /// (it read 1 everywhere when the A8 view became an R8 view).
     #[test]
     fn warp_an_alpha_only_view_of_an_r8_texture_reads_alpha() {
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
         let Some(device) = warp() else {
             return;
         };
@@ -5184,6 +5186,8 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
     /// texture, which no host casts to, reads as the texture.
     #[test]
     fn warp_views_in_another_format_of_the_family_read_as_that_format() {
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
         let Some(device) = warp() else {
             return;
         };
@@ -5213,6 +5217,8 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
 
     #[test]
     fn warp_views_of_four_bytes_in_another_order_swap_and_fill_channels() {
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
         let Some(device) = warp() else {
             return;
         };

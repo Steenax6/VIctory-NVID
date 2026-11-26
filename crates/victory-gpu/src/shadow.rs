@@ -5516,6 +5516,8 @@ mod card_merge_tests {
     /// they were last taken is what puts it on the list `card_dirty` walks.
     #[test]
     fn a_copys_changed_ranges_are_taken_once_and_its_first_one_lists_it() {
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
         let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
             return;
         };
@@ -5571,6 +5573,8 @@ mod card_merge_tests {
     /// title's byte is put back to the card's older one.
     #[test]
     fn a_title_byte_sent_after_a_flight_survives_its_slot() {
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
         let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
             return;
         };
@@ -5622,6 +5626,8 @@ mod card_merge_tests {
     /// (skipped by both).
     #[test]
     fn the_fast_merge_leaves_what_the_whole_merge_leaves() {
+        // One test on the software adapter at a time, to the end of this one.
+        let _alone = crate::host::warp_alone();
         let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
             return;
         };

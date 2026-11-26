@@ -987,6 +987,31 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// The tests that use the software adapter, one at a time: each holds this
+/// from before it asks for the adapter's device until everything it made
+/// on it is released.
+///
+/// The process has one device on that adapter, whoever asks for it, and
+/// each test runs a queue of its own on it. With several of them running
+/// at once the test binary died of an access violation inside
+/// `d3d10warp.dll` (10.0.26100.9818), in 9 of 30 runs of the whole crate
+/// and in 11 of 30 to 18 of 40 runs of these tests alone: nearly always on
+/// one of the adapter's own worker threads, reading or writing a wild
+/// address, with no frame of the layer or of a test on the stack; now and
+/// then on a test's thread inside a call of its rig into the runtime. It
+/// took no particular test (each module left out in turn, it still died;
+/// one plain test with itself on sixteen threads did too), not the device
+/// being let go under another test (one kept for the whole process changed
+/// nothing), and never happened with the tests one after the other, nor
+/// among the tests that run nothing on the adapter. What in the adapter it
+/// is was not found; only that it needs two queues at work at once.
+#[cfg(test)]
+pub(crate) fn warp_alone() -> std::sync::MutexGuard<'static, ()> {
+    static ALONE: Mutex<()> = Mutex::new(());
+    // A test that failed holding it has left the adapter as any other.
+    ALONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     /// A texture a list sampled is uploaded again for draws after a copy
