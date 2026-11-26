@@ -56,8 +56,11 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
-    /// An internal constant with this initialiser (a constant table).
+    /// An internal global with this initialiser: a constant table, or a variable of each
+    /// thread's own (`writable`).
     init: Option<u32>,
+    /// With `init`: stores may change it ([`Module::private_global`]).
+    writable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -370,8 +373,19 @@ impl Module {
             ptr,
             space,
             init: None,
+            writable: false,
         });
         V::Global(self.globals.len() as u32 - 1)
+    }
+
+    /// An internal global of each thread's own (HLSL's `static`), initialised with the
+    /// constant `init`, which loads and stores may use as a variable.
+    pub fn private_global(&mut self, name: &str, init: V) -> V {
+        let g = self.constant_global(name, init);
+        if let V::Global(n) = g {
+            self.globals[n as usize].writable = true;
+        }
+        g
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -630,7 +644,7 @@ impl Module {
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
             // section]
             let (constant, init, linkage) = match g.init {
-                Some(i) => (1, first_const + u64::from(i) + 1, 3),
+                Some(i) => (u64::from(!g.writable), first_const + u64::from(i) + 1, 3),
                 None => (0, 0, 0),
             };
             w.record(
