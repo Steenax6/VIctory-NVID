@@ -245,7 +245,7 @@ impl Front {
             let mut w = Vec::new();
             for &address in self.roots[usize::from(compute)].iter().filter(|&&a| a != 0) {
                 w.push(address);
-                w.push(hash_at(address));
+                w.push(hash_at(address & !TABLE));
             }
             if !w.is_empty() {
                 self.put(CHECK, &w);
@@ -254,16 +254,17 @@ impl Front {
         let _ = compute;
     }
 
-    /// Diagnostics: a table or root view is set (the check's addresses).
+    /// Diagnostics: a table (`table`) or root view is set (the check's
+    /// addresses).
     #[inline]
-    fn root(&mut self, compute: bool, slot: u32, address: u64) {
+    fn root(&mut self, compute: bool, slot: u32, address: u64, table: bool) {
         #[cfg(feature = "diagnostics")]
         if check()
             && let Some(at) = self.roots[usize::from(compute)].get_mut(slot as usize)
         {
-            *at = address;
+            *at = if address == 0 { 0 } else if table { address | TABLE } else { address };
         }
-        let _ = (compute, slot, address);
+        let _ = (compute, slot, address, table);
     }
 }
 
@@ -280,9 +281,10 @@ static CHUNKS: AtomicU64 = AtomicU64::new(0);
 /// threads), recordings translated, recordings let go of in the middle,
 /// objects whose freeing waited for translation and those freed past a
 /// recording still open, the microseconds a present or a waited submission
-/// of ours stood for translation; diagnostics: draws checked and those whose
-/// memory changed between call and translation.
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// of ours stood for translation; diagnostics: draws checked, those whose
+/// memory changed between call and translation, and the tables and root
+/// views that changed.
+static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 const S_CALLS: usize = 0;
 const S_MICROS: usize = 1;
 const S_LISTS: usize = 2;
@@ -294,6 +296,10 @@ const S_SETTLE: usize = 6;
 const S_CHECKED: usize = 7;
 #[cfg(feature = "diagnostics")]
 const S_CHANGED: usize = 8;
+#[cfg(feature = "diagnostics")]
+const S_CHANGED_TABLES: usize = 9;
+#[cfg(feature = "diagnostics")]
+const S_CHANGED_VIEWS: usize = 10;
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -678,9 +684,11 @@ pub(crate) fn line(frames: f64) {
     if check() {
         tracing::info!(
             "thin check (VICTORY_THIN_CHECK=1), per frame: {:.0} draws and dispatches checked, {:.2} of them read a table or root view \
-             whose first bytes changed between the call and its translation",
+             whose first 32 bytes changed between the call and its translation ({:.2} tables, {:.2} root views)",
             s[S_CHECKED],
-            s[S_CHANGED]
+            s[S_CHANGED],
+            s[S_CHANGED_TABLES],
+            s[S_CHANGED_VIEWS]
         );
     }
 }
@@ -697,10 +705,17 @@ fn check() -> bool {
 #[cfg(feature = "diagnostics")]
 const ROOTS: usize = 16;
 
-/// A hash of the first 256 bytes at `address` (0 if they cannot be read).
+/// The check's mark of a table among its addresses (a root view has none).
+#[cfg(feature = "diagnostics")]
+const TABLE: u64 = 1 << 63;
+
+/// A hash of the first 32 bytes at `address` (0 if they cannot be read):
+/// the first descriptor of a table, the first two vectors of constants of
+/// a view; what the draw reads for certain (the extent of a table is its
+/// root signature's, and the bytes after it are the next draw's in a ring).
 #[cfg(feature = "diagnostics")]
 fn hash_at(address: u64) -> u64 {
-    let mut bytes = [0u8; 256];
+    let mut bytes = [0u8; 32];
     if !crate::host::read_into(address as *const u8, &mut bytes) {
         return 0;
     }
@@ -774,12 +789,12 @@ plain! {
     TOPOLOGY topology = state::topology, (v: u32);
     STENCIL_REF stencil_ref = state::stencil_ref, (v: u32);
     DEPTH_BOUNDS depth_bounds = state::depth_bounds, (min: f32, max: f32);
-    COMPUTE_TABLE compute_table = state::compute_table, (slot: u32, handle: u64) => |f: &mut Front| f.root(true, slot, handle);
-    GRAPHICS_TABLE graphics_table = state::graphics_table, (slot: u32, handle: u64) => |f: &mut Front| f.root(false, slot, handle);
+    COMPUTE_TABLE compute_table = state::compute_table, (slot: u32, handle: u64) => |f: &mut Front| f.root(true, slot, handle, true);
+    GRAPHICS_TABLE graphics_table = state::graphics_table, (slot: u32, handle: u64) => |f: &mut Front| f.root(false, slot, handle, true);
     COMPUTE_CONSTANT compute_constant = state::compute_constant, (slot: u32, value: u32, offset: u32);
     GRAPHICS_CONSTANT graphics_constant = state::graphics_constant, (slot: u32, value: u32, offset: u32);
-    COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64) => |f: &mut Front| f.root(true, slot, address);
-    GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64) => |f: &mut Front| f.root(false, slot, address);
+    COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64) => |f: &mut Front| f.root(true, slot, address, false);
+    GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64) => |f: &mut Front| f.root(false, slot, address, false);
     SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
     DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32) => |f: &mut Front| f.work(false);
     DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) => |f: &mut Front| f.work(false);
@@ -1103,7 +1118,24 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             #[cfg(feature = "diagnostics")]
             CHECK => {
                 STATS[S_CHECKED].fetch_add(1, Relaxed);
-                if w.chunks_exact(2).any(|pair| hash_at(pair[0]) != pair[1]) {
+                let mut changed = false;
+                for pair in w.chunks_exact(2) {
+                    if hash_at(pair[0] & !TABLE) != pair[1] {
+                        changed = true;
+                        // The first few, to find out what they are.
+                        static NAMED: AtomicU64 = AtomicU64::new(0);
+                        if NAMED.fetch_add(1, Relaxed) < 16 {
+                            tracing::info!(
+                                address = format_args!("{:#x}", pair[0] & !TABLE),
+                                table = pair[0] & TABLE != 0,
+                                buffer = ?crate::shadow::find_any(pair[0] & !TABLE, 32).is_some(),
+                                "thin check: what a draw reads changed between its call and its translation"
+                            );
+                        }
+                        STATS[if pair[0] & TABLE != 0 { S_CHANGED_TABLES } else { S_CHANGED_VIEWS }].fetch_add(1, Relaxed);
+                    }
+                }
+                if changed {
                     STATS[S_CHANGED].fetch_add(1, Relaxed);
                 }
             }
