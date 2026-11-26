@@ -372,7 +372,11 @@ pub(crate) fn let_go_idle() {
         while i < blocks.len() {
             let b = &blocks[i];
             let empty = b.align == align && b.shared == shared && b.free_bytes == HEAP;
-            if empty && !first && now.saturating_sub(b.given) > EMPTY_MS {
+            // Heaps in the PC's memory are kept empty longer: few textures
+            // go there, in bursts, and a heap made again is a heap made
+            // resident again.
+            let after = if shared { 12 * EMPTY_MS } else { EMPTY_MS };
+            if empty && !first && now.saturating_sub(b.given) > after {
                 if shared {
                     SHARED_HEAPS.fetch_sub(1, Relaxed);
                 } else {

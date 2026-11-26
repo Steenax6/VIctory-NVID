@@ -1187,6 +1187,10 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// When the sweep first found its host copy held by nothing (by list
+    /// or slot) since it was last found held (`crate::host::moment`; 0:
+    /// held, or not looked at yet): [`let_go_idle`].
+    unheld: std::sync::atomic::AtomicU64,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1403,15 +1407,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             };
             leave_out = drop_policy().levels(&shape, filled_for_policy());
         }
-        // Into the PC's memory the card reads over the bus ([`spill_on`]):
-        // a texture the title fills, made whole while the card has no room
-        // and that memory has. While it has, no texture leaves levels out:
-        // the levels go only once both are full.
-        let spill_room = spill_on() && fills(&r.desc) && shared_room_lately();
-        if spill_room {
+        // Levels are left out by the policy, as without the spill; a
+        // texture the title fills that finds no room on the card even so
+        // goes whole into the PC's memory the card reads over the bus
+        // ([`spill_on`], [`placement`]).
+        let spill = fills(&r.desc)
+            && placement(room_lately(), spill_on() && shared_room_lately()) == Placement::Shared;
+        if spill {
             leave_out = 0;
         }
-        let spill = spill_room && !room_lately();
         if shape_fits && r.host.placed.load(Relaxed) && (crate::tiles::wanted() || leave_out > 0) {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
@@ -1798,15 +1802,36 @@ pub(crate) fn room_lately() -> bool {
     room
 }
 
-/// Whether host copies of textures the title fills go on into the PC's
-/// memory the system lets the card reach over the bus once the card has no
-/// room ([`card_room`]), made whole, instead of waiting for room or being
-/// made without their most detailed levels (on by default;
-/// `VICTORY_TEXTURE_SPILL=0`: they wait or leave levels out, as before).
-/// The order as memory fills: whole on the card, then whole in the PC's
-/// memory while it has room ([`shared_room`]), and only past that without
-/// levels (`crate::tiles::DropPolicy`). A texture there is read over the
-/// bus, slower than the card's own memory, but it is there and whole.
+/// Where a new host copy of a texture the title fills goes
+/// ([`placement`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    /// On the card, with the levels the policy leaves out
+    /// (`crate::tiles::DropPolicy`) left out.
+    Card,
+    /// Whole, in the PC's memory the card reads over the bus.
+    Shared,
+}
+
+/// The order as memory fills: on the card while it has room
+/// ([`card_room`]), levels left out past the policy's line as without the
+/// spill; once the card has no room even so, in the PC's memory while
+/// that has room (`shared`, [`shared_room`]); and with neither, on the card
+/// again, as before the spill (a texture picked by index waits for room
+/// then, `draw.rs` `heap_textures`).
+fn placement(card: bool, shared: bool) -> Placement {
+    if !card && shared { Placement::Shared } else { Placement::Card }
+}
+
+/// Whether host copies of textures the title fills that find no room on
+/// the card go into the PC's memory the system lets the card reach over the
+/// bus, made whole, instead of waiting for room (on by default; a texture
+/// there is read over the bus, slower than the card's own memory, but it is
+/// there; `VICTORY_TEXTURE_SPILL=0`: they wait, as before). The last step:
+/// levels are left out first ([`placement`]). Spill first, then levels,
+/// measured on the RTX 4070 Ti: the opening cutscene 170 ms a frame
+/// against 106, 50,457 textures made there in 205 s for 6,795 alive, and
+/// the picture the same.
 /// From fxceless/victory-fork pull request #601 (DiogoPCastelos: on a
 /// 6 GB card skin, walls and clothes sampled black while their textures
 /// waited for room; with the spill they had their colours) and
@@ -1874,23 +1899,27 @@ fn shared_room_lately() -> bool {
 pub(crate) static SPILLED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The line on host copies in the PC's memory, every few seconds; nothing
-/// until there is one.
+/// until there is one, or a pass of textures picked by index found no room
+/// at all.
 #[cfg(windows)]
 pub(crate) fn spill_line() {
     use std::sync::atomic::Ordering::Relaxed;
     let [alive, bytes, made, made_bytes, refused] = [0, 1, 2, 3, 4].map(|i| SPILLED[i].load(Relaxed));
-    if made + refused == 0 {
+    let full = crate::draw::HEAP_TEXTURES_FULL.load(Relaxed);
+    if made + refused + full == 0 {
         return;
     }
     let shared = crate::host::host()
         .and_then(|h| h.video_memory())
         .map_or_else(|| "unknown".to_owned(), |[.., budget, used]| format!("{} of {} MB", used >> 20, budget >> 20));
     tracing::info!(
-        "host copies of textures in the PC's memory the card reads over the bus (VICTORY_TEXTURE_SPILL; the card had no \
-         room): {alive} alive, {} MB; since the start {made} made, {} MB, {refused} refused and made on the card; {} \
-         heaps of placed textures there; the PC's shared memory in use: {shared}",
-        bytes >> 20,
+        "textures that found no room on the card, levels left out and all (VICTORY_TEXTURE_SPILL): {made} made whole in \
+         the PC's memory the card reads over the bus instead of waiting since the start ({} MB), {alive} of them alive \
+         ({} MB), {refused} refused there and made on the card; {full} passes over textures picked by index that found \
+         no room in either, so that they waited; {} heaps of placed textures there; the PC's shared memory in use: \
+         {shared}",
         made_bytes >> 20,
+        bytes >> 20,
         crate::placed::shared_heaps(),
     );
 }
@@ -2176,6 +2205,7 @@ pub(crate) fn let_go_idle() {
         std::env::var("VICTORY_TILED_IDLE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(5000).min(60_000)
     });
     let tiled_idle_ms = if idle_ms > 1000 { idle_ms.max(tiled_idle) } else { idle_ms };
+    let spilled_idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2189,11 +2219,41 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            // A slot that shows a copy holds it without asking for it: the
+            // time since it was asked for can be minutes when the title
+            // moves the texture to another slot, and the copy went at the
+            // next sweep, to be made and uploaded again a frame later with
+            // nothing shown meanwhile (tippythetaidum/VIppy 70bdfa4: 19,054
+            // of 75,053 copies let go in 600 s were made again). So the idle
+            // time also runs from when the copy was first found held by
+            // nothing.
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                let ms = if host.tiled.is_some() { tiled_idle_ms } else { idle_ms };
+                // A copy in the PC's memory takes none of the card's: by
+                // the card's pressure it went after a second idle and was
+                // made and uploaded again (50,457 made for 6,795 alive in
+                // 205 s). It goes by the PC's memory, as other caches there
+                // do; once gone, its next use makes it on the card if that
+                // has room, which is how it gets back there.
+                let ms = if host.spilled {
+                    spilled_idle_ms
+                } else if host.tiled.is_some() {
+                    tiled_idle_ms
+                } else {
+                    idle_ms
+                };
+                let unheld =
+                    std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1;
+                if !unheld {
+                    r.host.unheld.store(0, Relaxed);
+                    return false;
+                }
+                let since = r.host.unheld.load(Relaxed);
+                if since == 0 {
+                    r.host.unheld.store(crate::host::moment().max(1), Relaxed);
+                    return false;
+                }
                 crate::host::long_ago(r.host.used.load(Relaxed), ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+                    && crate::host::long_ago(since, ms, IDLE_FRAMES)
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -2206,6 +2266,7 @@ pub(crate) fn let_go_idle() {
         };
         if let Some((host, _)) = gone {
             r.host.gone.store(true, Relaxed);
+            r.host.unheld.store(0, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
             went += 1;
@@ -2955,6 +3016,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            unheld: std::sync::atomic::AtomicU64::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -3545,6 +3607,17 @@ mod tests {
         assert_eq!(family(66), 66);
     }
 
+    /// The order: levels left out first, the PC's memory only for what
+    /// finds no room on the card even so, and with no room in either the
+    /// card as before.
+    #[test]
+    fn textures_go_to_the_pcs_memory_last() {
+        assert_eq!(placement(true, true), Placement::Card, "room on the card: there, levels by the policy");
+        assert_eq!(placement(true, false), Placement::Card);
+        assert_eq!(placement(false, true), Placement::Shared, "no room on the card: the PC's memory");
+        assert_eq!(placement(false, false), Placement::Card, "no room anywhere: as before (it waits)");
+    }
+
     /// The PC's shared memory takes textures up to its share of the budget
     /// and while the PC keeps its floor free.
     #[cfg(windows)]
@@ -4030,6 +4103,99 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         list.reset();
         assert_eq!(list.preludes_again(), 0, "let go with the reset");
+    }
+
+    /// An earlier title-memory upload must not suppress a later alias copy
+    /// from a GPU-written probe atlas into the same sampled texture
+    /// (fxceless/victory-fork pull request #1241).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn alias_after_title_upload_copies_the_gpu_atlas() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(view), Some(source));
+        let written = host_resource(source).unwrap();
+        let sampled = host_resource(view).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let seed = host.new_list().unwrap();
+        let packed_light = 0x8c02_0100_u32;
+        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 4).cast::<u32>().write_unaligned(packed_light);
+                }
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(written),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: written.GetDesc().Format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, view, sampled);
+        assert!(crate::texture::alias(&list, view, source));
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the completed copy contains at least one 32-bit texel.
+        let actual = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let texel = mapped.cast::<u8>().add(rows.Offset as usize).cast::<u32>().read_unaligned();
+            readback.Unmap(0, None);
+            texel
+        };
+        resource_release(view);
+        resource_release(source);
+        assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

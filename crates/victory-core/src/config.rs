@@ -24,6 +24,10 @@ pub struct Config {
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+    /// `[controls]`: keyboard and mouse settings and bindings for
+    /// `victory-hle`, as `name = value` entries (`on_foot.<key>` for a
+    /// binding of a sub-table; a list's values joined by commas).
+    pub controls: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +35,44 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    controls: Option<toml::Table>,
+}
+
+/// `[controls]` as `name = value` entries: plain values as they are written,
+/// one level of sub-tables named `table.key`, lists of strings joined by
+/// commas. What the entries mean is `victory-hle`'s to check.
+fn controls_entries(table: &toml::Table) -> Result<Vec<(String, String)>> {
+    fn value(name: &str, v: &toml::Value) -> Result<String> {
+        Ok(match v {
+            toml::Value::String(s) => s.clone(),
+            toml::Value::Integer(n) => n.to_string(),
+            toml::Value::Float(n) => n.to_string(),
+            toml::Value::Boolean(b) => b.to_string(),
+            toml::Value::Array(items) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .with_context(|| format!("[controls] {name}: a list holds names only"))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join(","),
+            _ => anyhow::bail!("[controls] {name}: not a value this section takes"),
+        })
+    }
+    let mut entries = Vec::new();
+    for (name, v) in table {
+        match v {
+            toml::Value::Table(sub) => {
+                for (key, v) in sub {
+                    let name = format!("{name}.{key}");
+                    entries.push((name.clone(), value(&name, v)?));
+                }
+            }
+            v => entries.push((name.clone(), value(name, v)?)),
+        }
+    }
+    Ok(entries)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,7 +112,13 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let controls = match &parsed.controls {
+            Some(table) => controls_entries(table)?,
+            None => Vec::new(),
+        };
+        let mut cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
+        cfg.controls = controls;
+        Ok(cfg)
     }
 
     fn resolve(
@@ -97,6 +145,7 @@ impl Config {
             data_dir,
             test_titles,
             source,
+            controls: Vec::new(),
         })
     }
 
@@ -193,6 +242,27 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn controls_become_name_value_entries() {
+        let text = r#"
+            [controls]
+            mouse_sensitivity = 2.5
+            mouse_invert_y = true
+            [controls.on_foot]
+            Space = "A"
+            Mouse4 = ["LB", "RB"]
+        "#;
+        let parsed: FileConfig = toml::from_str(text).unwrap();
+        let entries = controls_entries(parsed.controls.as_ref().unwrap()).unwrap();
+        let get = |n: &str| entries.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+        assert_eq!(get("mouse_sensitivity"), Some("2.5"));
+        assert_eq!(get("mouse_invert_y"), Some("true"));
+        assert_eq!(get("on_foot.Space"), Some("A"));
+        assert_eq!(get("on_foot.Mouse4"), Some("LB,RB"));
+        let deep: FileConfig = toml::from_str("[controls.on_foot.x]\ny = 1").unwrap();
+        assert!(controls_entries(deep.controls.as_ref().unwrap()).is_err());
     }
 
     #[test]
