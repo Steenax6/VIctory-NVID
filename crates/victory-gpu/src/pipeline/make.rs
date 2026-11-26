@@ -38,6 +38,9 @@ pub(crate) struct Pending {
     /// frames ([`wait`]), and whether it is counted in [`PASSED_OVER`].
     waited_us: AtomicU64,
     passed_over: AtomicBool,
+    /// The same pipeline made for other render target formats
+    /// ([`for_targets`]); never removed while this one lives.
+    variants: Mutex<Vec<Arc<Pending>>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -63,6 +66,7 @@ impl Pending {
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
             passed_over: AtomicBool::new(false),
+            variants: Mutex::new(Vec::new()),
         }
     }
 
@@ -139,6 +143,37 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     p.made.get()?.as_ref()
 }
+
+/// `p` made for render targets of `targets` instead of the formats the
+/// title named, by the workers like any first use (and waited for within
+/// the frame's budget); `None` while it is being made or if the host
+/// refuses it. Each set of formats is made once per pipeline.
+pub(crate) fn for_targets(
+    p: &Pending,
+    targets: windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY,
+) -> Option<&HostPipeline> {
+    let g = p.graphics.as_deref()?;
+    let variant = {
+        let mut variants = p.variants.lock().unwrap_or_else(|e| e.into_inner());
+        match variants.iter().find(|v| v.graphics.as_ref().is_some_and(|vg| vg.targets == targets)) {
+            Some(v) => v.clone(),
+            None => {
+                let v = Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_targets(targets)))));
+                variants.push(v.clone());
+                VARIANTS.fetch_add(1, Ordering::Relaxed);
+                v
+            }
+        }
+    };
+    let made = ready(&variant)?;
+    // SAFETY: the variant lives in `p.variants`, which only grows and lives
+    // as long as `p`, so what it made outlives this borrow of `p`.
+    Some(unsafe { &*std::ptr::from_ref(made) })
+}
+
+/// Pipelines made again for the formats of their bound targets, since the
+/// start.
+pub(crate) static VARIANTS: AtomicU64 = AtomicU64::new(0);
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
@@ -484,6 +519,34 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    /// A pipeline is made again once for each set of target formats it is
+    /// drawn into, with those formats; one without graphics state never.
+    #[test]
+    fn each_set_of_target_formats_is_made_once() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let p = Pending::new(Vec::new(), Some(Box::default()));
+        let formats = |first: i32| {
+            let mut t = D3D12_RT_FORMAT_ARRAY {
+                NumRenderTargets: 1,
+                ..Default::default()
+            };
+            t.RTFormats[0] = DXGI_FORMAT(first);
+            t
+        };
+        // (No shaders: no host pipeline, whatever the formats.)
+        assert!(for_targets(&p, formats(29)).is_none());
+        assert!(for_targets(&p, formats(29)).is_none());
+        assert!(for_targets(&p, formats(26)).is_none());
+        let variants = p.variants.lock().unwrap();
+        let made: Vec<i32> = variants.iter().map(|v| v.graphics.as_ref().unwrap().targets.RTFormats[0].0).collect();
+        assert_eq!(made, [29, 26]);
+        drop(variants);
+        let compute = Pending::new(Vec::new(), None);
+        assert!(for_targets(&compute, formats(29)).is_none());
+        assert!(compute.variants.lock().unwrap().is_empty());
     }
 
     #[test]
