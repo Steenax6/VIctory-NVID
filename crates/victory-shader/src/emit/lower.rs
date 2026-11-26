@@ -75,6 +75,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether its UAVs are globally coherent ([`crate::ir::orders_across_groups`]).
+    #[cfg(test)]
+    pub coherent: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1126,6 +1129,9 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
+        s.coherent = crate::ir::orders_across_groups(
+            p.blocks.iter().flat_map(|b| &b.insts).map(|i| (i.name(), i.fields.clone())),
+        );
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
@@ -2356,6 +2362,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            coherent: self.s.coherent,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5403,6 +5411,12 @@ impl<'a> Lower<'a> {
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
+        if name == "s_waitcnt_vscnt" {
+            // The wait for the program's stores to land, kept only in a program that orders
+            // memory between groups (`ir::orders_across_groups`): a fence there.
+            self.device_fence();
+            return Ok(());
+        }
         if matches!(
             name,
             "s_setreg_imm32_b32" | "s_setreg_b32" | "s_swappc_b64" | "s_version"
@@ -5903,6 +5917,22 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A fence over all device memory (`DeviceMemoryBarrier`: the global UAV fence, no group
+    /// sync) in a compute program that orders memory between groups (its views are globally
+    /// coherent, [`crate::ir::orders_across_groups`]), where the console orders its accesses
+    /// against other groups': the wait for its stores to land (`s_waitcnt_vscnt`, before the
+    /// atomic that tells another group they are there) and a cache invalidation (before reads
+    /// of what another group wrote). The host orders a thread's accesses to different
+    /// addresses for other groups only at a fence. Elsewhere nothing.
+    /// From fxceless/victory-fork PR #914 with its commit 93c64fc36 (SpaghettiMaster545).
+    fn device_fence(&mut self) {
+        if !self.s.coherent || self.s.threads.is_none() || self.s.mesh.is_some() {
+            return;
+        }
+        let (mode, void) = (self.s.m.i32(2), self.s.t.void);
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -5914,6 +5944,11 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if matches!(name, "s_dcache_inv" | "s_gl1_inv") {
+            // As `buffer_gl0_inv`: no cache of the console's to drop, a fence.
+            self.device_fence();
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -10303,7 +10338,9 @@ impl<'a> Lower<'a> {
         };
         let name = inst.name();
         if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
-            // The host has no console buffer cache to invalidate.
+            // The host has no console buffer cache to invalidate; what the
+            // invalidation orders is a fence there (`device_fence`).
+            self.device_fence();
             return Ok(());
         }
         if *lds || *tfe {
@@ -11711,6 +11748,90 @@ mod tests {
         // host to invalidate its cached view of a buffer.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    }
+
+    /// Which programs order memory between groups: loads and stores marked `glc` or `dlc`,
+    /// scalar loads so marked, cache invalidations; not plain accesses, not an atomic's `glc`
+    /// (the old value back), not `slc`, not LDS atomics (after fxceless/victory-fork #914's
+    /// test). Only there does `s_waitcnt_vscnt` stay in the IR.
+    #[test]
+    fn programs_that_order_memory_between_groups_are_known_by_their_cache_bits() {
+        let build = |body: &[u32]| {
+            let mut words = body.to_vec();
+            words.push(S_ENDPGM);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            ir::build(&code, false, 8).unwrap()
+        };
+        let orders = |body: &[u32]| {
+            let p = build(body);
+            crate::ir::orders_across_groups(p.blocks.iter().flat_map(|b| &b.insts).map(|i| (i.name(), i.fields.clone())))
+        };
+        // buffer_load_dword v1, v0, s[4:7], 0 offen; buffer_store_dword v1, v0, s[4:7], 0 offen
+        assert!(!orders(&[0xE030_1000, 0x8001_0100, 0xE070_1000, 0x8001_0100]));
+        // ds_add_u32 v0, v1
+        assert!(!orders(&[0xD800_0000, 0x0000_0100]));
+        // buffer_atomic_add v1, v0, s[4:7], 0 offen glc
+        assert!(!orders(&[0xE0C8_5000, 0x8001_0100]));
+        // the load with slc (dword 1 bit 22)
+        assert!(!orders(&[0xE030_1000, 0x8041_0100]));
+        // the load with glc (bit 14), dlc (bit 15)
+        assert!(orders(&[0xE030_5000, 0x8001_0100]));
+        assert!(orders(&[0xE030_9000, 0x8001_0100]));
+        // buffer_gl0_inv
+        assert!(orders(&[0xE1C4_0000, 0x0000_0000]));
+        // s_load_dword s8, s[4:5], 0x0 glc, and without
+        assert!(orders(&[0xF401_0202, 0xFA00_0000]));
+        assert!(!orders(&[0xF400_0202, 0xFA00_0000]));
+        // a store with glc, s_waitcnt_vscnt null, 0x0, an atomic: the wait stays
+        let kept = |body: &[u32]| {
+            build(body).blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_waitcnt_vscnt")
+        };
+        assert!(kept(&[0xE070_5000, 0x8001_0100, 0xBBFD_0000, 0xE0C8_1000, 0x8001_0100]));
+        assert!(!kept(&[0xE070_1000, 0x8001_0100, 0xBBFD_0000, 0xE0C8_1000, 0x8001_0100]));
+    }
+
+    /// A program that orders memory between groups has its UAVs globally coherent and a
+    /// device fence at the wait for its stores; the same code without `glc` has neither.
+    #[test]
+    fn a_program_that_orders_memory_between_groups_has_coherent_views_and_fences() {
+        // s_mov_b32 s4, s0; s_mov_b32 s5, 0; s_load_dwordx4 s[8:11], s[4:5]; a store (glc or
+        // not) of v1 at v0 through it, s_waitcnt_vscnt null, 0x0, buffer_atomic_add likewise
+        let program = |store: u32| {
+            [
+                0xBE84_0300,
+                0xBE85_0380,
+                0xF408_0202,
+                0xFA00_0000,
+                store,
+                0x8002_0100,
+                0xBBFD_0000,
+                0xE0C8_1000,
+                0x8002_0100,
+                S_ENDPGM,
+            ]
+        };
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let plain = lower_with(&program(0xE070_1000), layout(), used()).expect("plain");
+        let marked = lower_with(&program(0xE070_5000), layout(), used()).expect("marked");
+        assert!(!plain.coherent && marked.coherent);
+        // the views' property and the fence are in the module
+        assert_ne!(plain.dxil, marked.dxil);
+        if let Ok(mut v) = super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref()) {
+            v.validate(&mut plain.dxil.clone()).expect("DXIL validation failed");
+            v.validate(&mut marked.dxil.clone()).expect("DXIL validation failed");
+        }
     }
 
     #[test]

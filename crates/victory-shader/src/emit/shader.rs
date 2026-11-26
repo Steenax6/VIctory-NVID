@@ -146,6 +146,9 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Resource properties, word 0: a globally coherent UAV (bit 14).
+const COHERENT: u32 = 0x4000;
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -174,6 +177,10 @@ pub(crate) struct Shader {
     /// A pixel shader whose writes to views the console orders by primitive (POPS): its
     /// heap views written or read as UAVs are rasterizer-ordered views.
     pub ordered: bool,
+    /// Every UAV globally coherent: a program that orders memory between
+    /// thread groups (`crate::ir::orders_across_groups`). Set before the
+    /// first handle is made.
+    pub coherent: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -232,6 +239,7 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             ordered: false,
+            coherent: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -366,7 +374,7 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let h = self.annotate(block, h, 11 | 0x1000 | self.coherent_bit(), 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -397,6 +405,12 @@ impl Shader {
             0
         };
         self.annotate(block, h, 14 | cmp, 0)
+    }
+
+    /// Resource properties, word 0, of a UAV of this shader: bit 14, globally
+    /// coherent, in a program that orders memory between groups.
+    fn coherent_bit(&self) -> u32 {
+        if self.coherent { COHERENT } else { 0 }
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
@@ -454,6 +468,11 @@ impl Shader {
         let props = if self.ordered && !sampler && props.0 & 0x1000 != 0 {
             self.flags |= flags::ROVS;
             (props.0 | 0x2000, props.1)
+        } else {
+            props
+        };
+        let props = if !sampler && props.0 & 0x1000 != 0 {
+            (props.0 | self.coherent_bit(), props.1)
         } else {
             props
         };
@@ -599,6 +618,9 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                // as the handles are annotated (`coherent_bit`)
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -612,7 +634,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,
