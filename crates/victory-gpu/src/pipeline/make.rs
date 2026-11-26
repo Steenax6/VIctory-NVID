@@ -332,18 +332,22 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self
-            .requested_graphics
-            .pop_front()
-            .or_else(|| self.requested.pop_front())
-            .or_else(|| {
-                // An early entry can have been promoted and claimed already.
-                std::iter::from_fn(|| self.early.pop_front())
-                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-            })?;
+    /// The next pipeline to make, and whether it is one started early only
+    /// (no draw has asked for it yet): those only while fewer than
+    /// `early_most` workers make such ones (counted in `early_making`).
+    fn pop(&mut self, early_making: &AtomicU64, early_most: usize) -> Option<(Arc<Pending>, bool)> {
+        if let Some(p) = self.requested_graphics.pop_front().or_else(|| self.requested.pop_front()) {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some((p, false));
+        }
+        if early_making.load(Ordering::Relaxed) >= early_most as u64 {
+            return None;
+        }
+        // An early entry can have been promoted and claimed already.
+        let p = std::iter::from_fn(|| self.early.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+        early_making.fetch_add(1, Ordering::Relaxed);
+        Some((p, true))
     }
 }
 
@@ -371,10 +375,10 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next() -> (Arc<Pending>, bool) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(&EARLY_MAKING, early_workers()) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -424,7 +428,15 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let (p, early) = next();
+                        p.make();
+                        if early {
+                            // Another worker may take the next early one
+                            // (under the queue's lock: no worker misses it).
+                            let _queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            EARLY_MAKING.fetch_sub(1, Ordering::Relaxed);
+                            AVAILABLE.notify_all();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -442,6 +454,38 @@ fn workers() -> bool {
     })
 }
 
+/// Workers that may make pipelines started early at once
+/// (`VICTORY_PIPELINE_EARLY_WORKERS`; by default an eighth of the logical
+/// processors, at least one). The early list (the pipelines the run before
+/// drew with: 3,327 of them) is made before anything asks for them; where
+/// the library does not have them, each is a compile of the driver's, at
+/// full tilt on the worker's thread and on threads of the driver's own.
+/// With all eight workers on the early list, eleven of the sixteen logical
+/// processors were in the driver's compiler for minutes, and the title's
+/// frames and texture refreshes (which read, hash and detile hundreds of
+/// MB) got what was left: a run 2026-11-26 went from 30 fps to 0.1-3.9 in
+/// its loading screens, texture refreshes from 0.3-12 ms to 234 ms - 12.7 s
+/// a frame, and never left them in four minutes. The workers hold no lock
+/// of ours while the driver compiles (`library::pipeline` compiles outside
+/// its locks; a save holds the library's own, which no frame takes): the
+/// frame wanted processors. Pipelines a draw asks for take every worker.
+fn early_workers() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let most = std::env::var("VICTORY_PIPELINE_EARLY_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or((logical / 8).max(1));
+        tracing::info!(most, "host pipeline workers that may make pipelines started early");
+        most
+    })
+}
+
+/// Workers making a pipeline started early now ([`early_workers`]).
+static EARLY_MAKING: AtomicU64 = AtomicU64::new(0);
+
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
@@ -453,6 +497,7 @@ fn drained() {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            from_other_translations = super::library::SEEDED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipelines all made"
         );
@@ -574,10 +619,35 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        let making = AtomicU64::new(0);
+        let (p, early) = queue.pop(&making, 8).unwrap();
+        assert!(Arc::ptr_eq(&p, &requested) && !early);
+        let (p, early) = queue.pop(&making, 8).unwrap();
+        assert!(Arc::ptr_eq(&p, &promoted) && !early);
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        let (p, early) = queue.pop(&making, 8).unwrap();
+        assert!(Arc::ptr_eq(&p, &earlier) && early);
+        assert!(queue.pop(&making, 8).is_none());
+    }
+
+    /// Pipelines started early are given to at most so many workers at
+    /// once; one a draw asks for is given at any time.
+    #[test]
+    fn early_pipelines_take_only_some_workers() {
+        let mut queue = Queue::new();
+        let early: Vec<Arc<Pending>> = (0..3).map(|_| Arc::new(Pending::new(Vec::new(), None))).collect();
+        for p in &early {
+            queue.push(p, EARLY);
+        }
+        let making = AtomicU64::new(0);
+        assert!(queue.pop(&making, 2).is_some_and(|(_, e)| e));
+        assert!(queue.pop(&making, 2).is_some_and(|(_, e)| e));
+        assert!(queue.pop(&making, 2).is_none(), "two workers make early ones already");
+        let asked = Arc::new(Pending::new(Vec::new(), None));
+        queue.push(&asked, REQUESTED);
+        let (p, e) = queue.pop(&making, 2).unwrap();
+        assert!(Arc::ptr_eq(&p, &asked) && !e);
+        making.fetch_sub(1, Ordering::Relaxed);
+        assert!(queue.pop(&making, 2).is_some_and(|(_, e)| e), "one done: the next early one");
     }
 }
