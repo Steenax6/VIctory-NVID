@@ -293,8 +293,9 @@ impl<'a> Lower<'a> {
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
+    /// Leaves `self.cur` at the block it ends in (a look for the second half
+    /// ends in a block of its own).
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         // The second half of a 128-byte node may lie in the next 64 KiB
         // page, which may be in another copy: its own look, made once.
@@ -311,9 +312,10 @@ impl<'a> Lower<'a> {
                     // Every lane in this block runs the instruction.
                     let (handle, byte) = self.bvh_memory(low, high, None);
                     let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
+                    (handle, self.s.m.bin(self.cur, Bin::Sub, byte, k64))
                 }),
             };
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -373,7 +375,9 @@ impl<'a> Lower<'a> {
         let k16 = self.s.m.i32(16);
         let words = self.bvh_node_words(at, None, 16, 24);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        // (the second half's look ends in a block of its own)
+        let wide_end = self.cur;
+        self.s.m.terminate(wide_end, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
@@ -402,7 +406,7 @@ impl<'a> Lower<'a> {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_block)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).

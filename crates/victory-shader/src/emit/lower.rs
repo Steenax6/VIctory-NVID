@@ -2988,6 +2988,7 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
         let directory = self.s.root_srv_handle(SLOT_MEMORY);
         let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), k(self, 4));
+        let zero = k(self, 0);
         let entry = self.s.op(
             c,
             "rawBufferLoad.f32",
@@ -2998,9 +2999,20 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
-        let zero = k(self, 0);
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let slot = self.s.m.bin(c, Bin::Add, base, copy);
+        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let k64k = k(self, 0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(c, Bin::Add, start, within);
+        // A page without a copy: its number, at a place by the number, for
+        // lanes that run; only those store, in a block of their own. (Every
+        // lane stored before, the others to a sink dword: the notes are in
+        // the host's memory, so each access by address of each wave crossed
+        // the bus with a write, nearly always to the sink. The idea of
+        // Marvisak/VIctory pull request #2958 for its write marks: fewer lanes
+        // touch memory across the bus. Callers go on in the block this ends
+        // in.)
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
@@ -3011,24 +3023,19 @@ impl<'a> Lower<'a> {
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
+        let gate = self.begin_guarded(Some(missing));
         self.s.op(
-            c,
+            self.cur,
             "rawBufferStore.i32",
             Attr::NoUnwind,
             void,
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
-        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
-        let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
-        let k64k = k(self, 0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let byte = self.s.m.bin(c, Bin::Add, start, within);
+        self.end_guarded(gate, &[]);
         (h, byte)
     }
 
@@ -3061,7 +3068,6 @@ impl<'a> Lower<'a> {
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
-        let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
@@ -3079,6 +3085,8 @@ impl<'a> Lower<'a> {
                 return Err("a global load result");
             };
             let (h, byte) = self.memory(lo, hi, guard);
+            // (the look ends in a block of its own)
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -3127,6 +3135,8 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let (h, byte) = self.memory(lo, hi, guard);
+        // (the look ends in a block of its own)
+        let c = self.cur;
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -3261,6 +3271,8 @@ impl<'a> Lower<'a> {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
             let (h, byte) = self.memory(lo, hi, None);
+            // (the look ends in a block of its own)
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
