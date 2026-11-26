@@ -2886,6 +2886,13 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// A title texture's dimension as the title made it (2 1D, 3 2D, 4 3D;
+/// the host's copy of a 1D one is 2D: [`host_dimension`]); `None` for
+/// buffers.
+pub(crate) fn title_dimension(this: This) -> Option<u32> {
+    texture_memory(this).map(|(_, d)| d.dimension)
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {

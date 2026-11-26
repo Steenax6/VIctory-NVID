@@ -3425,9 +3425,10 @@ pub(crate) static OTHER_CHANNELS: std::sync::atomic::AtomicU64 = std::sync::atom
 /// ([`other_channels`]). Each distinct case is logged once (at most 32),
 /// and so is each distinct alpha-only view of an alpha-only texture, which
 /// needs no change: they say how the title's A8 tables are read.
-/// `title_dimension` is the title's view dimension (a 1D view is made 2D:
+/// `title_dimension` is the title's view dimension and the dimension the
+/// title made the texture in (a 1D view and texture are made 2D:
 /// `resource::host_dimension`).
-fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, title_dimension: u32) {
+fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, title_dimension: (u32, u32)) {
     const A8_UNORM: u32 = 65;
     // SAFETY: a live resource.
     let own = unsafe { texture.GetDesc() }.Format.0 as u32;
@@ -3440,7 +3441,7 @@ fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_
     }
     if other.is_some() || view == A8_UNORM || own == A8_UNORM {
         static SEEN: Mutex<Vec<(u32, u32, i32, u32)>> = Mutex::new(Vec::new());
-        let case = (view, own, title_dimension as i32, desc.Shader4ComponentMapping);
+        let case = (view, own, (title_dimension.0 | title_dimension.1 << 8) as i32, desc.Shader4ComponentMapping);
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if seen.len() < 32 && !seen.contains(&case) {
             seen.push(case);
@@ -3448,7 +3449,8 @@ fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_
                 view_format = view,
                 texture_format = own,
                 host_format = desc.Format.0,
-                dimension = title_dimension,
+                dimension = title_dimension.0,
+                texture_dimension = title_dimension.1,
                 host_dimension = desc.ViewDimension.0,
                 mapping = desc.Shader4ComponentMapping,
                 through_other_channels = other.is_some(),
@@ -3709,7 +3711,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         }
                     }
                 }
-                let title_dimension = desc.map(|d| d[1]);
+                let title_dimension =
+                    desc.map(|d| (d[1], crate::resource::title_dimension(resource).unwrap_or(0)));
                 let mut desc = desc.as_ref().map(srv_desc);
                 if let (Some(desc), Some(dimension)) = (desc.as_mut(), title_dimension) {
                     read_through(texture, desc, dimension);
@@ -4393,7 +4396,7 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
                 .expect("the texels");
             texture.Unmap(0, None);
             let mut desc = srv_desc(&words);
-            read_through(&texture, &mut desc, words[1]);
+            read_through(&texture, &mut desc, (words[1], 3));
             assert!(fits(&texture, Some(&mut desc.Format), false), "a view the host makes");
             let heap: ID3D12DescriptorHeap = device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
