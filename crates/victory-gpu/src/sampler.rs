@@ -52,7 +52,12 @@ impl Fields {
             AddressU: D3D12_TEXTURE_ADDRESS_MODE(self.address[0] as i32),
             AddressV: D3D12_TEXTURE_ADDRESS_MODE(self.address[1] as i32),
             AddressW: D3D12_TEXTURE_ADDRESS_MODE(self.address[2] as i32),
-            MipLODBias: self.bias,
+            // (D3D12 takes -16 to 15.99; the console's description is a float)
+            MipLODBias: if self.bias.is_nan() {
+                0.0
+            } else {
+                self.bias.clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
+            },
             MaxAnisotropy: if aniso {
                 self.anisotropy.clamp(1, 16)
             } else {
@@ -115,5 +120,10 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+        // A bias past the host's range is clamped into it.
+        for (bias, host) in [(-24.0f32, -16.0), (2.5, 2.5), (31.0, 15.99), (f32::NAN, 0.0)] {
+            w[11] = bias.to_bits();
+            assert_eq!(console(&w).MipLODBias, host, "{bias}");
+        }
     }
 }

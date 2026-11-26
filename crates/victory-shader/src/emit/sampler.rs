@@ -34,6 +34,17 @@ pub struct StaticSampler {
 impl Eq for StaticSampler {}
 
 impl StaticSampler {
+    /// The LOD bias as a D3D12 sampler takes it: inside
+    /// `D3D12_MIP_LOD_BIAS_MIN..=D3D12_MIP_LOD_BIAS_MAX` (-16 to 15.99). The console's
+    /// field reaches -32 to 31.996; a root signature with a static sampler outside the
+    /// host's range does not serialize, and the pipeline would be refused. Clamped, such
+    /// a sampler differs from the console's only where the LOD before the bias is far
+    /// enough outside the texture's levels that the extra bias still mattered.
+    pub fn host_mip_lod_bias(&self) -> f32 {
+        // (from fixed point: never NaN)
+        self.mip_lod_bias.clamp(-16.0, 15.99)
+    }
+
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -121,5 +132,22 @@ mod tests {
             ),
             (0x1D5, 16, 15.0)
         );
+    }
+
+    #[test]
+    fn lod_biases_past_the_hosts_range_are_clamped() {
+        for (raw, decoded, host) in [
+            (0x2000, -32.0, -16.0),
+            (0x2800, -24.0, -16.0),
+            (0x3000, -16.0, -16.0),
+            (0x0080, 0.5, 0.5),
+            (0x0FFD, 4093.0 / 256.0, 4093.0 / 256.0),
+            (0x0FFE, 4094.0 / 256.0, 15.99),
+            (0x1800, 24.0, 15.99),
+            (0x1FFF, 8191.0 / 256.0, 15.99),
+        ] {
+            let s = StaticSampler::from_words([0, 0, raw, 0]);
+            assert_eq!((s.mip_lod_bias, s.host_mip_lod_bias()), (decoded, host), "{raw:#x}");
+        }
     }
 }
