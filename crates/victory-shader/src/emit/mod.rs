@@ -2266,6 +2266,17 @@ mod barycentric_tests {
         assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
     }
 
+    /// A pixel program's `v_readfirstlane_b32` gives a helper lane its own value
+    /// (`IsHelperLane`, SM 6.6): the program still validates as SM 6.6.
+    #[test]
+    fn a_helper_lanes_first_lane_read_validates() {
+        let [e0, e1] = exp_mrt0(2);
+        // v_readfirstlane_b32 s0, v0; v_mov_b32 v2, s0
+        let words = [0x7E00_0500, 0x7E04_0200, e0, e1, 0xBF81_0000];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
+    }
+
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
     /// weights of vertices 1 and 2.

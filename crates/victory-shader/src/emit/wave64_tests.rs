@@ -495,6 +495,41 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
     eprintln!("ran on the hardware device: the mask's bits, or the number");
 }
 
+/// A 32-lane console program in a group of 32 x 2 that reads its lane (`v_mbcnt`, so its
+/// threads are relabelled to put each console lane on its host lane), and stores lane + 1 at
+/// its own flat id (x + 32 y). A host may give such a group's waves 16 x 2 tiles: relabelled by
+/// the wave's first flat id, two waves then took the same ids and half the ids were never
+/// stored (upstream, RTX 3070 Ti). Every id is stored, with its lane.
+#[test]
+fn every_thread_of_a_group_a_wave_may_tile_keeps_its_own_id() {
+    let words = [
+        0xD765_0004,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v4, -1, 0: the lane
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+        0x3404_0285, // v_lshlrev_b32 v2, 5, v1: 32 y
+        0x4A04_0500, // v_add_nc_u32 v2, v0, v2: the flat id
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2: its byte
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 4 << 8 | 2, // buffer_store_dword v4, v2, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, false, 32);
+    // two thread-id VGPRs (x, y), 32 x 2 threads
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11,
+        threads: [32, 2, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 64) else { return };
+    let want: Vec<u32> = (0..64).map(|n| n % 32 + 1).collect();
+    assert_eq!(got, want);
+}
+
 /// A 32-lane console wave. `if (t < s0) { ... SCC = (s1 == 7) }` and a branch on SCC after
 /// the join: the skip brings the SCC of `s_and_saveexec` ("some lane is left") along
 /// (`rtdirectionalshadows:CS_RTShadowTrace32HQ_TiledFarOnly`, 0x360-0x39c). On the console

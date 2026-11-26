@@ -15,7 +15,7 @@
 //! through the directory, which is only checked to lower and validate.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::lower::intersect::TEST_MEMORY;
+use super::lower::intersect::{TEST_BUILT, TEST_MEMORY};
 use super::{HostShader, lower, validator};
 use crate::bvh::{self, Ray, tests as nodes};
 use crate::native::{
@@ -469,6 +469,17 @@ fn expected(scene: &Scene, case: &Case, sort: bool) -> [u32; 4] {
     }
 }
 
+/// What the program returns for `case` as it is lowered: the reference, or
+/// with no structures built ([`TEST_BUILT`] clear) no child of a box node
+/// and a miss of a triangle node.
+fn returned(scene: &Scene, case: &Case, sort: bool) -> [u32; 4] {
+    match case {
+        Some((_, 4 | 5, _)) if !TEST_BUILT.get() => [bvh::NONE; 4],
+        Some(_) if !TEST_BUILT.get() => bvh::MISS.map(f32::to_bits),
+        _ => expected(scene, case, sort),
+    }
+}
+
 /// Sets the tests' title memory for this thread until dropped.
 struct Memory;
 
@@ -563,7 +574,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    Some(c) => returned(&scene, c, sort),
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -627,6 +638,33 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
         (structure >> 40) as u32 | bvh::BOX_SORT,
     );
     run(false, descriptor, 0, true);
+}
+
+/// Clears [`TEST_BUILT`] for this thread until dropped.
+struct Unbuilt;
+
+impl Unbuilt {
+    fn set() -> Self {
+        TEST_BUILT.set(false);
+        Self
+    }
+}
+
+impl Drop for Unbuilt {
+    fn drop(&mut self) {
+        TEST_BUILT.set(true);
+    }
+}
+
+#[test]
+fn without_the_builder_every_node_test_misses_on_the_card() {
+    let _unbuilt = Unbuilt::set();
+    run(true, Descriptor::Table, u64::from(NODES), true);
+    let _memory = Memory::at(BASE);
+    run(true, WHOLE, BASE + u64::from(NODES), true);
+    // The nodes are not read: the program asks the host for no title memory.
+    let (shader, _) = build(true, WHOLE).expect("lowers");
+    assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
 }
 
 #[test]

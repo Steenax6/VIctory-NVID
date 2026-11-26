@@ -85,12 +85,22 @@ shaders and emulates the one instruction.
   translated program has no thread count to stop at yet (a shader change).
 - The directory of title memory by address does not follow buffers the
   title releases or replaces.
+- Without the builder (no `VICTORY_BVH_BUILDER=1`) the dynamic structures and
+  the top of the tree are never built, and a walk through them read whatever
+  their memory held: dark tiles on hair and faces, bright squares in shadow,
+  walks that ran to the trace loop limit. The node test now answers "no hit"
+  then (a box node returns no child, a triangle node a miss) and reads no
+  node, decided when the program is translated: a run with the switch whose
+  builder the host turns off later (a builder pipeline that cannot be made)
+  keeps the full test.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
-  of two boxes entered at the same distance, and the result for a ray exactly
-  through an edge.
+  of two boxes entered at the same distance, the result for a ray exactly
+  through an edge, and that a child whose pointer is "none" is a miss
+  whatever its box (sorted, it would otherwise stand before children that
+  are there).
 - Cost on the GPU is unmeasured.
 
 ## Where to look
