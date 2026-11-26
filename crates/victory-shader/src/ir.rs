@@ -1175,6 +1175,8 @@ fn goes_round(p: &Program, first: usize, within: &[bool], entry: &[Value]) -> bo
 /// only when no lane of the wave is left; scalar code has no effects. The
 /// body is then code every lane runs, which a console wave run as two host
 /// waves needs for the barriers of its exchanges and LDS accesses.
+/// An early-out is kept where the rest of the program holds a loop that may
+/// not end with no lane left ([`goes_round`]), as in [`without_skips`].
 /// `None` if the program has no such branch.
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     let ends = |b: usize| {
@@ -1183,11 +1185,14 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     };
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for block in &mut blocks {
+    for (b, block) in blocks.iter_mut().enumerate() {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        if ends(taken)
+            && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && !goes_round(p, not_taken, &reached_from(p, not_taken), &tested_exec(p, b))
+        {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
             any = true;
@@ -2293,6 +2298,21 @@ mod tests {
         assert_eq!(skips(&p), 1);
         assert!(without_skips(&p, false).is_none());
         assert!(without_skips(&p, true).is_none());
+        assert!(without_early_outs(&p).is_none());
+        // with a loop that ends with its lanes after it instead, the early-out goes
+        let p = build_words(
+            &[
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0003, // s_cbranch_execz to the end
+                0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+                0x7DA8_0284, // v_cmpx_gt_u32 4, v1
+                0xBF89_FFFD, // s_cbranch_execnz (back to the add)
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert_eq!(skips(&without_early_outs(&p).expect("left out")), 0);
     }
 
     /// A loop that ends when no lane is left (EXEC tested at its back edge) ends at once in a
