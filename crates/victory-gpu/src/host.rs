@@ -7490,15 +7490,41 @@ impl HostList {
         // wrote on the card; then what this list writes on the card is
         // noted for the lists after it. (Its own copies run after its
         // prelude: an upload it asked for is theirs to overwrite.)
-        let uploads = {
+        // Then the copies on the card that bring the textures of views
+        // placed in card-written memory what the card wrote: those noted
+        // by the lists submitted before this one and by this one's
+        // uploads, not those its own card copies ask for (they follow it,
+        // in the next prelude).
+        let (uploads, feeds) = {
             let deferred = self.deferred();
             let uploads = crate::texture::decide_uploads(&deferred.texture_uploads);
             crate::texture::check_card_written(&deferred.card_checks);
+            let feeds = crate::texture::take_feeds();
+            crate::texture::count_own_writes(&uploads, &deferred.card_writes);
             for write in &deferred.card_writes {
                 write.publish();
             }
-            uploads
+            (uploads, feeds)
         };
+        // Each feed with its two textures in the copy states, and back to
+        // the states they were in: taken here, before the states below are
+        // moved on to what this list leaves. The list holds the textures
+        // until it is reset.
+        let feed_moves: Vec<[Vec<D3D12_RESOURCE_BARRIER>; 2]> = feeds
+            .iter()
+            .map(|feed| {
+                let (mut there, mut back) = (Vec::new(), Vec::new());
+                for (texture, state) in feed.textures().into_iter().zip([COPY_SOURCE, COPY_DEST]) {
+                    self.keep(&texture.texture);
+                    let real = texture.state.load(Ordering::Relaxed);
+                    if real != state {
+                        there.push(transition(&texture.texture, host_state(real), host_state(state)));
+                        back.push(transition(&texture.texture, host_state(state), host_state(real)));
+                    }
+                }
+                [there, back]
+            })
+            .collect();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -7578,7 +7604,7 @@ impl HostList {
         let hoisted = (!hoist_runs.is_empty())
             .then(|| self.hoist_buffers.get().and_then(|b| b.as_ref()))
             .flatten();
-        if barriers.is_empty() && syncs.is_empty() && hoisted.is_none() && uploads.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && hoisted.is_none() && uploads.is_empty() && feeds.is_empty() {
             return None;
         }
         let mut again_held = self.preludes_again.lock().unwrap_or_else(|e| e.into_inner());
@@ -7608,6 +7634,15 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                for (feed, [there, back]) in feeds.iter().zip(&feed_moves) {
+                    if !there.is_empty() {
+                        list.ResourceBarrier(there);
+                    }
+                    feed.record(list);
+                    if !back.is_empty() {
+                        list.ResourceBarrier(back);
+                    }
+                }
                 // Timed with `VICTORY_GPU_TIMING` (`crate::own_time`).
                 let timed = (!syncs.is_empty()).then(|| crate::own_time::begin(list, crate::own_time::Own::TwinCopies)).flatten();
                 if !to_copy.is_empty() {
@@ -8261,6 +8296,12 @@ impl HostList {
     /// upload for it: looked at when the list is submitted.
     pub(crate) fn card_check(&self, copy: std::sync::Arc<crate::resource::HostTexture>) {
         self.deferred().card_checks.push(copy);
+    }
+
+    /// Whether the list has a card copy into `copy` noted already; the
+    /// subresources `subs` are then added to that note.
+    pub(crate) fn card_write_more(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, subs: u64) -> bool {
+        self.deferred().card_writes.iter_mut().any(|write| write.more(copy, subs))
     }
 
     /// The list records a card copy into a texture the title fills: noted

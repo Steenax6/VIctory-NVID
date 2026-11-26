@@ -222,11 +222,19 @@ prelude, and left out for the levels the card wrote last. They were
 recorded while the game's list was, and an upload recorded before such a
 card copy ran after it when its list was submitted later: 27 times in one
 run, whose textures then showed what their memory had held before (noise
-baked onto a head in about half the runs). The line "textures the title
-fills that the card copied into" counts the levels copied from memory after
-the card had written them last (0 now), the uploads withheld for that, and
-the times the game was found to have written such memory after the card
-(its bytes then go up again).
+baked onto a head in about half the runs). The same holds for every view
+of that memory: a view the game placed where a texture the card writes
+starts (another format of the same family, the same texels and levels) is
+a texture of its own here and is brought what the card wrote by a copy on
+the card, in the next list's prelude, and no upload from memory goes over
+it afterwards. The line "textures the title fills that the card copied
+into" counts the levels copied from memory over what the card had written
+last (0: none can be), the levels uploaded ahead of a card copy of their
+own list (the copy runs after, nothing is lost), the uploads withheld, the
+times the game was found to have written such memory after the card (its
+bytes then go up again), and the placed views in such memory: how many
+start where the texture does, have a host copy, are shown by a slot, were
+fed from the card, or do not fit it.
 
 At the game's Submit the addresses a read into physical pages will write
 are known; until the read is done the texture pass leaves a texture there

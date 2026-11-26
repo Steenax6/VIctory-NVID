@@ -3401,21 +3401,35 @@ pub(crate) fn placed_copies(address: u64) -> usize {
     textures.iter().filter(|&&t| copy_state(t as This).is_some_and(|state| state.0 == 2)).count()
 }
 
-/// How many textures [`texture_at`] made for views placed in the title
-/// memory `[address, address + bytes)`, `this` itself left out: each has a
-/// host copy of its own, filled from that memory (for the count of
-/// `crate::texture::CARD_WRITTEN`, when the card first copies into the
-/// texture that owns the memory).
+/// The textures [`texture_at`] made for views placed in the title memory
+/// `[address, address + bytes)`, `this` itself left out, each with where
+/// it is placed: each has a host copy of its own, filled from that memory
+/// (for `crate::texture::CARD_WRITTEN`, when the card first copies into
+/// the texture that owns the memory).
 #[cfg(windows)]
-pub(crate) fn placed_within(address: u64, bytes: u64, this: This) -> u64 {
+pub(crate) fn placed_in(address: u64, bytes: u64, this: This) -> Vec<(u64, This)> {
     // (No bytes: nothing inside; the end never lies below the start.)
     if bytes == 0 {
-        return 0;
+        return Vec::new();
     }
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     map.range((address, [0; 14])..(address.saturating_add(bytes), [0; 14]))
         .filter(|&(_, &texture)| texture != this as usize)
-        .count() as u64
+        .map(|(&(at, _), &texture)| (at, texture as This))
+        .collect()
+}
+
+/// The host copies, where they are made, of the textures [`texture_at`]
+/// made for views placed at `address` (one for each description viewed
+/// there). None is made here. The textures stay for the run, so this may
+/// be asked at a submission.
+#[cfg(windows)]
+pub(crate) fn placed_copies_at(address: u64) -> Vec<std::sync::Arc<HostTexture>> {
+    let textures: Vec<usize> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.range((address, [0; 14])..=(address, [u32::MAX; 14])).map(|(_, &t)| t).collect()
+    };
+    textures.into_iter().filter_map(|t| hosted(t as This, false).map(|made| made.0)).collect()
 }
 
 /// The resource [`texture_at`] made for a texture placed at `address` with
@@ -4181,8 +4195,8 @@ mod tests {
             fill(t, colour);
             t
         };
-        // The first texel of subresource `sub` of a texture's host copy.
-        let texel = |t: This, sub: u32| -> [u8; 4] {
+        // The first row of subresource `sub` of a texture's host copy.
+        let row = |t: This, sub: u32| -> Vec<[u8; 4]> {
             let image = host_resource(t).unwrap();
             // SAFETY: live resources, an open list, a finished copy.
             unsafe {
@@ -4233,11 +4247,14 @@ mod tests {
                 host.execute(&[&back]);
                 let mut mapped = std::ptr::null_mut();
                 readback.Map(0, None, Some(&mut mapped)).unwrap();
-                let texel = mapped.cast::<u8>().add(footprint.Offset as usize).cast::<[u8; 4]>().read_unaligned();
+                let first = mapped.cast::<u8>().add(footprint.Offset as usize).cast::<[u8; 4]>();
+                let texels = (0..footprint.Footprint.Width as usize).map(|x| first.add(x).read_unaligned()).collect();
                 readback.Unmap(0, None);
-                texel
+                texels
             }
         };
+        // Its first texel.
+        let texel = |t: This, sub: u32| row(t, sub)[0];
         // A list that samples `t`: its upload is asked for, as a draw's
         // table read asks.
         let reads = |t: This| {
@@ -4348,9 +4365,87 @@ mod tests {
         host.execute(&[&upload]);
         assert_eq!(texel(never, 0), red, "a copy that was never submitted");
         assert_eq!(host_copy(never).unwrap().card.subs(), 0);
+
+        // Two card copies into different parts of one level, and an upload
+        // between them. A copy of a part asks for the destination's upload
+        // first, in its own list (as `copy_texture_region` does): title
+        // memory goes under the level once, before the card's first copy
+        // into it, and never again, so what the first copy wrote stays
+        // under the second.
+        let part = |to: This, from: This, columns: std::ops::Range<u32>| {
+            let list = host.new_list().unwrap();
+            let (host_to, host_from) = (host_resource(to).unwrap(), host_resource(from).unwrap());
+            crate::texture::upload(&list, from, host_from);
+            crate::texture::upload(&list, to, host_to);
+            crate::list::ensure_state(&list, to, COPY_DEST);
+            crate::list::ensure_state(&list, from, COPY_SOURCE);
+            crate::texture::host_written(&list, to, host_to, Some(0));
+            let columns = D3D12_BOX { left: columns.start, top: 0, front: 0, right: columns.end, bottom: 4, back: 1 };
+            // SAFETY: an open list, live textures in the copy states, a box
+            // inside both.
+            unsafe {
+                let of = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                list.list.CopyTextureRegion(&of(host_to), columns.left, 0, 0, &of(host_from), Some(&columns));
+            }
+            list.close();
+            list
+        };
+        let (halves, left, right) = (make(1, red), make(1, green), make(1, blue));
+        let own_before = counts();
+        let between = reads(halves);
+        let first = part(halves, left, 0..2);
+        let second = part(halves, right, 2..4);
+        host.execute(&[&first]);
+        host.execute(&[&between]);
+        assert_eq!(row(halves, 0), [green, green, red, red], "title memory under the part the card did not write");
+        host.execute(&[&second]);
+        assert_eq!(row(halves, 0), [green, green, blue, blue], "the first copy's part stays under the second");
+        let later = reads(halves);
+        host.execute(&[&later]);
+        assert_eq!(row(halves, 0), [green, green, blue, blue]);
+        let own = counts();
+        assert_eq!(own[2], own_before[2], "nothing copied over what the card wrote last");
+        assert!(own[8] > own_before[8], "the level uploaded ahead of its own list's copy is counted as that");
+
+        // A view the title placed in the memory of a texture the card
+        // writes shows what the card wrote, though it is a host texture of
+        // its own and title memory never holds those bytes: one whose host
+        // copy is there when the card writes, and one made afterwards.
+        let object = make(1, red);
+        let address = resource(object).data() as u64;
+        let placed = |format: u32| {
+            let desc = ResourceDesc { layout: 1, ..texture(4, 4, format, 1) };
+            // SAFETY: 56 bytes in the description's layout.
+            let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+            texture_at(address, &words).unwrap()
+        };
+        let fed_before = counts()[9];
+        let view = placed(29);
+        let upload = reads(view);
+        host.execute(&[&upload]);
+        assert_eq!(texel(view, 0), red, "filled from title memory while nothing else wrote the memory");
+        let copy = copies(object, left, None);
+        host.execute(&[&copy]);
+        // The copy into the view runs with the next list submitted.
+        let next = reads(right);
+        host.execute(&[&next]);
+        assert_eq!(texel(view, 0), green, "a placed view of memory the card wrote shows what the card wrote");
+        let late = placed(30);
+        let upload = reads(late);
+        host.execute(&[&upload]);
+        assert_eq!(texel(late, 0), green, "and so does one made after the card wrote");
+        // An upload asked for either leaves the card's bytes.
+        let (again, again2) = (reads(view), reads(late));
+        host.execute(&[&again, &again2]);
+        assert_eq!((texel(view, 0), texel(late, 0)), (green, green));
+        assert!(counts()[9] >= fed_before + 2, "the views fed from the card are counted");
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-        for t in [t, s, t2, s2, t3, s3, levels, source, never, source2] {
+        for t in [t, s, t2, s2, t3, s3, levels, source, never, source2, halves, left, right, object] {
             resource_release(t);
         }
     }
