@@ -425,22 +425,36 @@ pub(crate) fn removal_context() -> String {
     let (started, finished) = (STARTED.load(Ordering::Relaxed), FINISHED.load(Ordering::Relaxed));
     // Started and not landed, less the one being prepared: sent ahead.
     let ahead = started.saturating_sub(finished).saturating_sub(u64::from(phase == 1));
+    // The lists of those flights, if the line is free to look at (whoever
+    // found the removal may hold it).
+    let flying = LINE.try_lock().map_or_else(|_| "lists not known: the line was busy".to_owned(), |line| format!("{} lists", line.lists));
     let card = match (phase, ahead) {
         (2, _) => String::new(),
         (_, 0) => " (nothing of ours was running on the card)".to_owned(),
-        (_, n) => format!(" ({n} submissions sent ahead had not landed: their lists were on the card or waiting for it)"),
+        (_, n) => format!(" ({n} submissions sent ahead had not landed, {flying}: on the card or waiting for it)"),
+    };
+    // Without device-removed data the runtime says nothing of where the
+    // card stood: the switch that asks for it at little cost.
+    let data = if dred_any() {
+        ""
+    } else if cfg!(feature = "diagnostics") {
+        "; no device-removed data was asked for: VICTORY_D3D12_DRED=light names the list and command the card stood at"
+    } else {
+        "; no device-removed data: a diagnostics build with VICTORY_D3D12_DRED=light names the list and command the card stood at"
     };
     // A pass of the title's that is recorded and not run (its host
     // pipeline is not made yet, or it is one the layer drops) leaves what
     // it would have written as it was, and the passes that read it run.
     let (dropped, drawn) = crate::draw::dropped_now();
     format!(
-        "the submitting thread was {doing}{card}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {started} finished {finished}; since the last frame line {dropped} draws and dispatches were recorded and not run for want of a host pipeline ({drawn} draws run so far)",
+        "the submitting thread was {doing}{card}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {started} finished {finished}; since the last frame line {dropped} draws and dispatches were recorded and not run for want of a host pipeline ({drawn} draws run so far); host pipelines queued and not made yet {} ({} of them no longer waited for){data}",
         SUBMITTING[1].load(Ordering::Relaxed),
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
         crate::pipeline::library_removal_note(),
         RETIREMENTS[0].load(Ordering::Relaxed),
         RETIREMENTS[1].load(Ordering::Relaxed),
+        crate::pipeline::making(),
+        crate::pipeline::passed_over(),
     )
 }
 

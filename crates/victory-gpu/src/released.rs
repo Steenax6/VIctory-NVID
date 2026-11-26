@@ -16,6 +16,12 @@
 //! marked released is counted, as held by a state of the list (it was held
 //! before 2336572 too) or by a keep alone (without the keep it would have
 //! been freed before the list ran).
+//!
+//! Both counts were 0 in every run through 2026-11-26 (22 runs after the
+//! counter came in, entries into the open world with and without the
+//! dump, with the keep of bound targets): the line, said only when one is
+//! above 0, never came. The losses of the host device at the world's
+//! entry that day are not explained by a texture let go under a list.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,7 +132,7 @@ pub(crate) fn line() {
     let now = COUNTS[1].each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     let first = FIRST.lock().unwrap_or_else(|e| e.into_inner());
     tracing::info!(
-        "lists submitted with a host texture let go before (by the title or the sweep): since the start {} held by a state of the list and {} by a keep alone \
+        "lists submitted with a host texture let go before (by the title or the sweep; 0 in every run through 2026-11-26): since the start {} held by a state of the list and {} by a keep alone \
          (without it freed before the list ran); since the last line {} and {}; the first: {}",
         total[0],
         total[1],
