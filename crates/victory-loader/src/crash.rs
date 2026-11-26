@@ -684,6 +684,108 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+    // SAFETY: as above.
+    unsafe { dump_on_crash(info) };
+}
+
+/// The directory `VICTORY_CRASH_DUMP_DIR` names, if it is set, or why it
+/// cannot be used: a dump holds the title's memory, so a directory inside
+/// the source tree (any copy of it) is refused, as for captures and caches
+/// ([`victory_core::ensure_outside_repo`]).
+fn dump_dir(set: Option<std::ffi::OsString>) -> Option<Result<std::path::PathBuf, String>> {
+    let dir = std::path::PathBuf::from(set?);
+    Some(
+        victory_core::ensure_outside_repo(&dir)
+            .map(|()| dir)
+            .map_err(|e| e.to_string()),
+    )
+}
+
+/// `VICTORY_CRASH_DUMP_DIR=<dir>`: on an unhandled exception, a full-memory
+/// minidump of the process (the title's memory, our objects, every thread)
+/// with the exception named in it, written to `<dir>\crash-<time>-<pid>.dmp`
+/// before the process ends; a new file each time. Off unless set: a dump
+/// is the size of the process (20 to 26 GB here) and holds the title's code
+/// and data, so it stays on this machine, and a directory below the source
+/// tree is refused. dbghelp is loaded by name only when it is needed.
+/// (Geckomacabre/vx-layer 707b75be0.)
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn dump_on_crash(info: *const EXCEPTION_POINTERS) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId};
+    let dir = match dump_dir(std::env::var_os("VICTORY_CRASH_DUMP_DIR")) {
+        None => return,
+        Some(Ok(dir)) => dir,
+        Some(Err(why)) => {
+            append_to_log(&format!("VIctory: crash dump not written: {why}\n"));
+            return;
+        }
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // SAFETY: a plain query.
+    let pid = unsafe { GetCurrentProcessId() };
+    let path = dir.join(format!("crash-{stamp}-{pid}.dmp"));
+    let Ok(file) = std::fs::File::create_new(&path) else {
+        append_to_log(&format!("VIctory: crash dump not written: cannot create {}\n", path.display()));
+        return;
+    };
+    /// MINIDUMP_EXCEPTION_INFORMATION (packed to 4 in dbghelp.h).
+    #[repr(C, packed(4))]
+    struct ExceptionInformation {
+        thread: u32,
+        pointers: *const EXCEPTION_POINTERS,
+        client_pointers: i32,
+    }
+    type WriteDump = unsafe extern "system" fn(
+        process: *mut core::ffi::c_void,
+        pid: u32,
+        file: *mut core::ffi::c_void,
+        kind: u32,
+        exception: *const ExceptionInformation,
+        user: *const core::ffi::c_void,
+        callback: *const core::ffi::c_void,
+    ) -> i32;
+    // SAFETY: loading a system DLL by name and looking up its export, whose
+    // signature is the one declared above.
+    let write: Option<WriteDump> = unsafe {
+        let module = LoadLibraryA(c"dbghelp.dll".as_ptr().cast());
+        if module.is_null() {
+            None
+        } else {
+            GetProcAddress(module, c"MiniDumpWriteDump".as_ptr().cast()).map(|f| std::mem::transmute(f))
+        }
+    };
+    let Some(write) = write else {
+        append_to_log("VIctory: crash dump not written: dbghelp's MiniDumpWriteDump not found\n");
+        return;
+    };
+    let exception = ExceptionInformation {
+        // SAFETY: a plain query.
+        thread: unsafe { GetCurrentThreadId() },
+        pointers: info,
+        client_pointers: 0,
+    };
+    // Full memory, handles, unloaded modules, full memory info, thread info.
+    const KIND: u32 = 0x2 | 0x4 | 0x20 | 0x800 | 0x1000;
+    let started = std::time::Instant::now();
+    // SAFETY: our own process, an open file, and the exception being dispatched.
+    let ok = unsafe {
+        write(GetCurrentProcess(), pid, file.as_raw_handle(), KIND, &exception, std::ptr::null(), std::ptr::null())
+    };
+    drop(file);
+    append_to_log(&format!(
+        "VIctory: crash dump {} {} ({:.1} GB, {:.0} s)\n",
+        if ok != 0 { "written to" } else { "FAILED at" },
+        path.display(),
+        std::fs::metadata(&path).map_or(0.0, |m| m.len() as f64 / (1u64 << 30) as f64),
+        started.elapsed().as_secs_f64()
+    ));
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),
@@ -962,6 +1064,18 @@ mod tests {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
+
+    /// A dump holds the title's memory: unset is no dump, a directory in the
+    /// source tree is refused, one outside it is taken.
+    #[test]
+    fn a_crash_dump_directory_below_the_source_tree_is_refused() {
+        assert!(dump_dir(None).is_none());
+        let inside = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dumps");
+        assert!(dump_dir(Some(inside.into_os_string())).unwrap().is_err());
+        let outside = tempfile::tempdir().unwrap();
+        let taken = dump_dir(Some(outside.path().as_os_str().to_owned())).unwrap();
+        assert_eq!(taken.unwrap(), outside.path());
+    }
 
     #[test]
     fn concurrent_crash_records_stay_together() {
