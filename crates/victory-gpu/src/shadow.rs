@@ -154,8 +154,9 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_KB` (1024; it was 16 MiB once) and
-/// `VICTORY_CARD_BUFFERS_MB` (1024; it was 512). Run 69's gameplay has ten
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (64, every title buffer; 1024 before, 16
+/// MiB once) and `VICTORY_CARD_BUFFERS_MB` (1280; 1024 before, 512 once).
+/// Run 69's gameplay has ten
 /// title buffers of 16 MiB or more, 494 MB, and 1,650 MB of the card's
 /// budget free. From 1 MiB up the shader writes of the smaller buffers are
 /// found by the card's hashes too, and with that the first room's walls
@@ -174,9 +175,13 @@ pub(crate) fn cards() -> bool {
 /// runs 274 and 275). What it costs: 64 KiB of the card's memory a copy
 /// and as much again for one shaders write, and the passes that send and
 /// hash before each submission go through more copies (11.6 to 23.0 ms of
-/// card time there; [`Shadow::card_hashed`]). Not measured here yet, so
-/// not the default. Where the copies went is said with the memory lines
-/// ([`placed_line`]).
+/// card time there; [`Shadow::card_hashed`] hashes a copy's own bytes for
+/// that). Measured here (RTX 4070 Ti, prologue, with the own-bytes hash):
+/// the first room 77.2 ms a frame against 87.8 and 89.0 with 1 MiB, the
+/// card busy 56 % of the time against 74 to 78, the frame line's copies 26
+/// ms against 17.5, the opening cutscene 108 ms, the picture the same; a
+/// 22-minute run in the open world with it had no trouble. Where the
+/// copies went is said with the memory lines ([`placed_line`]).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
@@ -184,8 +189,8 @@ fn card_limits() -> (u64, u64) {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
         (
-            (number("VICTORY_CARD_BUFFERS_MIN_KB", 1024) << 10).max(PIECE as u64),
-            number("VICTORY_CARD_BUFFERS_MB", 1024) << 20,
+            (number("VICTORY_CARD_BUFFERS_MIN_KB", 64) << 10).max(PIECE as u64),
+            number("VICTORY_CARD_BUFFERS_MB", 1280) << 20,
         )
     })
 }
@@ -220,7 +225,7 @@ pub(crate) fn placed_line() {
     tracing::info!(
         "title buffers' host copies made so far, by where shaders read them: {} in the card's memory {:.0} MB; in the PC's \
          memory (read over the bus): {} of 64 KiB {:.0} MB, {} up to 256 KiB {:.0} MB, {} up to 1 MiB {:.0} MB, {} larger {:.0} MB \
-         (the least size for the card: {} KiB, VICTORY_CARD_BUFFERS_MIN_KB)",
+         (the least size for the card: {} KiB, VICTORY_CARD_BUFFERS_MIN_KB; 64 is every title buffer)",
         v[0].0,
         mb(v[0].1),
         v[1].0,
@@ -3900,19 +3905,19 @@ impl Shadow {
     /// card side's bytes from before if made yet, and their size.
     /// The bytes from the copy's start that the card's hashes cover, for a
     /// copy of `size` bytes in the card's memory: the copy's whole buffer;
-    /// with `VICTORY_CARD_HASH_LEN=1` the title buffer's own bytes, rounded
-    /// up to the hash's 16-byte step. A copy's buffer is the title buffer
+    /// by default the title buffer's own bytes, rounded up to the hash's
+    /// 16-byte step (`VICTORY_CARD_HASH_LEN=0`: the whole buffer). A copy's buffer is the title buffer
     /// rounded up to 64 KiB, so a title buffer of 288 bytes was hashed over
     /// 4,096 steps where 18 hold everything that can go back to the title
     /// (what is fetched is cut to the title buffer, [`Shadow::card_piece`]).
     /// With every title buffer on the card (`VICTORY_CARD_BUFFERS_MIN_KB=64`)
     /// the source's send-and-hash lists took 19.7 ms of card time a frame
     /// where they had taken 10.9 (fxceless/victory-fork c36971b). Every hash
-    /// of a copy, sent and compared, takes the same length. Not run in a
-    /// game yet, so not the default.
+    /// of a copy, sent and compared, takes the same length. The default with
+    /// every title buffer on the card ([`card_limits`]).
     pub(crate) fn card_hashed(&self, size: u64) -> u64 {
         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*OWN.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1")) {
+        if !*OWN.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_LEN").is_none_or(|v| v != "0")) {
             return size;
         }
         self.len.next_multiple_of(16).clamp(16, size.max(16))

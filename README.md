@@ -183,16 +183,19 @@ those passes are slow as translated is open, and it is where the next gain
 would be; 30 frames a second would need the title's commands, twice a
 frame's time there now, to halve.
 
-To measure, not yet the default: `VICTORY_CARD_BUFFERS_MIN_KB=64` (with
-`VICTORY_CARD_BUFFERS_MB=1280`) puts the host copy of every title buffer in
-the card's memory; by default only those of 1 MiB and more are there
-(`=1024`), and a shader's every load and store on the others crosses the
-bus. On an RTX 4070 (fxceless/victory-fork c36971b) the title's lists went
-from 68.0 to 49.8 ms of card time a frame, single passes from 6.7 to 1.6
-ms; our passes that send and hash before each submission went from 11.6
-to 23.0 ms, and `VICTORY_CARD_HASH_LEN=1` (hash a copy's own bytes, not its
-whole 64 KiB) is meant to take that back. A line with the frame-rate line
-says how many copies went where, by size.
+The host copy of every title buffer is in the card's memory
+(`VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_CARD_BUFFERS_MB=1280`; before,
+only those of 1 MiB and more, `=1024` and `=1024`, and a shader's every
+load and store on the others crossed the bus), and the card's hashes of a
+copy cover the title buffer's own bytes, not its whole 64 KiB
+(`VICTORY_CARD_HASH_LEN`, on; `=0`: the whole copy). On the RTX 4070 Ti in
+the prologue the first room went from 87.8-89.0 to 77.2 ms a frame, the
+card busy 56 % of the time instead of 74-78, the frame line's copies from
+17.5 to 26 ms, the opening cutscene at 108 ms, the picture the same; a
+22-minute run in the open world had no trouble with it
+(fxceless/victory-fork c36971b measured 68.0 to 49.8 ms of card time a
+frame on an RTX 4070). The three stay as tunables. A line with the
+frame-rate line says how many copies went where, by size.
 
 `VICTORY_PIPELINE_EARLY_WORKERS=<n>` sets how many of them may make the
 pipelines the run before drew with, before anything asks for them (default:
