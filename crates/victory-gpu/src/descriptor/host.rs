@@ -2377,10 +2377,11 @@ impl HostHeap {
     /// such view whatever slot it is in.
     fn quick(&self, index: u32, view: &View) -> Option<Quick> {
         let buffer = match view {
-            View::Constant(..) | View::Placed(true, ..) => true,
+            View::Constant(..) => true,
             // A placed texture's view notes its memory, which may make
-            // other slots stale: not quick.
-            View::Placed(false, resource, _) => resource[0] == 1,
+            // other slots stale: not quick. Nor is an unordered one, which
+            // is made as the slot is written ([`View::is_buffer`]).
+            View::Placed(_, resource, _) => resource[0] == 1,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as crate::object::This).is_some()
             }
@@ -4430,10 +4431,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                // No texture could be made for it ([`placed_texture`]): a
+                // null view, whose writes are dropped.
+                once!(
+                    dimension = resource[0],
+                    unordered = *unordered,
+                    "a placed texture view has no host texture: a null view"
+                );
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -4478,19 +4482,28 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in
+/// memory itself, as a view of the resource made for that memory (on first
+/// use): for a shader view one filled from that memory, for an unordered
+/// one the host's own, which the views placed to sample the memory take
+/// their texels from (`crate::resource::alias_of`).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let &View::Placed(unordered, ref resource, ref desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    if unordered {
+        let texture = crate::resource::uav_texture_at(address, resource, desc[0])?;
+        Some(View::Unordered(texture as usize, 0, words))
+    } else {
+        let texture = crate::resource::texture_at(address, resource)?;
+        Some(View::Shader(texture as usize, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
