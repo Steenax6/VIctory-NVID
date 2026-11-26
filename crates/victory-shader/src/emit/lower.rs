@@ -101,6 +101,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether its UAVs are globally coherent ([`crate::ir::orders_across_groups`]).
+    #[cfg(test)]
+    pub coherent: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1157,6 +1160,9 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
+        s.coherent = crate::ir::orders_across_groups(
+            p.blocks.iter().flat_map(|b| &b.insts).map(|i| (i.name(), i.fields.clone())),
+        );
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
@@ -2392,6 +2398,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            coherent: self.s.coherent,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2489,6 +2497,26 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::ThreadsLeft => {
+                // The dispatch's threads in x less those of the groups before this one
+                // (`spill::thread_limited`): u32::MAX for a dispatch of whole groups leaves
+                // more than a group in every one; a group past the count has none.
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let width = match self.x.native.io {
+                    StageIo::Cs(cs) => cs.threads[0],
+                    _ => return Val::Missing("the threads left of a dispatch outside a compute program"),
+                };
+                let count = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS), 0, 0);
+                let e = self.s.entry;
+                let width = self.s.m.i32(width);
+                let before = self.s.m.bin(e, Bin::Mul, g, width);
+                let left = self.s.m.bin(e, Bin::Sub, count, before);
+                let some = self.s.m.cmp(e, pred::IUGT, count, before);
+                let zero = self.s.m.i32(0);
+                return Val::I32(self.s.m.select(e, some, left, zero));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -2886,6 +2914,11 @@ impl<'a> Lower<'a> {
         use super::shader::USER_VIEW_ADDRESS;
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
+        // Picked from the view heap at an index the code computes: from the
+        // host's table of view addresses by heap slot.
+        if rp.root == RootType::ResourceHeap && a.offset % 32 == 0 {
+            return self.heap_view_address(site);
+        }
         if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
             return None;
         }
@@ -5419,6 +5452,12 @@ impl<'a> Lower<'a> {
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
+        if name == "s_waitcnt_vscnt" {
+            // The wait for the program's stores to land, kept only in a program that orders
+            // memory between groups (`ir::orders_across_groups`): a fence there.
+            self.device_fence();
+            return Ok(());
+        }
         if matches!(
             name,
             "s_setreg_imm32_b32" | "s_setreg_b32" | "s_swappc_b64" | "s_version"
@@ -5919,6 +5958,22 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A fence over all device memory (`DeviceMemoryBarrier`: the global UAV fence, no group
+    /// sync) in a compute program that orders memory between groups (its views are globally
+    /// coherent, [`crate::ir::orders_across_groups`]), where the console orders its accesses
+    /// against other groups': the wait for its stores to land (`s_waitcnt_vscnt`, before the
+    /// atomic that tells another group they are there) and a cache invalidation (before reads
+    /// of what another group wrote). The host orders a thread's accesses to different
+    /// addresses for other groups only at a fence. Elsewhere nothing.
+    /// From fxceless/victory-fork PR #914 with its commit 93c64fc36 (SpaghettiMaster545).
+    fn device_fence(&mut self) {
+        if !self.s.coherent || self.s.threads.is_none() || self.s.mesh.is_some() {
+            return;
+        }
+        let (mode, void) = (self.s.m.i32(2), self.s.t.void);
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -5930,6 +5985,11 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if matches!(name, "s_dcache_inv" | "s_gl1_inv") {
+            // As `buffer_gl0_inv`: no cache of the console's to drop, a fence.
+            self.device_fence();
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -9549,7 +9609,9 @@ impl<'a> Lower<'a> {
         };
         let name = inst.name();
         if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
-            // The host has no console buffer cache to invalidate.
+            // The host has no console buffer cache to invalidate; what the
+            // invalidation orders is a fence there (`device_fence`).
+            self.device_fence();
             return Ok(());
         }
         if *lds || *tfe {
@@ -10518,6 +10580,14 @@ impl<'a> Lower<'a> {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
+            // The structure builder's programs (a spilled user-data table) loop over their
+            // structures: copies whose threads step by the dispatch's width over a structure's
+            // nodes, climbs from a leaf to the root, walks of a node list to its end; their
+            // trip counts grow with the structures, which 4,096 does not bound. (Their one
+            // wait on another group's flag stops itself at 256 rounds.) They run only while
+            // the whole builder does (`VICTORY_BVH_BUILDER=1`).
+            // shortcut: cut at 65,536, the compute limit before it was lowered for the others.
+            LOOP_LIMIT if crate::spill::is_spilled(self.x.native) => 1 << 16,
             LOOP_LIMIT => 1 << 12,
             named => named,
         };

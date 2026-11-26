@@ -511,6 +511,8 @@ fn translate(
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
+        // as `emit::translate` has them
+        let p = victory_shader::spill::thread_limited(p);
         match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
