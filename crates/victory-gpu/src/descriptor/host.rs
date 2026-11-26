@@ -3130,6 +3130,26 @@ impl HostHeap {
         // for any placed texture's view that changed stopped all recording
         // threads behind each such write and the views being made before
         // it, some 10 ms a frame of theirs.)
+        // A slot made from the very record that is there has nothing done
+        // to it under its lock either: it is answered without the lock.
+        // Every draw asks this of every slot its tables name, and the lock
+        // is the one the pass over the heap and the title's writes of other
+        // slots take (7.8 ms a frame of the recording threads waiting for
+        // it, the profile of 2026-11-26). A slot another thread is making
+        // or taking away this instant is seen either as it was or as it will
+        // be, which are the two orders the lock allows.
+        {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag == VIEW_TAG
+                && key != 0
+                && self.made_key(index) == Some(key)
+                && let Some(view) = view_at(i, generation)
+            {
+                return Some(view);
+            }
+        }
         let mut all = false;
         loop {
             let slot = if all { self.locks.all() } else { self.locks.slot(index) };
