@@ -134,6 +134,81 @@ pub(crate) struct HostHeap {
     /// journal's asking its upload read after (`crate::watch::asked_now`;
     /// 0 until the read), for [`HostHeap::texture_slot_found`].
     asked: Mutex<std::collections::HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+    /// Per title slot the texture pass uploaded, the title memory its
+    /// view holds: from where its texture starts to the end of the bytes
+    /// of the view's first level ([`HostHeap::texture_slot_holds`]). A
+    /// tell is for the slot if it lies in them ([`told_slots`]).
+    held: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
+}
+
+/// Since the start, of the slots a tell of written or mapped memory might
+/// be for ([`told_slots`]): those that took it because their view holds
+/// its bytes though another texture's view starts between (they were
+/// passed over, and a look found them changed later or never); those
+/// passed over because their view does not hold its bytes (they were
+/// uploaded again for memory that is another texture's, or not there).
+pub(crate) static TOLD_BY_VIEW: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Of the slots a tell of title memory `[start, end)` may be for, the
+/// ones it is for and the ones it is only known of
+/// ([`HostHeap::note_hidden`]). `by_rule`: the slots the spans take to
+/// hold bytes of it (a texture ends where the next one starts); `over`:
+/// those whose texture's span it lies in at its full size.
+///
+/// A slot the pass uploaded is asked by what its view holds (`held`: the
+/// first bytes of its texture, up to the end of the view's first level;
+/// the title holds a texture from the level it views it from). The tell
+/// is for it if it lies in those bytes, whatever view starts between, and
+/// is not if it lies past them. A slot not uploaded since its view was
+/// written is taken as the spans say.
+///
+/// By the spans alone, a tell that lay in a texture's bytes behind an
+/// older view of other memory was taken for that view's texture (16,175
+/// textures found changed by a look in the opening cutscene had such a
+/// tell of DirectStorage, 4,177 one of a mapping), and one past the
+/// levels a view holds was taken for its slot (the title streams a level
+/// into its place before it views the texture from it).
+fn told_slots(
+    placed: &Spans,
+    held: &std::collections::HashMap<u32, (u64, u64)>,
+    (start, end): (u64, u64),
+    mut by_rule: Vec<u32>,
+    over: Vec<u32>,
+) -> (Vec<u32>, Vec<u32>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    by_rule.sort_unstable();
+    by_rule.dedup();
+    // Whether the slot's view holds bytes of the tell; `None`: not known
+    // (never uploaded, or uploaded for a view of other memory).
+    let holds = |slot: u32| {
+        held.get(&slot)
+            .filter(|range| placed.by_slot.get(&slot) == Some(&range.0))
+            .map(|&(from, to)| from < end && to > start)
+    };
+    let (mut told, mut known) = (Vec::new(), Vec::new());
+    for &slot in &by_rule {
+        match holds(slot) {
+            Some(false) => {
+                TOLD_BY_VIEW[1].fetch_add(1, Relaxed);
+            }
+            _ => told.push(slot),
+        }
+    }
+    for slot in over {
+        if by_rule.binary_search(&slot).is_ok() {
+            continue;
+        }
+        match holds(slot) {
+            Some(true) => {
+                TOLD_BY_VIEW[0].fetch_add(1, Relaxed);
+                told.push(slot);
+            }
+            Some(false) => {}
+            None => known.push(slot),
+        }
+    }
+    told.sort_unstable();
+    (told, known)
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1407,6 +1482,7 @@ impl HostHeap {
             stale: Mutex::default(),
             hidden: Mutex::default(),
             asked: Mutex::default(),
+            held: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1728,18 +1804,13 @@ impl HostHeap {
             if all {
                 (placed.by_slot.keys().map(|&slot| (slot, 0, Cause::Mapped as u8)).collect(), Vec::new())
             } else {
+                let views = self.held.lock().unwrap_or_else(|e| e.into_inner());
                 let (mut slots, mut over) = (Vec::new(), Vec::new());
                 for &(start, end, number, cause) in &ranges {
-                    let mut held = placed.slots_in(start, end);
-                    held.sort_unstable();
-                    over.extend(
-                        placed
-                            .slots_over(start, end)
-                            .into_iter()
-                            .filter(|s| held.binary_search(s).is_err())
-                            .map(|s| (s, number, cause)),
-                    );
-                    slots.extend(held.into_iter().map(|s| (s, number, cause)));
+                    let (told, known) =
+                        told_slots(&placed, &views, (start, end), placed.slots_in(start, end), placed.slots_over(start, end));
+                    over.extend(known.into_iter().map(|s| (s, number, cause)));
+                    slots.extend(told.into_iter().map(|s| (s, number, cause)));
                 }
                 (slots, over)
             }
@@ -1807,8 +1878,9 @@ impl HostHeap {
     /// since the last call ([`page_written`]) and notes stale the slots
     /// whose last upload read before a write's bytes were there
     /// ([`HostHeap::slots_written_under`]). With `VICTORY_PAGE_WRITES` bit
-    /// 2 (`crate::watch::page_writes`) every stale slot is due at once as
-    /// well; without, a stale slot waits for whatever else makes it due.
+    /// 2 (`crate::watch::page_writes`, the default) every stale slot is
+    /// due at once as well; without, a stale slot waits for whatever else
+    /// makes it due.
     /// Returns how many slots it noted stale.
     /// shortcut: the ranges are kept in one place for all heaps; the heap
     /// whose pass runs first takes them (a title has one view heap).
@@ -1831,7 +1903,7 @@ impl HostHeap {
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end,
     /// the write's number, what wrote it): the slots whose placed texture holds bytes of
-    /// them ([`Spans::slots_holding`]) and whose last upload by the texture
+    /// them ([`Spans::slots_holding`], [`told_slots`]) and whose last upload by the texture
     /// pass read before the write's number was given
     /// ([`HostHeap::texture_slot_stamp`], `crate::writes::holds`) show the
     /// bytes from before: noted stale (`stale`) until uploaded again. A
@@ -1845,14 +1917,13 @@ impl HostHeap {
         // what wrote that one.
         let (mut needs, mut over): (Vec<(u32, u64, u8)>, Vec<(u32, u64, u8)>) = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let views = self.held.lock().unwrap_or_else(|e| e.into_inner());
             let (mut needs, mut over) = (Vec::new(), Vec::new());
             for &(start, end, number, by) in ranges {
-                let mut held = placed.slots_holding(start, end);
-                held.sort_unstable();
-                over.extend(
-                    placed.slots_over(start, end).into_iter().filter(|s| held.binary_search(s).is_err()).map(|s| (s, number, by)),
-                );
-                needs.extend(held.into_iter().map(|s| (s, number, by)));
+                let (told, known) =
+                    told_slots(&placed, &views, (start, end), placed.slots_holding(start, end), placed.slots_over(start, end));
+                over.extend(known.into_iter().map(|s| (s, number, by)));
+                needs.extend(told.into_iter().map(|s| (s, number, by)));
             }
             (needs, over)
         };
@@ -1983,6 +2054,13 @@ impl HostHeap {
         if stale.remove(&index).is_some() {
             STALE_NOW.store(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// The view of title slot `index`, uploaded now, holds the first `own`
+    /// bytes of the texture at `start`: a tell of memory written or mapped
+    /// is for the slot if it lies in them ([`told_slots`]).
+    pub(crate) fn texture_slot_holds(&self, index: u32, start: u64, own: u64) {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).insert(index, (start, start.saturating_add(own)));
     }
 
     /// Title slot `index` was left for after a write the title has
@@ -6506,6 +6584,68 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.slots_written_under(&into, 52), [2]);
         assert_eq!(heap.texture_slot_found(2, inner, 0x1000), F_STALE + Cause::Copy as usize);
         assert_eq!(heap.texture_slot_found(1, at, size), F_HIDDEN + Cause::Copy as usize);
+    }
+
+    /// A tell is for the slots whose view holds its bytes: one that lies
+    /// in a texture's bytes behind an older view of other memory is taken
+    /// for the texture, and one past the levels a view holds is not taken
+    /// for its slot. A slot not uploaded is taken as the spans say.
+    #[test]
+    fn a_tell_is_for_the_slots_whose_view_holds_its_bytes() {
+        use crate::census::{F_HIDDEN, F_STALE};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let at = 0x7fe9_0000_0000u64;
+        let view = |at: u64, side: u32, levels: u32| {
+            let mut desc = [0u32; 16];
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, side, 0, side, 0x1_0000 | levels, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        assert!(heap.note_buffer(1, Some(&view(at, 256, 9)), false).is_empty());
+        let inner = at + 0x4000;
+        assert!(heap.note_buffer(2, Some(&view(inner, 64, 1)), false).is_empty());
+        let size = heap.placed.lock().unwrap_or_else(|e| e.into_inner()).by_start[&at].0 - at;
+        assert!(size > 0x8000);
+        let stamp = || Arc::new(AtomicU64::new(crate::writes::stamp()));
+        let write = |from: u64, to: u64| [(from, to, crate::writes::next(), Cause::Pages as u8)];
+        heap.texture_slot_stamp(1, stamp(), Arc::new(AtomicU64::new(0)));
+        heap.texture_slot_stamp(2, stamp(), Arc::new(AtomicU64::new(0)));
+        // The large texture's view holds its first 0x7000 bytes: a write
+        // past the inner view and inside them is its own, and makes it
+        // stale; nothing is merely known of it.
+        heap.texture_slot_holds(1, at, 0x7000);
+        assert_eq!(heap.slots_written_under(&write(at + 0x6000, at + 0x6800), 50), [1]);
+        assert_eq!(heap.texture_slot_found(1, at, size), F_STALE + Cause::Pages as usize);
+        // One past what the view holds is nobody's.
+        heap.texture_slot_stamp(1, stamp(), Arc::new(AtomicU64::new(0)));
+        assert_eq!(heap.slots_written_under(&write(at + 0x7000, at + 0x7800), 51), [] as [u32; 0]);
+        assert_ne!(heap.texture_slot_found(1, at, size), F_HIDDEN + Cause::Pages as usize);
+        // One at its start, where the spans take it to hold the bytes: its
+        // own while the view holds them, and not once it holds none there.
+        assert_eq!(heap.slots_written_under(&write(at + 0x100, at + 0x200), 52), [1]);
+        heap.texture_slot_stamp(1, stamp(), Arc::new(AtomicU64::new(0)));
+        heap.texture_slot_holds(1, at, 0x80);
+        assert_eq!(heap.slots_written_under(&write(at + 0x100, at + 0x200), 53), [] as [u32; 0]);
+        // The inner view's slot was not asked what it holds: as the spans
+        // say, a write into its memory is its own; with the large one's
+        // view reaching over it, it is that one's as well.
+        heap.texture_slot_holds(1, at, 0x7000);
+        assert_eq!(heap.slots_written_under(&write(inner + 0x800, inner + 0x900), 54), [1, 2]);
+        // What a slot held before its view was written anew for other
+        // memory says nothing: taken as the spans say. (The large one's
+        // view holds none of it now.)
+        heap.texture_slot_holds(1, at, 0x80);
+        heap.texture_slot_holds(2, at + 0x10_0000, 0x10);
+        heap.texture_slot_stamp(2, stamp(), Arc::new(AtomicU64::new(0)));
+        assert_eq!(heap.slots_written_under(&write(inner + 0x800, inner + 0x900), 55), [2]);
+        // No bytes, an end below the start, the top of the address space.
+        heap.texture_slot_holds(3, u64::MAX, u64::MAX);
+        assert_eq!(heap.slots_written_under(&[(at + 16, at, 1, 200), (u64::MAX, u64::MAX, 2, 0)], 56), [] as [u32; 0]);
+        let counts = TOLD_BY_VIEW.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(counts[0] >= 2 && counts[1] >= 1, "{counts:?}");
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

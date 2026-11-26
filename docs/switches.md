@@ -186,13 +186,16 @@ them again ahead of every bake draw (`VICTORY_BAKE_WRITES`, some 25,000
 uploads a run): the head was baked with noise as before, and a character's
 body came apart in the run that did it, so that is gone.
 
-`VICTORY_PAGE_WRITES` (unset or `guards`: the guarded blocks under such a
+`VICTORY_PAGE_WRITES` (unset, `1` or `all`: the guarded blocks under such a
 write are opened, so host copies of buffers and of textures read through
-tables take its bytes; `0`: not; `slots`, `1` or `all`: the stale slots are
-also due at once at every pass, about 120 uploads a second more in the
-opening cutscene). The line "writes behind
-the guards" counts the writes, the slots under them, the stale ones and
-the stale ones now.
+tables take its bytes, and the stale slots are due at once at every pass;
+`guards`: the first alone, as it was by default while every upload brought
+a whole texture; `slots`: the second alone; `0`: neither). A write, and a
+mapping, is taken for the slots whose view holds its bytes: the first
+bytes of the texture, up to the end of the level the view starts at. The
+line "writes behind the guards" counts the writes, the slots under them,
+the stale ones, the stale ones now, and the slots that took a tell or were
+passed over by what their view holds.
 
 What the texture pass does is counted (no switch; lines every five
 seconds). "texture uploads by reason" says for every upload what made its

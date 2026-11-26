@@ -104,7 +104,7 @@ pub(crate) fn bake_writes_line(frame: u64) {
         reads_under_pending = crate::texture::READ_UNDER_PENDING.load(Ordering::Relaxed),
         "bake sources, since the start: {bakes} bake draws with a texture pass, {stale_bakes} of them with slots \
          stale by the writes' numbers ({stale} such slots in all, {by_storage} by DirectStorage, {by_copy} by copies \
-         of the title's; read before the write ended, left as they were); {pending} slots under a read still to \
+         of the title's; read before the write ended and not uploaded again yet); {pending} slots under a read still to \
          finish uploaded at a bake"
     );
 }
@@ -2426,6 +2426,9 @@ impl State {
                 Some(picked) => {
                     let (start, size) = picked.memory;
                     own = Some(picked.own);
+                    // A tell of written or mapped memory is for the slot
+                    // if it lies in what its view holds.
+                    host.texture_slot_holds(index, start, picked.own.min(size));
                     host.texture_slot_stamp(index, picked.stamp, picked.asked);
                     // What else the upload is, as recorded.
                     let flag = |k: usize, n: u64| c::FLAGS[k].fetch_add(n, Ordering::Relaxed);

@@ -2022,24 +2022,30 @@ pub(crate) fn asked_now() -> u64 {
 /// through tables take them again); 2, the placed textures picked by index
 /// whose last upload read before the write (by the writes' numbers,
 /// `crate::writes`) are due again at once, at every pass (without it they
-/// are counted and left as they are). Unset or `guards`: bit 1 alone. `0`: nothing.
-/// `1` or `all`: bits 1 and 2. `slots`: bit 2 alone. Every such write and
+/// are counted and left as they are). Unset, `1` or `all`: bits 1 and 2.
+/// `guards`: bit 1 alone. `slots`: bit 2 alone. `0`: nothing. Every such write and
 /// every read to a plain address that finished is numbered and noted for
 /// the texture pass whatever this says (a read to a plain address writes
 /// from user mode, which the guards see).
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
-/// it. Bit 2 uploads some 120 textures a second again in the opening
-/// cutscene (12,011 in 100 s); in its earlier form, two frames after the
-/// write, it cost 8 ms a frame.)
+/// it. Bit 2 uploaded some 120 textures a second again in the opening
+/// cutscene (12,011 in 100 s), each of them whole, and was off for it; in
+/// its earlier form, two frames after the write, it cost 8 ms a frame. It
+/// is on now that an upload brings only the levels whose bytes changed and
+/// a write is taken for the slots whose view holds its bytes
+/// (`crate::descriptor::host` `told_slots`): the game maps a texture's
+/// pages, writes its view and has DirectStorage fill the pages afterwards,
+/// and a slot uploaded in between showed what the pages held before until
+/// a look found it changed, 4 to 400 frames later, or never.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
         Ok("0") => 0,
-        Ok("1") | Ok("all") => 3,
+        Ok("guards") => 1,
         Ok("slots") => 2,
-        _ => 1,
+        _ => 3,
     })
 }
 
