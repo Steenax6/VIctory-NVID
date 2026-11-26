@@ -330,7 +330,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: Plain<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -338,9 +338,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: Plain<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: Plain<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// The threads in x of the dispatch being bound, if it counts threads
@@ -467,6 +467,38 @@ pub(crate) fn dropped_now() -> (u64, u64) {
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
+
+/// A map of one list's draw state, keyed by addresses and numbers of ours
+/// and hashed with a multiply (`crate::descriptor::slots::SlotHasher`), not
+/// with the standard hash made to stand keys an attacker picks: every draw
+/// looks its tables and root views up in them.
+type Plain<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::descriptor::slots::SlotHasher>>;
+
+/// What a table of `n` descriptors at `table` holds, as one number (the
+/// record words of each, and whether it is shown otherwise: `other`), for
+/// telling a table made in this list already from one that is not
+/// (`State::tables`). Equal tables give equal numbers, and two different
+/// ones the same number about once in 2^64: each record is taken in by a
+/// multiply to twice the width, folded, of its words with the number so
+/// far (the standard hash this replaces gave 64 bits as well; it was 4 ms
+/// a frame of the recording threads, the profile of 2026-11-26).
+fn table_print(table: u64, n: u32, other: impl Fn(u32) -> bool) -> u64 {
+    const K: [u64; 2] = [0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f];
+    let fold = |a: u64, b: u64| {
+        let wide = u128::from(a) * u128::from(b);
+        wide as u64 ^ (wide >> 64) as u64
+    };
+    let mut h = K[1];
+    for k in 0..n {
+        let at = table + u64::from(k) * 32;
+        // SAFETY: a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+        let words = u64::from(generation) << 32 | u64::from(i);
+        let rest = u64::from(tag) << 1 | u64::from(other(k));
+        h = fold(words ^ K[0], rest ^ h);
+    }
+    fold(h ^ u64::from(n), K[1])
+}
 
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
@@ -3567,19 +3599,9 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                    // (Another table than the same slots made for a shader
-                    // that reads them in the title's formats.)
-                    half.contains(&(slot, k * 8)).hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
+            // (Shown otherwise: another table than the same slots made for
+            // a shader that reads them in the title's formats.)
+            let key = (table, n, table_print(table, n, |k| half.contains(&(slot, k * 8))));
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -4640,6 +4662,43 @@ mod tests {
             assert_ne!(heaps_wanted(title, hosted), [0; 2], "a list with nothing bound binds");
         }
         assert_ne!(VIEWS_OURS, SAMPLERS_OURS);
+    }
+
+    /// Tables that hold the same records print alike, and a table that
+    /// differs in one word of one record, in how one is shown or in its
+    /// length prints otherwise ([`table_print`]).
+    #[test]
+    fn tables_print_alike_only_when_they_hold_the_same() {
+        // Eight 32-byte slots, three words of record each.
+        let mut heap = [[0u32; 8]; 8];
+        for (k, slot) in heap.iter_mut().enumerate() {
+            (slot[0], slot[1], slot[2]) = (0x4549_5676, 100 + k as u32, 1);
+        }
+        let copy = heap;
+        let at = |h: &[[u32; 8]; 8]| h.as_ptr() as u64;
+        let plain = |_: u32| false;
+        let print = table_print(at(&heap), 8, plain);
+        assert_eq!(print, table_print(at(&copy), 8, plain), "the same records elsewhere");
+        assert_ne!(print, table_print(at(&heap), 7, plain), "a shorter table");
+        assert_ne!(print, table_print(at(&heap), 8, |k| k == 3), "one shown otherwise");
+        let mut seen = std::collections::HashSet::from([print]);
+        for k in 0..8 {
+            for word in 0..3 {
+                for bit in [0, 7, 31] {
+                    let mut other = heap;
+                    other[k][word] ^= 1 << bit;
+                    assert!(seen.insert(table_print(at(&other), 8, plain)), "record {k} word {word} bit {bit}");
+                }
+            }
+        }
+        // (The words past a record's three are not the table's.)
+        let mut other = heap;
+        other[2][5] = 77;
+        assert_eq!(print, table_print(at(&other), 8, plain));
+        // Two records in the other order.
+        let mut other = heap;
+        other.swap(1, 6);
+        assert_ne!(print, table_print(at(&other), 8, plain));
     }
 
     /// What a pass over the heap's picked views found, a list takes once:

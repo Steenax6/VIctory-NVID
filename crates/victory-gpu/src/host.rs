@@ -1011,7 +1011,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<Plain<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1083,10 +1083,17 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type States = Plain<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+
+/// A map of a recording's own, keyed by addresses and numbers of ours and
+/// hashed with a multiply (`crate::descriptor::slots::SlotHasher`): every
+/// texture and buffer range a draw reads is looked up in one, and the
+/// standard hash, made to stand keys an attacker picks, was 6 ms a frame of
+/// the recording threads (the profile of 2026-11-26). Nothing goes by the
+/// order of such a map.
+type Plain<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::descriptor::slots::SlotHasher>>;
+/// [`Plain`], as a set.
+type PlainSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<crate::descriptor::slots::SlotHasher>>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -2218,13 +2225,13 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: PlainSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: PlainSet<usize>,
     /// Per host texture of a view placed in a texture the host writes, the
     /// host texture last copied into it in this recording
     /// (`crate::texture::alias`).
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: Plain<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
