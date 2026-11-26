@@ -21,6 +21,8 @@ mod ambient;
 mod capture;
 #[cfg(windows)]
 mod card_fine;
+#[cfg(windows)]
+mod code_use;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

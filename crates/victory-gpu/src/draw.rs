@@ -1184,6 +1184,10 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
+            // Its code is in use from here ([`crate::code_use`]).
+            if let Some(code) = &p.code {
+                code.bound();
+            }
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
