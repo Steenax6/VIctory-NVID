@@ -29,7 +29,11 @@
 //!
 //! The report is written every `VICTORY_PROFILE_EVERY` seconds (30) and at
 //! exit to `VICTORY_PROFILE_OUT` (`%TEMP%\victory_profile_<pid>.txt`), the
-//! stacks for a flame graph beside it (`.folded`). Per kind of thread:
+//! stacks for a flame graph beside it (`.folded`: those with 0.005 % of
+//! their role's time or more, the rest as one line a role;
+//! `VICTORY_PROFILE_FOLD_LEAST=<percent>` sets the share, 0 for every
+//! stack, which a split of a function by what it calls needs: the rest was
+//! a quarter of the recording threads' time). Per kind of thread:
 //! time by module, by function (own and with what it calls), where it
 //! waited and for which of our functions, the hottest lines of ours. Times
 //! are milliseconds per presented frame ([`frame`]).

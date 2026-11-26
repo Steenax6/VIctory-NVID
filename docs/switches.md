@@ -474,6 +474,45 @@ submitting thread was the whole frame, and it faulted), the heap sync
 started at the title's submit instead of in the sending turn (9 ms), and
 less work in `State::bind` on the recording threads.
 
+The same day a timeline (`VICTORY_TIMELINE`) put events to that order,
+and the recording was taken up first. What the runs of that evening
+showed (single runs of the first room with a profile or a timeline, on
+a machine other work ran on: indications, to be timed side by side):
+
+- The list that took 15 ms in one frame and 30 in the next was the list
+  the pass over the heap's picked buffer views happened to run in: the
+  pass ran inside the first list call that bound a shader picking by
+  index after a frame began, 12 to 45 ms of that call, and in every
+  other frame that call was in the chain of 19 lists the title's render
+  thread waits for. The pass runs on a thread of its own now; the list
+  that starts it takes what it found at its submission.
+- A draw made ready again what its list had made ready before: 140,000
+  views a frame asked for, 122,000 of them known. A list remembers
+  (`Seen` in `draw.rs`; `VICTORY_SEEN_CHECK=1` makes everything ready
+  as before and counts the differences, none in 100 million views), and
+  makes each buffer view of its tables once and copies it into the
+  table slots (`KeptViews`).
+- Smaller things on the same path: a moment is the tick count and not
+  the performance counter (12 ms a frame of the recording threads), a
+  slot made from the record that is there is answered without its lock,
+  what a draw's slots showed before is retired once a draw, a
+  recording's own maps hash with a multiply, a draw allocates nothing
+  for its tables.
+
+The chain is recorded in 16 to 18.5 ms where it took 33 to 52, its
+longest list in 6 to 7 ms (15, or 30 with the pass); the recording
+threads are on a processor 129 ms a frame summed where they were 170,
+of which `State::bind` 84 where it was 145. The frame followed only a
+little (60 to 62 ms a frame in the last seconds of that run, with no
+profile running, against 65 to 68): the title's present now stands
+through most of the frame, and the submitting thread is on a processor
+78 % of it. What the recording still waits for: the guards' lock in the
+title's own write faults (18 ms a frame of the recording threads in
+those runs, 8 in the profile of the afternoon), and the pass over
+picked buffer views, which the title's submit waited 5 ms a frame for
+once the recording was that quick (it takes 21 to 36 ms for the slots of
+two frames, on five threads that share three locks a slot).
+
 ## Tried and not kept
 
 - `VICTORY_ASYNC_PRESENT=1` (the title records the next frame while the
@@ -515,7 +554,8 @@ Diagnostics build: `cargo build --profile diag -p victory --features diagnostics
 | Switch | Effect |
 |---|---|
 | `VICTORY_CAPTURE=<dir>` + `VICTORY_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
-| `VICTORY_TIMELINE=<file>` (+ `VICTORY_TIMELINE_AFTER=<seconds>`, 130 unless told; `VICTORY_TIMELINE_FRAMES=<n>`, 8 unless told) | a few frames event by event (diagnostics build): one line per event with the milliseconds since the first of those presents, the thread, the event and two numbers of its own. Events: the present call and its return, each submission of the title and its signals, what the submitting thread sends and when it idles, what the landing thread lands, bottom-of-pipe writes and fences set, every list's reset and close, and the title's own waits and wake-ups (`WaitForSingleObject`, `SetEvent`, `ReleaseSemaphore`, served by the layer only with this switch). It shows what a frame waits for where the profile only shows who idles |
+| `VICTORY_TIMELINE=<file>` (+ `VICTORY_TIMELINE_AFTER=<seconds>`, 130 unless told; `VICTORY_TIMELINE_FRAMES=<n>`, 8 unless told) | a few frames event by event (diagnostics build): one line per event with the milliseconds since the first of those presents, the thread, the event and two numbers of its own. Events: the present call and its return, each submission of the title and its signals, what the submitting thread sends and when it idles, what the landing thread lands, bottom-of-pipe writes and fences set, every list's reset and close (the close with what the list holds: draws, indexed draws, indirect executions and dispatches, sixteen bits each), the pass over picked buffer views on its thread (`pass>`, `pass<`) and a submission that waits for it (`pwait>`, `pwait<`), the early pass over textures picked by index (`early>`, `early<`), and the title's own waits and wake-ups (`WaitForSingleObject`, `SetEvent`, `ReleaseSemaphore`, served by the layer only with this switch). It shows what a frame waits for where the profile only shows who idles |
+| `VICTORY_SEEN_CHECK=1` | diagnostics build: a draw makes ready every view of its tables as it did before a list remembered what it had made ready (`draw.rs`, `Seen`), and makes every buffer view again that its list would copy from the ones it kept (`descriptor/host.rs`, `KeptViews`); the frame lines count the views a list knew ready that were not (the recording then holds another step, upload, state or kept object) and the kept views that are not the descriptor made now. Both stayed 0 over 100 million views and 29 million copies in the first room (2026-11-26). It costs what the remembering saves |
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build); the key bindings make them pad input |
 | `VICTORY_KBM=30:W*2,31:MouseX=400*0.5,33:MouseLeft` | play keys, mouse motion (counts over the hold) and wheel steps into the keyboard and mouse pad (diagnostics build) |
 | `VICTORY_LOG=victory_hle::modules::gameinput=debug` | log each pad state the game reads |
