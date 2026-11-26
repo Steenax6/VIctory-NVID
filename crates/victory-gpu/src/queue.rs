@@ -69,7 +69,7 @@ static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new())
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
+    crate::timeline::waited("L:queue", || mutex.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Whether queues wait for fences. `VICTORY_QUEUE_WAIT=0`: they do not,
@@ -511,6 +511,7 @@ fn wake() {
 /// to run, each time something was added or a fence moved.
 #[cfg(windows)]
 fn worker() {
+    crate::read_census::layer_thread(false);
     loop {
         {
             let mut work = lock(&WORK.0);

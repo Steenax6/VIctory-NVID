@@ -1527,6 +1527,7 @@ fn workers() -> &'static Workers {
         let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                crate::read_census::layer_thread(false);
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -3107,6 +3108,13 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// The lock of the copy's reference (`before`: its snapshot, or what
+    /// stands for the CPU's side of a copy in the card's memory), taken; a
+    /// wait of 0.2 ms or more for it is an event of `crate::timeline`.
+    fn side(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        crate::timeline::waited("L:side", || self.before.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -3322,7 +3330,7 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut before = self.side();
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
@@ -3397,7 +3405,7 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.side();
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
@@ -3508,7 +3516,7 @@ impl Shadow {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.side();
         let Some(before) = snapshot.as_mut() else {
             return 0;
         };
@@ -3661,7 +3669,7 @@ impl Shadow {
             // the snapshot's.)
             kept.0.clear();
         }
-        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(bytes) = self.side().take() {
             give_back(bytes);
         }
     }
@@ -3827,7 +3835,7 @@ impl Shadow {
                     // reference under the same lock, and a page read before
                     // such a merge and compared after it would take the card's
                     // bytes for the title's.
-                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut before = self.side();
                     // A page that is not there is left as it is, and looked at
                     // again next time.
                     if !crate::host::read_into(lo as *const u8, title) {
@@ -4685,7 +4693,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.side();
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
@@ -4755,7 +4763,7 @@ impl Shadow {
             // The CPU side's lock, as the merge holds it: what else writes
             // these bytes of it (title bytes put in under shader writes)
             // holds it too, and no refresh writes a range not done with.
-            let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let _side = self.side();
             READ.with(|read| {
                 let mut read = read.borrow_mut();
                 read.resize(KERNEL_PAGE, 0);
@@ -4885,7 +4893,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.side();
         // SAFETY: as in `card_merge_relay`.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         MERGE_SCRATCH.with(|scratch| {
@@ -4996,7 +5004,10 @@ impl Shadow {
                             write_title(start + a + done, &t[done..]);
                         }
                     }
-                    None => write_title(start + a, t),
+                    None => {
+                        write_title(start + a, t);
+                        crate::read_census::wrote(start + a, n);
+                    }
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::buffers::landed(start + a, n);

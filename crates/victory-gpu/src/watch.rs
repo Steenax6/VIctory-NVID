@@ -506,6 +506,12 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     once_id: 0,
 });
 
+/// The journal, locked (a wait of 0.2 ms or more for it is an event of
+/// `crate::timeline`).
+fn journal() -> std::sync::MutexGuard<'static, Journal> {
+    crate::timeline::waited("L:journal", || JOURNAL.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Notes the kernel's answer (`j.found[..count]`, addresses of written
 /// 4 KiB pages) under asking `now`, a mask per 64 KiB page.
 fn note_found(j: &mut Journal, count: usize, now: u64) {
@@ -575,7 +581,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -629,7 +635,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept {
         j.ahead.clear();
     }
@@ -669,7 +675,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     ask_once_end();
     let ranges = &*watchable(ranges);
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     j.once_id += 1;
     if j.ahead.is_empty() || j.asked != j.ahead_asked {
@@ -700,7 +706,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -720,7 +726,7 @@ pub(crate) fn ask_once_end() {
 /// before it, and with them whatever the title had written into the same
 /// 4 KiB pages since the last asking.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if len == 0 {
         return;
     }
@@ -760,7 +766,7 @@ pub(crate) fn take_landed(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, Writte
     let mut pieces: Vec<(usize, usize)> =
         ranges.iter().filter(|r| r.0 < r.1).map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE))).collect();
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     j.asked += 1;
     let now = j.asked;
@@ -880,7 +886,7 @@ fn ask_kernel_as(j: &mut Journal, first: usize, last: usize, now: u64) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal();
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -912,7 +918,7 @@ pub(crate) fn writes_fine_look(start: usize, end: usize, guarded: bool, look: &m
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     // Where the kernel's write watch answers (here and below) no event
     // tells of a write: such a range is asked every time. The guards' own
@@ -1387,7 +1393,7 @@ impl Guards {
 }
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    crate::timeline::waited("L:guards", || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// [`guard_fine`] without the kernel pages: the pages written.
@@ -2499,6 +2505,8 @@ pub fn writing(at: usize, len: usize) {
 /// [`writing`] for the layer's own writes, which say what they are
 /// (`cause`).
 pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
+    // (A diagnostic's inaccessible pages there: the kernel would not write them.)
+    crate::read_census::disarm(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     {
         let mut g = guards();
@@ -2613,7 +2621,7 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     let first = start / BLOCK;
     let last = end.div_ceil(BLOCK).min(first.saturating_add(1 << 16));
     let noted = asked != 0 && {
-        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = journal();
         let mut after = false;
         j.written.each(first, last, |_, w| after |= w.at > asked);
         after
@@ -2659,7 +2667,7 @@ pub(crate) fn watched_dirty(at: usize, len: usize) -> Option<usize> {
 /// The number of the journal's last asking: what a read of title memory
 /// that begins now comes after.
 pub(crate) fn asked_now() -> u64 {
-    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked
+    journal().asked
 }
 
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write into physical
@@ -2813,7 +2821,7 @@ pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    Remapping(crate::timeline::waited("L:mapping.w", || MAPPING.write().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -2824,7 +2832,7 @@ pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    Reading(crate::timeline::waited("L:mapping.r", || MAPPING.read().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
@@ -2939,6 +2947,17 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
+        // A page the read census made inaccessible (`crate::read_census`,
+        // a diagnostic): given back and counted, whoever touched it.
+        if crate::read_census::every() != 0
+            && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] <= WRITE
+            // SAFETY: the faulting thread's context, as dispatched.
+            && crate::read_census::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE, unsafe { (*(*info).ContextRecord).Rip } as usize)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
@@ -3447,7 +3466,7 @@ mod tests {
     /// The journal never forgets a page: a test's fresh allocation may lie
     /// where another test's was, whose writes it still holds.
     fn forget(start: usize, end: usize) {
-        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut j = journal();
         for page in start / PAGE..end.div_ceil(PAGE) {
             j.written.remove(page);
         }

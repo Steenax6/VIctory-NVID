@@ -1818,6 +1818,12 @@ unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
+/// [`CARD_WORK`], locked (a wait of 0.2 ms or more for it is an event of
+/// `crate::timeline`).
+fn card_work() -> std::sync::MutexGuard<'static, Option<CardWork>> {
+    crate::timeline::waited("L:cardwork", || CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one thread per 64 KiB piece (cut at multiples of
 /// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
@@ -2438,6 +2444,43 @@ fn relay_exact() -> bool {
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
+/// For the timeline (`crate::timeline`, diagnostics): says when the card
+/// has reached each value signalled on the host's fence behind a
+/// submission sent ahead (the event `done` with the value), from a thread
+/// of its own that waits for them one after the other. The thread that
+/// lands flights sees the card's progress only between its landings.
+fn card_watch(value: u64) {
+    static WATCH: OnceLock<Option<std::sync::mpsc::Sender<u64>>> = OnceLock::new();
+    let watch = WATCH.get_or_init(|| {
+        let (send, values) = std::sync::mpsc::channel::<u64>();
+        std::thread::Builder::new()
+            .name("victory-timeline-card".into())
+            .spawn(move || {
+                let Some(host) = host() else {
+                    return;
+                };
+                // SAFETY: a plain event of our own.
+                let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+                    return;
+                };
+                for value in values {
+                    // SAFETY: the host's fence and this thread's event.
+                    unsafe {
+                        if host.fence.GetCompletedValue() < value && host.fence.SetEventOnCompletion(value, event).is_ok() {
+                            WaitForSingleObject(event, INFINITE);
+                        }
+                    }
+                    crate::timeline::ev("done", value, 0);
+                }
+            })
+            .ok()
+            .map(|_| send)
+    });
+    if let Some(watch) = watch {
+        let _ = watch.send(value);
+    }
+}
+
 /// Told when something joins [`LINE`], for the thread that lands flights
 /// ([`relay`]); [`LINE_MOVED`] stays the word for the thread that looks at
 /// what queues hold.
@@ -2454,6 +2497,12 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 /// fetch sent with the count at N ran behind sends 1..N and ahead of every
 /// later one.
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+
+/// [`QUEUE_ORDER`], locked (a wait of 0.2 ms or more for it is an event of
+/// `crate::timeline`).
+fn queue_order() -> std::sync::MutexGuard<'static, u64> {
+    crate::timeline::waited("L:order", || QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()))
+}
 
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
@@ -2513,7 +2562,7 @@ pub(crate) fn inflight_raise(landed: u32, k: u32) -> u32 {
 /// 0xffff_ffff reads as [`INFLIGHT_NONE`]; a flagged piece that draws it
 /// copies nothing and its landing goes the old way, once every 2^32.
 fn inflight_tickets_landed(plans: &[&CardPlan]) {
-    let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut work = card_work();
     let Some(work) = work.as_mut() else {
         return;
     };
@@ -2913,7 +2962,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
 
 fn line() -> std::sync::MutexGuard<'static, Line> {
-    LINE.lock().unwrap_or_else(|e| e.into_inner())
+    crate::timeline::waited("L:line", || LINE.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
@@ -3411,7 +3460,7 @@ pub(crate) fn settle_now(why: usize) {
     let Some(host) = host() else {
         return;
     };
-    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let mut submitted = crate::timeline::waited("L:submitted", || host.submitted.lock().unwrap_or_else(|e| e.into_inner()));
     host.settle(&mut submitted, why);
 }
 
@@ -3471,6 +3520,7 @@ fn late_helper() {
     let Some(host) = host() else {
         return;
     };
+    crate::read_census::layer_thread(false);
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
@@ -3505,7 +3555,7 @@ fn late_helper() {
             }
         }
         {
-            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut submitted = crate::timeline::waited("L:submitted", || host.submitted.lock().unwrap_or_else(|e| e.into_inner()));
             // Something newer went up meanwhile: the card is waited for
             // again, the submitting thread is not held up for it.
             if line().target != target {
@@ -3558,6 +3608,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    let _span = crate::timeline::span("rwait>", "rwait<", why as u64, 0);
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
@@ -3593,6 +3644,7 @@ fn relay_worker() {
     let Some(host) = host() else {
         return;
     };
+    crate::read_census::layer_thread(true);
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
@@ -3703,6 +3755,7 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     fill_check::line();
     fill_ahead::line(frames);
+    crate::read_census::line(frames);
     {
         let [asked, set, us] = [0, 1, 2].map(|i| crate::fence::EVENT_WAITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
@@ -4489,7 +4542,7 @@ impl Host {
         static READY: OnceLock<bool> = OnceLock::new();
         *READY.get_or_init(|| match self.make_card_work() {
             Ok(work) => {
-                *CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
+                *card_work() = Some(work);
                 true
             }
             Err(e) => {
@@ -4795,7 +4848,7 @@ impl Host {
         }
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
-        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut order = relay().then(|| queue_order());
         let sent_as = match order.as_mut() {
             Some(order) => {
                 **order += 1;
@@ -4819,7 +4872,7 @@ impl Host {
             numbered();
             return None;
         }
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = card_work();
         let work = work.as_mut()?;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
@@ -5127,7 +5180,7 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = card_work();
         let Some(work) = work.as_mut() else {
             return;
         };
@@ -5212,7 +5265,7 @@ impl Host {
         // With fine flags: every piece fetched now with its blocks.
         let mut fine_numbers: Vec<(usize, u32, u32)> = Vec::new();
         let differs = {
-            let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            let work = card_work();
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
@@ -5300,7 +5353,7 @@ impl Host {
             // fetch (on a copy queue: every send the card has finished).
             crate::shadow::relay_fetched(match lane {
                 Some(second) => second.order_done(),
-                None => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
+                None => *queue_order(),
             });
             return;
         }
@@ -5370,7 +5423,7 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                let order = queue_order();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -5392,12 +5445,14 @@ impl Host {
         // yet; every one before it has (the submission lock).
         if inflight_fetch()
             && after > 1
-            && let Some(inflight) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|w| w.inflight.as_mut())
+            && let Some(inflight) = card_work().as_mut().and_then(|w| w.inflight.as_mut())
         {
             inflight.brought.extend(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.clone(), *lo, *hi, after - 1)));
         }
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        crate::timeline::ev("l.fetch", us, total);
+        let merging = crate::timeline::clock();
         {
             use crate::shadow::CARD_STATS;
             // With fine flags these are runs of blocks, not pieces
@@ -5455,6 +5510,9 @@ impl Host {
             }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        if let Some(merging) = merging {
+            crate::timeline::ev("l.merge", merging.elapsed().as_micros() as u64, written as u64);
+        }
         // What landed in private title memory set the kernel's written
         // bits there: taken now, while the ranges are closed to refreshes
         // still (`crate::shadow::land_taken`; not for pieces merged out of
@@ -5463,6 +5521,8 @@ impl Host {
             let landed: Vec<_> = pieces.iter().map(|(shadow, lo, hi, _)| (shadow.clone(), *lo, *hi)).collect();
             crate::shadow::landed(&landed);
         }
+        // (The read census: what this landing wrote, from its next access on.)
+        crate::read_census::arm();
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are
         // (`fallback_fetched_mark`).
@@ -5510,7 +5570,7 @@ impl Host {
         type Piece = (Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
         let mut pieces: Vec<Piece> = Vec::new();
         {
-            let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            let work = card_work();
             let Some(work) = work.as_ref() else {
                 return false;
             };
@@ -5658,7 +5718,9 @@ impl Host {
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
+                let mut steps = crate::timeline::Steps::begin();
                 self.relay_card_back(&plans, fetch, behind, landed);
+                steps.mark("l.card", flights.len() as u64);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -5675,6 +5737,7 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
+                steps.mark("l.hand", back.len() as u64);
                 copy_order::landed(landed);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
@@ -5683,6 +5746,8 @@ impl Host {
                         shadow.copy_back_done(ranges);
                     }
                 }
+                steps.mark("l.done", 0);
+                crate::timeline::ev("landed", flights.iter().map(|f| f.number).min().unwrap_or(0), landed);
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -5691,6 +5756,7 @@ impl Host {
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
+        let mut tell = crate::timeline::Steps::begin();
         for item in items {
             match item {
                 Late::Run(flight) => {
@@ -5710,12 +5776,14 @@ impl Host {
                 Late::Signal(fence, value) => crate::fence::set(fence.this(), value),
             }
         }
+        tell.mark("l.tell", last);
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury_aside(last);
         }
         self.log_messages();
         fill_ahead::landing(0);
+        tell.mark("l.bury", 0);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
             let mut line = line();
@@ -5769,7 +5837,7 @@ impl Host {
         if plan.ranges.is_empty() {
             return;
         }
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = card_work();
         let Some(work) = work.as_mut() else {
             return;
         };
@@ -6242,7 +6310,8 @@ impl Host {
         }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut steps = crate::timeline::Steps::begin();
+        let mut submitted = crate::timeline::waited("L:submitted", || self.submitted.lock().unwrap_or_else(|e| e.into_inner()));
         #[cfg(feature = "diagnostics")]
         remember_lists(runs);
         for run in runs {
@@ -6265,9 +6334,11 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        steps.mark("p.blocked", runs.len() as u64);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         crate::descriptor::sync_heaps();
+        steps.mark("p.heap", 0);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6289,6 +6360,7 @@ impl Host {
         // lists that may read them run.
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        steps.mark("p.sweep", this_submission);
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -6322,6 +6394,7 @@ impl Host {
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
+            steps.mark("p.ask", ranges.len() as u64);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -6337,6 +6410,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        steps.mark("p.stale", 0);
         // The title buffer copies left to this submission's landing
         // (`copy_goes_late`), by what the flights in the air may write now.
         if late {
@@ -6348,8 +6422,13 @@ impl Host {
         // The lists run so far: a list run again records a prelude of its
         // own (`HostList::prelude`).
         let mut run_before: Vec<*const HostList> = Vec::new();
+        // (For the timeline: the steps' time and the preludes', apart; the
+        // refreshes inside the steps are a sum of the thread's.)
+        let (mut steps_us, mut preludes_us) = (steps.lap(), 0);
+        let _ = (crate::timeline::took(0), crate::timeline::took(1));
         for list in runs {
             list.run_deferred(&mut batch);
+            steps_us += steps.lap();
             firsts.push(lists.len());
             let again = run_before.contains(&std::ptr::from_ref(*list));
             if !again {
@@ -6359,9 +6438,18 @@ impl Host {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            preludes_us += steps.lap();
         }
         batch.flush();
         crate::watch::ask_once_end();
+        if crate::timeline::on() {
+            steps_us += steps.lap();
+            let (refresh_us, texture_us) = (crate::timeline::took(0), crate::timeline::took(1));
+            crate::timeline::ev("p.steps", steps_us.saturating_sub(refresh_us + texture_us), 0);
+            crate::timeline::ev("p.refresh", refresh_us, 0);
+            crate::timeline::ev("p.texture", texture_us, 0);
+            crate::timeline::ev("p.prelude", preludes_us, 0);
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -6372,6 +6460,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        steps.mark("p.snap", 0);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -6385,6 +6474,7 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        steps.mark("p.card", card.as_ref().map_or(0, |c| c.ranges.len() as u64));
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6393,6 +6483,11 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            steps.mark("p.exec", lists.len() as u64);
+            if crate::timeline::on() {
+                crate::timeline::ev("sent", this_submission, *submitted);
+                card_watch(*submitted);
+            }
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6554,7 +6649,7 @@ impl Host {
         // be merged is older than the sends to card copies so far, and
         // their notes can go.
         if relay() {
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::shadow::relay_fetched(*queue_order());
         }
         working(was_working);
         None
@@ -8252,7 +8347,9 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        let clock = crate::timeline::clock();
                         staging.refresh();
+                        crate::timeline::sum(1, clock);
                     }
                     continue;
                 }
@@ -8342,7 +8439,9 @@ impl Batch {
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
+        let clock = crate::timeline::clock();
         let copied = shadow.update(from, to - from);
+        crate::timeline::sum(0, clock);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         {
