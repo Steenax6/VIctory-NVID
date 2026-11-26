@@ -149,8 +149,17 @@ pub(crate) struct Staging {
 /// 78,510 of 218,624 uploads found no level changed since the memory's
 /// last upload (41.9 GB of title memory), and of the levels of the others
 /// 23.3 GB were the same.
+///
+/// Beside each key, the number of the write journal's asking that the
+/// last read which found the part's memory as the host copy holds it came
+/// after (`crate::watch::asked_now`; 0: none): what was known of the
+/// memory since is counted when an upload reads the part again
+/// (`crate::census::SCREEN`).
 #[derive(Default)]
-pub(crate) struct Sent([std::sync::atomic::AtomicU64; crate::census::PARTS]);
+pub(crate) struct Sent(
+    [std::sync::atomic::AtomicU64; crate::census::PARTS],
+    [std::sync::atomic::AtomicU64; crate::census::PARTS],
+);
 
 impl Sent {
     /// The key of what the host copy holds of part `part` (0: nothing).
@@ -2661,6 +2670,28 @@ impl Staging {
                 }
             });
         }
+        // What the journal, the guards and the write watch knew of the
+        // parts the host copy held, since the read that last found them as
+        // it holds them: counted for the pass's uploads, every changed
+        // part and the unchanged ones of one upload in sixteen
+        // (`crate::census::SCREEN`). A part changed with nothing seen is
+        // one that a screen by them, in place of this read, would have
+        // left with the bytes from before.
+        static TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sampled = count && TURN.fetch_add(1, Relaxed).is_multiple_of(16);
+        for k in (0..n).filter(|&k| reading(k)) {
+            let (was, since) = (self.sent.key(k), self.sent.1[k].load(Relaxed));
+            let changed = part_key(digests[k], self.place.levels_of_part[k], held) != was;
+            if count && was > 1 && since != 0 && (changed || sampled) {
+                let ((from, to), at) = (parts[k], self.memory as usize);
+                let (noted, written, open) = crate::watch::seen_since(at.saturating_add(from), at.saturating_add(to), since);
+                c::screened((why - 1) as u8, changed, noted || written > 0 || open > 0, (to - from) as u64);
+            }
+            // Found as the host copy holds it, by a read after this asking.
+            if !changed && last.asked != 0 {
+                self.sent.1[k].fetch_max(last.asked, Relaxed);
+            }
+        }
         by_level[c::L_READ].fetch_add(read as u64, Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, read as u64);
@@ -2734,6 +2765,7 @@ impl Staging {
             let need = if of_part & held == 0 { 0 } else { self.subresources(of_part & held) };
             if key != 0 && need != 0 && need & !subs == 0 {
                 sent.0[k].store(key, Relaxed);
+                sent.1[k].store(self.asked.load(std::sync::atomic::Ordering::SeqCst), Relaxed);
             }
         }
     }

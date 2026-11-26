@@ -192,6 +192,27 @@ fn drop_row(why: u8, size: u64, staged: u64, parts: Option<&[Part]>, found: Foun
     }
 }
 
+/// What the journal, the guards and the write watch knew of the parts of
+/// a texture's memory that an upload of the pass read again, since the read
+/// that last found them as the host copy holds them (`crate::texture`
+/// `Staging::refresh_parts`), by the upload's reason: parts changed with
+/// nothing seen (a screen by them would have left the bytes from before:
+/// 0 if they tell of every store); parts changed and seen; and, of one
+/// upload in sixteen, the bytes of unchanged parts with nothing seen (a
+/// screen would not have read them) and of unchanged parts seen.
+pub(crate) static SCREEN: [[AtomicU64; 4]; WHYS] = [const { [const { AtomicU64::new(0) }; 4] }; WHYS];
+
+/// Counts one part in [`SCREEN`], for an upload made for the reason `why`.
+pub(crate) fn screened(why: u8, changed: bool, seen: bool, bytes: u64) {
+    let row = &SCREEN[usize::from(why).min(WHYS - 1)];
+    match (changed, seen) {
+        (true, false) => row[0].fetch_add(1, Relaxed),
+        (true, true) => row[1].fetch_add(1, Relaxed),
+        (false, false) => row[2].fetch_add(bytes, Relaxed),
+        (false, true) => row[3].fetch_add(bytes, Relaxed),
+    };
+}
+
 /// What the pass knows of an upload when it records it, beside its reason
 /// ([`FLAGS`]' places): its host copy was made anew after it had been let
 /// go; made for the first time; another texture's view starts inside the
@@ -523,6 +544,33 @@ pub(crate) fn lines(frames: f64) {
     );
     {
         use std::fmt::Write;
+        let mut text = String::new();
+        for (row, counts) in SCREEN.iter().enumerate() {
+            let c: [u64; 4] = std::array::from_fn(|k| counts[k].load(Relaxed));
+            if c.iter().any(|&n| n != 0) {
+                let _ = write!(
+                    text,
+                    "; {}: {} parts changed with nothing seen, {} changed and seen, {} MB unchanged with nothing seen, {} MB \
+                     unchanged and seen",
+                    row_name(row),
+                    c[0],
+                    c[1],
+                    mb(c[2]),
+                    mb(c[3])
+                );
+            }
+        }
+        if !text.is_empty() {
+            tracing::info!(
+                "what the journal, the guards and the write watch knew of the parts of textures an upload of the pass read \
+                 again (parts the host copy held; every changed part, and the unchanged ones of one upload in 16), since \
+                 the start, by the upload's reason{text}. A part changed with nothing seen is one a screen by them, in \
+                 place of the read, would have left with the bytes from before"
+            );
+        }
+    }
+    {
+        use std::fmt::Write;
         let found: [u64; 2 * CAUSES + 4] = std::array::from_fn(|k| FOUND[k].load(Relaxed));
         let mut text = String::new();
         for cause in Cause::ALL {
@@ -645,6 +693,11 @@ mod tests {
         found(usize::MAX);
         let many = [part(1, 1); PARTS + 9];
         read(255, u64::MAX, u64::MAX, u64::MAX, u64::MAX, Some(&many));
+        let before = SCREEN[WHYS - 1][0].load(Relaxed);
+        screened(255, true, false, u64::MAX);
+        screened(VIEW, false, true, 7);
+        assert!(SCREEN[WHYS - 1][0].load(Relaxed) > before);
+        assert!(SCREEN[usize::from(VIEW)][3].load(Relaxed) >= 7);
         read(RELOOK, u64::MAX, 0, 0, 0, Some(&[]));
         read(VIEW, 0, 0, u64::MAX, 0, None);
         assert!(FOUND[FOUND.len() - 1].load(Relaxed) >= 1);

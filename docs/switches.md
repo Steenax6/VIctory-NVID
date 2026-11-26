@@ -213,6 +213,27 @@ the guards saw, blocks nothing guards, nothing). "told to the texture pass"
 counts the tells by who told, "the texture pass per frame" is the pass's
 time by part, "the texture queue by what its slots wait for" the queue.
 
+A texture goes up level by level. Its memory is told apart at its levels
+(the block of the smallest ones, then each level), and of each part the
+upload asks three things: is it the game's (every level a view shows; a
+more detailed one only where no other texture starts before its end), are
+its pages there, and does the host copy hold it as it is (what the host
+copy holds is noted with it). Only a part that is the game's, is there and
+is other than what the host copy holds is detiled and copied; one that is
+not the game's is not read at all, and one whose pages are not there is
+zeros on the host, once. "texture uploads level by level" has the
+megabytes read, not read for either reason, detiled, not detiled because
+the host copy held them, and copied, and the uploads that copied nothing.
+The megabytes in "texture uploads by reason" are those read.
+
+Whether a write would have been known without the read is counted too, to
+decide if the reads of unchanged textures can go: "what the journal, the
+guards and the write watch knew of the parts of textures an upload of the
+pass read again" has, by the upload's reason, the parts changed with
+nothing seen (must be 0 before anything is left unread on their word), the
+parts changed and seen, and for one upload in sixteen the megabytes of
+unchanged parts with nothing seen (what leaving them unread would save).
+
 For a texture both the game and the card write (the game's bake compresses
 its result on the card and copies it, level by level, into textures it also
 has views of), what was written last is what the texture holds, by the
