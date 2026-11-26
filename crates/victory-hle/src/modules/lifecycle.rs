@@ -381,8 +381,34 @@ extern "system" fn stand_in_proc(
         wm::WM_DESTROY => unsafe { wm::PostQuitMessage(0) },
         _ => {}
     }
+    if let Some(result) = cursor_message(message, lparam) {
+        return result;
+    }
     // SAFETY: the default handling for our window.
     unsafe { wm::DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+/// The mouse cursor for keyboard and mouse play (`gameinput::cursor`), on
+/// the stand-in: the window the user sees, clicks, focuses and sizes (the
+/// title's own is message-only and gets none of these). Hidden over the
+/// client area while captured, captured by a click in it, freed when the
+/// window loses focus or is sized or moved (a clip following a shrinking
+/// client area collapses the window). `Some`: the message is answered.
+fn cursor_message(message: u32, lparam: LPARAM) -> Option<LRESULT> {
+    use super::gameinput::cursor;
+    match message {
+        wm::WM_SETCURSOR if cursor::captured() && lparam as u32 & 0xFFFF == wm::HTCLIENT => {
+            // SAFETY: no cursor while it is over our client area.
+            unsafe { wm::SetCursor(std::ptr::null_mut()) };
+            return Some(1);
+        }
+        wm::WM_LBUTTONDOWN | wm::WM_RBUTTONDOWN | wm::WM_MBUTTONDOWN => cursor::click(),
+        wm::WM_KILLFOCUS => cursor::release(),
+        wm::WM_ENTERSIZEMOVE => cursor::size_move(true),
+        wm::WM_EXITSIZEMOVE => cursor::size_move(false),
+        _ => {}
+    }
+    None
 }
 
 /// The message loop of a stand-in's thread, until its window is destroyed.
@@ -447,27 +473,6 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
-    }
-    // The mouse cursor for keyboard and mouse play (`gameinput::cursor`):
-    // hidden over the window while captured, captured by a click in it,
-    // freed when the window loses focus or is sized or moved (a clip
-    // following a shrinking client area collapses the window). The title
-    // still sees every message.
-    match message {
-        wm::WM_SETCURSOR
-            if super::gameinput::cursor::captured() && lparam as u32 & 0xFFFF == wm::HTCLIENT =>
-        {
-            // SAFETY: no cursor while it is over our client area.
-            unsafe { wm::SetCursor(std::ptr::null_mut()) };
-            return 1;
-        }
-        wm::WM_LBUTTONDOWN | wm::WM_RBUTTONDOWN | wm::WM_MBUTTONDOWN => {
-            super::gameinput::cursor::click();
-        }
-        wm::WM_KILLFOCUS => super::gameinput::cursor::release(),
-        wm::WM_ENTERSIZEMOVE => super::gameinput::cursor::size_move(true),
-        wm::WM_EXITSIZEMOVE => super::gameinput::cursor::size_move(false),
-        _ => {}
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
@@ -891,6 +896,55 @@ mod tests {
             let mut text = [0u16; 16];
             let n = wm::GetWindowTextW(stand_in, text.as_mut_ptr(), 16);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "renamed");
+            wm::DestroyWindow(hwnd);
+        }
+    }
+
+    /// The cursor for keyboard and mouse play follows the stand-in, the
+    /// window the user clicks, focuses and sizes: the title's own window is
+    /// message-only and a click there captures nothing.
+    #[test]
+    fn the_stand_in_captures_hides_and_frees_the_cursor() {
+        use super::super::gameinput::cursor;
+        let _turn = cursor::TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        cursor::ENABLED.store(true, Ordering::Relaxed);
+        cursor::release();
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("cursor"),
+            wm::WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            10,
+            10,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        let stand_in = stand_in_of(hwnd);
+        assert!(!stand_in.is_null());
+        // SAFETY: our windows, never shown or activated; the stand-in's
+        // thread answers each message before SendMessageW returns.
+        unsafe {
+            let send = |window: HWND, message: u32, lparam: LPARAM| {
+                wm::SendMessageW(window, message, 0, lparam)
+            };
+            let client = wm::HTCLIENT as LPARAM;
+            send(hwnd, wm::WM_LBUTTONDOWN, 0);
+            assert!(!cursor::captured(), "the title's window is not clicked");
+            send(stand_in, wm::WM_LBUTTONDOWN, 0);
+            assert!(cursor::captured(), "a click in the stand-in captures");
+            assert_eq!(send(stand_in, wm::WM_SETCURSOR, client), 1, "hidden");
+            send(stand_in, wm::WM_ENTERSIZEMOVE, 0);
+            assert!(!cursor::captured(), "sizing frees it");
+            send(stand_in, wm::WM_EXITSIZEMOVE, 0);
+            send(stand_in, wm::WM_RBUTTONDOWN, 0);
+            assert!(cursor::captured());
+            send(stand_in, wm::WM_KILLFOCUS, 0);
+            assert!(!cursor::captured(), "losing focus frees it");
             wm::DestroyWindow(hwnd);
         }
     }

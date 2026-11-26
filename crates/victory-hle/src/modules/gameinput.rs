@@ -853,6 +853,10 @@ pub(crate) mod cursor {
         if captured() { release() } else { capture() }
     }
 
+    /// Tests that change the cursor's state take turns.
+    #[cfg(test)]
+    pub(crate) static TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -862,6 +866,7 @@ pub(crate) mod cursor {
         /// source, the clip following the shrinking client area.
         #[test]
         fn a_size_or_move_loop_frees_the_cursor() {
+            let _turn = TESTS.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(clip_rect((100, 50, 900, 650)), Some((116, 66, 884, 634)));
             assert_eq!(clip_rect((0, 0, 1339, 30)), None, "a strip: no clip");
             // The capture flag is set directly: other tests' hubs set
@@ -1816,7 +1821,10 @@ mod host {
                 }
                 return;
             }
-            // SAFETY: plain queries on the foreground window, ours.
+            // The foreground window is ours (`focused` compares processes):
+            // the title's visible stand-in, whose client area is the
+            // picture; the title's own window is message-only.
+            // SAFETY: plain queries on that window.
             unsafe {
                 let hwnd = GetForegroundWindow();
                 let mut client = RECT::default();
@@ -2216,7 +2224,9 @@ mod host {
         }
     }
 
-    /// The foreground window is one of ours (the title's or our fallback).
+    /// The foreground window is one of ours: the title's stand-in, which a
+    /// thread of ours owns (the title's own window is message-only and is
+    /// never in front). By process, not by window handle.
     fn focused() -> bool {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
