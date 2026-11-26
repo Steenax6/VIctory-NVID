@@ -3463,6 +3463,16 @@ fn some_there(at: *const u8, len: usize) -> bool {
     const BLOCK: usize = 64 << 10;
     let start = at as usize;
     let end = start.saturating_add(len);
+    if end <= start {
+        return false;
+    }
+    // Its first and last page are asked afresh, as [`mapped_bytes`] asks
+    // them: what is kept of a block is from the last mapping the runtime
+    // told of, and "nothing of it is there" makes a level zeros on the
+    // host without a read. A level's bytes start at its first page.
+    if committed(at, 1) || committed((end - 1) as *const u8, 1) {
+        return true;
+    }
     let mut block = start & !(BLOCK - 1);
     while block < end {
         if block_there(block, block.max(start)) {
@@ -3802,6 +3812,39 @@ mod remap_tests {
         }
         // SAFETY: the reservation above, released once.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// Whether anything of a range is there: by what is kept of its 64 KiB
+    /// blocks, and afresh at its first and last page, so that pages mapped
+    /// with nobody told of it are found where a level's bytes start.
+    #[test]
+    fn something_of_a_range_is_there_or_nothing() {
+        use windows_sys::Win32::System::Memory::*;
+        const RUN: usize = 0x1_0000;
+        // Four runs, the second alone there.
+        // SAFETY: a private reservation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * RUN, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let at = |run: usize, byte: usize| base.cast::<u8>().wrapping_add(run * RUN + byte).cast_const();
+        // SAFETY: the second run of the reservation above.
+        assert!(!unsafe { VirtualAlloc(at(1, 0).cast(), RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        super::blocks_remapped(base as usize, 4 * RUN);
+        assert!(super::some_there(at(0, 0), 4 * RUN), "a block in the middle");
+        assert!(super::some_there(at(1, 0x800), 0x100));
+        assert!(super::some_there(at(0, 0xff00), 0x200), "its last page");
+        assert!(!super::some_there(at(0, 0), RUN));
+        assert!(!super::some_there(at(2, 0), 2 * RUN));
+        // The third run comes and nobody tells: what is kept of its block
+        // says it is not there, its first page says it is.
+        // SAFETY: the third run of the reservation above.
+        assert!(!unsafe { VirtualAlloc(at(2, 0).cast(), RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        assert!(super::some_there(at(2, 0), 2 * RUN), "pages mapped with nobody told");
+        // No bytes, and a range at the top of the address space: nothing.
+        assert!(!super::some_there(at(1, 0), 0));
+        assert!(!super::some_there(usize::MAX as *const u8, 16));
+        // SAFETY: the reservation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+        super::blocks_remapped(base as usize, 4 * RUN);
     }
 
     /// A partly mapped texture is read at most every 30 frames; after a
