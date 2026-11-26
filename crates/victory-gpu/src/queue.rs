@@ -61,6 +61,48 @@ enum Held {
     Running,
     /// With [`async_present`]: a present, shown in its place in the line.
     Present(Box<dyn FnOnce() + Send>),
+    /// With list calls written down (`crate::list::thin`): a submission
+    /// whose lists are translated by threads of ours. It is free to run when
+    /// they are, and then becomes what [`submit_cut`] makes of a submission.
+    Lists(std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>),
+}
+
+/// A submission with list calls written down (`crate::list::thin`): put
+/// behind what the queue holds by its recordings; [`release_held_now`] cuts
+/// and sends it once they are translated.
+#[cfg(windows)]
+fn submit_thin(this: This, lists: &[This]) {
+    let recordings = crate::list::thin::submitted(lists);
+    #[cfg(feature = "diagnostics")]
+    crate::capture::op(this as usize, || {
+        format!(
+            "SUBMIT queue kind {} title lists {lists:?} to the line, translated by threads of ours",
+            queue(this).kind
+        )
+    });
+    if !recordings.is_empty() {
+        lock(&queue(this).held).push(Held::Lists(recordings));
+        let mut waiting = lock(&WAITING);
+        if !waiting.contains(&(this as usize)) {
+            waiting.push(this as usize);
+        }
+    }
+    release_held(false);
+}
+
+/// A recording was translated: a submission in a line may be free to run.
+#[cfg(windows)]
+pub(crate) fn thin_moved() {
+    if behind() {
+        wake();
+    }
+}
+
+/// This thread does work the line waits for (it translates lists): it never
+/// runs the line itself ([`before_sync`]).
+#[cfg(windows)]
+pub(crate) fn no_drain_here() {
+    RELEASING_HERE.set(true);
 }
 
 /// The queues that hold something (their addresses).
@@ -536,6 +578,8 @@ thread_local! {
 #[cfg(windows)]
 pub(crate) fn before_sync() {
     if behind() && !RELEASING_HERE.get() {
+        // (Submissions whose lists are translated first: they are before.)
+        crate::list::thin::settle();
         release_held_now(false);
     }
 }
@@ -565,6 +609,20 @@ fn release_held_now(all: bool) {
             let mut held = lock(line);
             loop {
                 let passed = all;
+                // A submission whose lists are not translated yet stands; one
+                // passed (at a present) is waited for, with the line open.
+                if let Some(Held::Lists(recordings)) = held.first()
+                    && !crate::list::thin::translated(recordings)
+                {
+                    if !passed {
+                        break;
+                    }
+                    let recordings = recordings.clone();
+                    drop(held);
+                    crate::list::thin::wait(&recordings);
+                    held = lock(line);
+                    continue;
+                }
                 match held.first() {
                     None | Some(Held::Running) => break,
                     Some(Held::Wait(fence, value))
@@ -577,6 +635,37 @@ fn release_held_now(all: bool) {
                 }
                 match held.remove(0) {
                     Held::Wait(..) | Held::Running => {}
+                    Held::Lists(recordings) => {
+                        // Translated: cut at its waits and taken from the
+                        // lists of ours as `submit_cut` does, in its place,
+                        // with the line open meanwhile.
+                        held.insert(0, Held::Running);
+                        drop(held);
+                        let backs = crate::list::thin::backs(&recordings);
+                        let parts = crate::list::detach_parts(&backs);
+                        #[cfg(feature = "diagnostics")]
+                        crate::capture::op(q, || {
+                            let named: Vec<String> = recordings
+                                .iter()
+                                .zip(&backs)
+                                .map(|(r, &b)| match crate::list::host_list(b) {
+                                    Some(h) => format!("title {:#x} as {:#x}", r.title(), std::ptr::from_ref(h) as usize),
+                                    None => format!("title {:#x}", r.title()),
+                                })
+                                .collect();
+                            format!("TRANSLATED submission, {} parts: {named:?}", parts.len())
+                        });
+                        let mut pieces = Vec::new();
+                        for (waits, taken, order) in parts {
+                            pieces.extend(waits.into_iter().map(Held::Value));
+                            pieces.push(Held::Run(taken, order));
+                        }
+                        held = lock(line);
+                        if matches!(held.first(), Some(Held::Running)) {
+                            held.remove(0);
+                        }
+                        held.splice(0..0, pieces);
+                    }
                     Held::Present(show) => {
                         // Shown with the line open, as a submission is
                         // sent: the title adds behind it meanwhile.
@@ -796,6 +885,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let _span = crate::timeline::span("exec>", "exec<", this as u64, u64::from(count));
         crate::resubmit::submitted(this, lists);
+        if crate::list::thin::on() && !this.is_null() {
+            submit_thin(this, lists);
+            return;
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -1052,6 +1145,10 @@ extern "system" fn present(
     crate::profile::frame();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
+    // (With list calls written down, every submission is translated first:
+    // what is free to run is then what it was before.)
+    #[cfg(windows)]
+    crate::list::thin::settle();
     #[cfg(windows)]
     let in_line = async_present();
     #[cfg(windows)]
