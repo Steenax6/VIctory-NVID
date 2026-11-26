@@ -414,6 +414,11 @@ struct Seen {
     /// Views by the key of their record and the way they are read
     /// ([`seen_way`]): what making them ready did.
     views: Plain<(u64, u8), Made>,
+    /// Diagnostics: views asked for, views known ready and slots known
+    /// made since the counts were last handed on ([`SEEN_COUNTS`]; counted
+    /// here because a count all recording threads add to at every view is
+    /// a line of memory they pass between them).
+    counted: [std::cell::Cell<u64>; 3],
 }
 
 /// What [`readable`] did for a view, for [`Seen`].
@@ -478,7 +483,22 @@ fn seen_way(kind: ResourceType) -> u8 {
     }
 }
 
+impl Drop for Seen {
+    fn drop(&mut self) {
+        self.count();
+    }
+}
+
 impl Seen {
+    /// Hands the list's counts on ([`SEEN_COUNTS`]).
+    fn count(&self) {
+        for (count, all) in self.counted.iter().zip(&SEEN_COUNTS) {
+            if count.get() > 0 {
+                all.fetch_add(count.take(), Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Nothing is known any more.
     fn clear(&mut self) {
         self.slots.clear();
@@ -497,6 +517,7 @@ impl Seen {
     /// (`resource::targets_changed`: a view placed in its memory shows its
     /// texels from then on, or no longer). True if something did.
     fn fresh(&mut self, list: &HostList) -> bool {
+        self.count();
         let now = [
             crate::frame::current(),
             std::ptr::from_ref(list) as u64,
@@ -3607,11 +3628,11 @@ impl State {
     fn ready(&mut self, list: &HostList, kind: ResourceType, key: u64, view: Option<&View>) {
         let way = seen_way(kind);
         #[cfg(feature = "diagnostics")]
-        SEEN_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+        self.seen.counted[0].set(self.seen.counted[0].get() + 1);
         if self.seen.known(list, key, way) {
             #[cfg(feature = "diagnostics")]
             {
-                SEEN_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+                self.seen.counted[1].set(self.seen.counted[1].get() + 1);
                 if seen_check() {
                     let before = list.recorded();
                     let found = view.cloned().or_else(|| crate::descriptor::view_of(key));
@@ -3668,7 +3689,7 @@ impl State {
             && crate::frame::current() == self.seen.stamp[0];
         #[cfg(feature = "diagnostics")]
         if known {
-            SEEN_COUNTS[2].fetch_add(1, Ordering::Relaxed);
+            self.seen.counted[2].set(self.seen.counted[2].get() + 1);
             // The check: a texture's slot is noted read in the frame the
             // list knows it from (or in one that began this instant).
             if seen_check()
