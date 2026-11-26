@@ -9167,6 +9167,7 @@ impl Meter {
             crate::code_use::line();
             crate::pipeline::driver_line();
             crate::resubmit::line();
+            crate::list::thin::line(logged_frames);
             {
                 let [ns, made] = [0, 1].map(|i| crate::resource::MAKING[i].swap(0, Ordering::Relaxed) as f64);
                 let [heaps, placed, committed] = crate::placed::stats();

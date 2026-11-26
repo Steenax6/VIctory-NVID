@@ -134,7 +134,16 @@ struct List {
     tally: Tally,
     #[cfg(windows)]
     after: std::sync::Mutex<Option<crate::resubmit::Summary>>,
+    /// With calls only written down (`VICTORY_THIN=1`, [`thin`]): the
+    /// recording being written and its words not handed over yet.
+    #[cfg(windows)]
+    thin: thin::Front,
 }
+
+/// List calls written down and translated by threads of ours
+/// (`VICTORY_THIN=1`).
+#[cfg(windows)]
+pub(crate) mod thin;
 
 /// Indices into [`Tally::counts`].
 #[cfg(windows)]
@@ -644,6 +653,30 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(windows)]
+    if thin::on() {
+        // The title's list only writes its calls down; a list of ours does
+        // them ([`thin`]), and it needs no host list of its own.
+        let mut list = boxed(kind, pipeline, false);
+        list.object = if crate::device::newer() {
+            Object::new(&thin::NEWER_FUNCTIONS)
+        } else {
+            Object::new(&thin::FUNCTIONS)
+        };
+        // Lists start open: what the title records before its first reset
+        // is a recording too.
+        let title = std::ptr::from_ref::<List>(&*list) as usize;
+        list.thin.begin(kind, pipeline, title);
+        return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    }
+    object::hand_out(LIST, boxed(kind, pipeline, true), iid, &LIST_IIDS, out)
+}
+
+/// A list of `kind` with `pipeline` bound, open, with a host list if
+/// `host` and there is a host GPU.
+fn boxed(kind: u32, pipeline: This, host: bool) -> Box<List> {
+    #[cfg(not(windows))]
+    let _ = host;
     let list = Box::new(List {
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
@@ -659,7 +692,7 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| host).and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -680,10 +713,12 @@ fn new_list(
         tally: Tally::default(),
         #[cfg(windows)]
         after: Default::default(),
+        #[cfg(windows)]
+        thin: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    list
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {

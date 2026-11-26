@@ -128,14 +128,22 @@ pub(crate) fn hand_out<T>(
 }
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
-pub(crate) fn release_boxed<T>(this: This) -> u32 {
+pub(crate) fn release_boxed<T: 'static>(this: This) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
             private_data().retain(|&(object, _), _| object != this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
-            drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
+            let object = unsafe { Box::from_raw(this.cast_mut().cast::<T>()) };
+            // With list calls translated later, a recording not translated
+            // yet may still name it (`crate::list::thin::bury`).
+            #[cfg(windows)]
+            if crate::list::thin::buries() {
+                crate::list::thin::bury(object);
+                return 0;
+            }
+            drop(object);
             0
         }
         Ok(n) => n - 1,

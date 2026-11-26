@@ -439,6 +439,64 @@ The log says "ambient light: stands in for the indirect light while no
 rays run" once with the level, then the reflections' and the left-out
 program's lines.
 
+## List calls written down (`VICTORY_THIN=1`, opt-in)
+
+`VICTORY_THIN=1` (with `VICTORY_ASYNC_SUBMIT=1`, whose line of
+submissions it uses; off by default until it is verified) makes the title's
+list calls write their arguments into a stream of words, with copies of what
+D3D12 reads at the call (arrays and structures passed, the records of render
+target and depth views). Threads of ours translate the streams through the
+same list methods as before, on lists of ours, starting while the title
+still records (every 1,024 words) and several lists at once. A submission
+stands in its queue's line until its lists are translated and is then cut at
+its waits and sent as before. Ported from avatarmanz/VIctory-7900XTX
+`crates/victory-gpu/src/list/thin.rs`. Why: the title records a chain of 19
+lists in one job, 36 to 50 ms of our translation on one thread, and its
+render thread waits 22 to 42 ms for that job before it submits and presents.
+
+What is read later than before and why that is what the console's card sees
+is listed call by call at the head of `crates/victory-gpu/src/list/thin.rs`.
+A title object whose last reference goes while recordings are not translated
+is freed once every recording begun before it is (at most 2 s later). The
+present, and a submission of ours that is waited for, first wait until every
+submitted recording is translated.
+
+- `VICTORY_THIN_THREADS=<n>` (6 unless told, 1 to 16): the translating
+  threads. `VICTORY_THIN_PRIORITY=<-2..2>` (0, normal, unless told): their
+  Windows thread priority.
+- `VICTORY_THIN_CHECK=1` (diagnostics build): for every draw and dispatch the
+  first 32 bytes of each bound descriptor table and root view (what the draw
+  reads for certain) are hashed at the call and again at translation; the
+  line "thin check" counts the draws whose bytes differed, tables and views
+  apart, that is where the path in the call would have read something else,
+  and the log names the first 16 addresses. First room, 2026-11-26: of about
+  13,060 draws and dispatches a frame, tables 0 to 0.04, root views 2.2 to
+  2.4 (with 256 bytes about 115: they reach into the next draw's slots).
+
+The line "list calls translated by threads of ours per frame" gives the calls
+and the threads' time, lists, pieces, recordings let go of unfinished, the
+title objects whose freeing waited and those freed past a recording held open,
+and how long presents stood for translation (the timeline's `thinwait`
+events; each translated piece is a `thin>`/`thin<` pair).
+
+First room, 2026-11-26 (indications: other work ran on the machine): the
+render thread no longer waits for the recording job (no wait of 3 ms or more
+in the timeline, 22 to 42 ms before); the title's job threads write their
+calls in a few milliseconds and six threads of ours translate about 42,000
+calls a frame in 200 ms summed (about 30 ms each). The frame is now the
+submitting thread's: it sends 60 to 64 ms of a 61 to 66 ms frame and idles
+under a millisecond, and the present stands for translation under a
+millisecond. So the frame did not get shorter (71.5 and 66.8 to 72.3 ms
+against 70.9 without), and its sending got slower (preparing 51 to 54 ms
+against 45). What shortens the frame from here is the submitting thread's
+work, or the present no longer waiting for it.
+
+To become the default and the path in the call to be removed: the picture of
+the first room and of the open world as without it; the always-on invariant
+lines at 0 and the warnings of a run of the same kinds and counts; the thin
+check at 0 over the first room and an open-world drive; no "freed past a
+recording held open"; a measured gain on a quiet machine.
+
 ## Where the time goes
 
 On 2026-11-25 the first room (90-100 ms a frame) was bound by the card,
