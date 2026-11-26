@@ -112,6 +112,18 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Per title slot the texture pass uploaded, the number its upload's
+    /// read began at (`crate::writes::stamp`; `crate::writes::NOT_READ`
+    /// until the list that holds the upload is submitted): a write behind
+    /// the guards numbered higher under the slot's texture came after the
+    /// read ([`HostHeap::slots_written_under`]).
+    stamps: Mutex<std::collections::HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+    /// The slots whose last upload read before a write that came after it
+    /// had its bytes there (by those numbers), until uploaded again.
+    stale: Mutex<std::collections::BTreeSet<u32>>,
+    /// Of `stamps`, those whose read may not have begun, with the address
+    /// of the list that holds the upload; pruned at each bake.
+    unread: Mutex<std::collections::HashMap<u32, (std::sync::Arc<std::sync::atomic::AtomicU64>, usize)>>,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -439,51 +451,70 @@ impl Spans {
 
 /// Title memory written behind the guards' back whose bytes are there
 /// (DirectStorage's reads into physical pages, at the addresses the title
-/// has them mapped; `crate::watch::title_memory_written`), since a texture
-/// pass last took the ranges ([`page_written`]). Kept apart from
-/// [`REMAPPED`] so that what such writes do is counted by itself.
-static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// has them mapped, and its reads to plain addresses;
+/// `crate::watch::title_memory_written`), since a texture pass last took
+/// the ranges ([`page_written`]): start, end, and the write's number
+/// (`crate::writes::next`, given under this lock, so a pass that takes
+/// them takes every number up to the last). Kept apart from [`REMAPPED`]
+/// so that what such writes do is counted by itself.
+static PAGE_WRITTEN: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
 
 /// Since the start: such ranges kept for a pass; ranges dropped because no
 /// pass took them; slots of placed textures that held bytes of them when a
-/// pass took them; of those, the slots whose texture had been uploaded
-/// before the write (out of the queue, or in it after an upload): they are
-/// the ones that kept the bytes from before, and the ones made due when
-/// `VICTORY_PAGE_WRITES` asks for it.
-pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// pass took them; of those, the slots whose last upload read before the
+/// write's bytes were there (`crate::writes`): stale; due slots the pass
+/// left for after a read the title has submitted into their memory
+/// (`crate::writes::pending_over`).
+pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-/// Frames from the pass that takes a written range to the look at its
-/// slots: the levels of one texture arrive in a few requests, and a look
-/// two frames on takes those of the next frame with it.
-const PAGE_WRITE_AFTER: u64 = 2;
+/// Slots noted stale now ([`HostHeap::slots_written_under`]), over the
+/// heaps.
+pub(crate) static STALE_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
 /// written and nothing mapped. Kept for the next texture pass
 /// ([`HostHeap::texture_slots_page_written`]), as [`remapped`] keeps its
-/// ranges; locks one mutex and calls nothing.
-pub(crate) fn page_written(at: usize, len: usize) {
+/// ranges. Returns the write's number (`crate::writes`); 0 for memory no
+/// texture view describes, where nothing waits for a pass. Locks one mutex
+/// and calls nothing.
+pub(crate) fn page_written(at: usize, len: usize) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them: a world's loading writes
+    /// thousands before a pass runs.
+    const MOST: usize = 1 << 20;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
-    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
-        return;
+    if !spanned(start, end) {
+        return 0;
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
+    let number = crate::writes::next();
+    // Joined with the one before: the whole range carries the newer number
+    // (an upload that read between the two is uploaded again either way).
     if let Some(last) = ranges.last_mut()
         && last.1 == start
     {
-        last.1 = end;
-        return;
+        (last.1, last.2) = (end, number);
+        return number;
     }
     if ranges.len() >= MOST {
+        // No pass took them (none runs): what read before them is not
+        // uploaded again. Counted.
         PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
         ranges.clear();
     }
-    ranges.push((start, end));
+    ranges.push((start, end, number));
+    number
+}
+
+/// Whether title memory `[start, end)` reaches into the spans of the
+/// texture views noted so far ([`SPANNED`]); outside them nothing the
+/// runtime does is the texture pass's business.
+pub(crate) fn spanned(start: u64, end: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    end > SPANNED[0].load(Relaxed) && start < SPANNED[1].load(Relaxed)
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -783,6 +814,15 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             w.due = w.due.max(due);
             self.held.insert(index, write);
+        }
+    }
+
+    /// Slot `index` is left for after a write the title has submitted
+    /// into its memory: due from frame `due`, nothing else of it changed
+    /// (it is no slot "waiting for its memory").
+    fn after(&mut self, index: u32, write: u64, due: u64) {
+        if let Some(w) = self.same(index, write) {
+            w.due = w.due.max(due);
         }
     }
 
@@ -1186,6 +1226,9 @@ impl HostHeap {
                 }
                 spans
             },
+            stamps: Mutex::default(),
+            stale: Mutex::default(),
+            unread: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1492,7 +1535,6 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        self.texture_slots_page_written(frame);
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         // Taken once: only another overflow sets it again.
         let all = OVERFLOWED.swap(false, Relaxed);
@@ -1522,51 +1564,133 @@ impl HostHeap {
     }
 
     /// Takes the ranges of title memory written behind the guards' back
-    /// since the last call ([`page_written`]) and finds the slots whose
-    /// placed texture holds bytes of them ([`Spans::slots_holding`]). A
-    /// slot whose texture was uploaded before the write shows the bytes
-    /// from before: with `VICTORY_PAGE_WRITES` (`crate::watch::page_writes`,
-    /// bit 2) it is due again [`PAGE_WRITE_AFTER`] frames on, as memory
-    /// mapped under it would make it ([`HostHeap::texture_slots_remapped`]);
-    /// its host copy exists, so the upload needs no room on the card. A
-    /// slot still waiting for its first upload is left as it is: that
-    /// upload takes the bytes that are there by then. Slots tables read
-    /// are left to their draws. Counted either way; returns how many slots
-    /// it made due.
-    fn texture_slots_page_written(&self, frame: u64) -> usize {
+    /// since the last call ([`page_written`]) and notes stale the slots
+    /// whose last upload read before a write's bytes were there
+    /// ([`HostHeap::slots_written_under`]). With `VICTORY_PAGE_WRITES` bit
+    /// 2 (`crate::watch::page_writes`) every stale slot is due at once as
+    /// well; without, a stale slot waits for a bake
+    /// ([`HostHeap::texture_slots_stale`]) or for whatever else makes it due.
+    /// Returns how many slots it noted stale.
+    /// shortcut: the ranges are kept in one place for all heaps; the heap
+    /// whose pass runs first takes them (a title has one view heap).
+    pub(crate) fn texture_slots_page_written(&self, frame: u64) -> usize {
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        let stale = self.slots_written_under(&ranges, frame);
+        if crate::watch::page_writes() & 2 != 0 && !stale.is_empty() {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in &stale {
+                textures.changed(slot, frame, frame);
+            }
+        }
+        stale.len()
     }
 
-    /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
-    /// the slots that held bytes of them, those of them uploaded before,
-    /// and those made due (the latter, if `due`).
-    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut slots: Vec<u32> = {
+    /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end,
+    /// the write's number): the slots whose placed texture holds bytes of
+    /// them ([`Spans::slots_holding`]) and whose last upload by the texture
+    /// pass read before the write's number was given
+    /// ([`HostHeap::texture_slot_stamp`], `crate::writes::holds`) show the
+    /// bytes from before: noted stale (`stale`) until uploaded again. A
+    /// slot never uploaded, or whose upload reads later (its list is not
+    /// submitted yet), is left as it is: that upload takes the bytes. So is
+    /// a slot tables read: its draws bring it up to date. Returns the slots
+    /// found stale now.
+    fn slots_written_under(&self, ranges: &[(u64, u64, u64)], frame: u64) -> Vec<u32> {
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        // Per slot, the highest number of a write it holds bytes of.
+        let mut needs: Vec<(u32, u64)> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+            ranges
+                .iter()
+                .flat_map(|&(start, end, number)| placed.slots_holding(start, end).into_iter().map(move |s| (s, number)))
+                .collect()
         };
+        needs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        needs.dedup_by_key(|n| n.0);
+        needs.retain(|&(slot, _)| !self.tabled_lately(slot, frame));
+        PAGE_WRITES[2].fetch_add(needs.len() as u64, Relaxed);
+        // Read before the write: the stamp of its last upload is older.
+        let stale: Vec<u32> = {
+            let stamps = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
+            needs
+                .into_iter()
+                .filter(|&(slot, number)| {
+                    stamps.get(&slot).is_some_and(|stamp| !crate::writes::holds(stamp.load(SeqCst), number))
+                })
+                .map(|(slot, _)| slot)
+                .collect()
+        };
+        PAGE_WRITES[3].fetch_add(stale.len() as u64, Relaxed);
+        let mut noted = self.stale.lock().unwrap_or_else(|e| e.into_inner());
+        noted.extend(stale.iter().copied());
+        STALE_NOW.store(noted.len() as u64, Relaxed);
+        drop(noted);
+        stale
+    }
+
+    /// The texture pass uploaded title slot `index`, and the upload's read
+    /// will begin (or began) at the number in `stamp` (`crate::writes`;
+    /// `NOT_READ` until it does): kept for the writes that come after it
+    /// ([`HostHeap::slots_written_under`]); the slot is stale no more.
+    /// `list` is the list that holds the upload (its address), for a bake
+    /// recorded in another ([`HostHeap::texture_slots_stale`]).
+    pub(crate) fn texture_slot_stamp(&self, index: u32, stamp: std::sync::Arc<std::sync::atomic::AtomicU64>, list: usize) {
+        self.stamps.lock().unwrap_or_else(|e| e.into_inner()).insert(index, stamp.clone());
+        {
+            let mut unread = self.unread.lock().unwrap_or_else(|e| e.into_inner());
+            // Bakes are few: the ones read since go now and then here too.
+            if unread.len() >= 1 << 14 {
+                unread.retain(|_, (s, _)| s.load(std::sync::atomic::Ordering::SeqCst) == crate::writes::NOT_READ);
+            }
+            unread.insert(index, (stamp, list));
+        }
+        let mut stale = self.stale.lock().unwrap_or_else(|e| e.into_inner());
+        if stale.remove(&index) {
+            STALE_NOW.store(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// For a bake (`crate::draw` `early_textures`) recorded in the list at
+    /// `list`: the slots noted stale ([`HostHeap::slots_written_under`]),
+    /// and unless `list` is 0 the slots whose last upload sits in another
+    /// list that has not been submitted (its read has not begun: the
+    /// bake's list may run first), each due at once as written in `frame`,
+    /// with its write number, for the pass to upload first. Slots tables
+    /// read lately are left to their draws. Returns them and how many of
+    /// them were stale.
+    pub(crate) fn texture_slots_stale(&self, frame: u64, list: usize) -> (Vec<(u32, u64)>, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut slots: Vec<u32> = self.stale.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+        let stale = slots.len();
+        {
+            let mut unread = self.unread.lock().unwrap_or_else(|e| e.into_inner());
+            // Read since: no longer of interest here.
+            unread.retain(|_, (stamp, _)| stamp.load(SeqCst) == crate::writes::NOT_READ);
+            if list != 0 {
+                slots.extend(unread.iter().filter(|(_, (_, at))| *at != list).map(|(&slot, _)| slot));
+            }
+        }
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let held = slots.len();
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        // Uploaded before: out of the queue, or in it after an upload (in
-        // part, or whole and being looked at again).
-        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
-        PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
-        PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
-        if !due {
-            return [held, slots.len(), 0];
-        }
-        for &slot in &slots {
-            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
-        }
-        [held, slots.len(), slots.len()]
+        let due = slots
+            .into_iter()
+            .map(|slot| {
+                textures.changed(slot, frame, frame);
+                (slot, textures.writes)
+            })
+            .collect();
+        (due, stale)
+    }
+
+    /// Title slot `index` was left for after a write the title has
+    /// submitted: due again from frame `due`, nothing else of it changed.
+    pub(crate) fn texture_slot_after(&self, index: u32, write: u64, due: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).after(index, write, due);
     }
 
     /// Whether host slot `index` is made from the very record the title
@@ -5725,12 +5849,17 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(spans.slots_holding(at + 0x2000, at + 0x2000), [] as [u32; 0]);
     }
 
-    /// A write behind the guards' back under a placed texture: a slot
-    /// waiting for its first upload is left alone, one uploaded before is
-    /// counted, and made due two frames on when that is asked for. (The
-    /// ranges are handed over here, not through the list all heaps share.)
+    /// A write behind the guards' back under a placed texture, by the
+    /// writes' numbers: a slot never uploaded, or whose upload has not read
+    /// yet, or read after the write, holds its bytes; one whose upload read
+    /// before it is stale, whatever the queue knows of it, until uploaded
+    /// again; before a bake the stale slots (and those not read yet, when
+    /// asked) are due at once. (The ranges are handed over here, not
+    /// through the list all heaps share.)
     #[test]
-    fn a_page_write_makes_an_uploaded_texture_slot_due_when_asked() {
+    fn a_page_write_after_an_uploads_read_makes_its_slot_stale() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
@@ -5741,22 +5870,43 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
         let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
         assert!(heap.note_buffer(1, Some(&view), false).is_empty());
-        let written = [(at, at + 0x1000)];
-        // Waiting for its first upload: held, not uploaded, nothing done.
-        assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let write = |number: u64| [(at, at + 0x1000, number)];
+        // Waiting for its first upload: nothing is stale, it stays as it is.
+        assert_eq!(heap.slots_written_under(&write(10), 50), [] as [u32; 0]);
+        let (queued, w) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
-        heap.texture_slot_done(1, write, None);
-        assert_eq!(slots(u64::MAX), []);
-        // Uploaded and out of the queue. Memory elsewhere: nothing.
-        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, true), [0, 0, 0]);
-        // Under it, counted only: it stays out of the queue.
-        assert_eq!(heap.slots_written_under(&written, 60, false), [1, 1, 0]);
-        assert_eq!(slots(u64::MAX), []);
-        // Under it, asked for: due two frames on, not before.
-        assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
-        assert_eq!(slots(61), []);
-        assert_eq!(slots(62), [1]);
+        // Uploaded by the pass, the list not submitted yet: its read comes
+        // after any write numbered now.
+        let stamp = Arc::new(AtomicU64::new(crate::writes::NOT_READ));
+        let (list, bake_list) = (0x1000usize, 0x2000usize);
+        heap.texture_slot_stamp(1, stamp.clone(), list);
+        heap.texture_slot_done(1, w, None);
+        assert_eq!(heap.slots_written_under(&write(11), 50), [] as [u32; 0]);
+        // Before a bake in another list it goes up again all the same (the
+        // bake's list may run before the one that holds the upload); in
+        // the same list, or when not asked for, not.
+        assert_eq!(heap.texture_slots_stale(51, 0).0, []);
+        assert_eq!(heap.texture_slots_stale(51, list).0, []);
+        let (due, stale) = heap.texture_slots_stale(51, bake_list);
+        assert_eq!((due.iter().map(|d| d.0).collect::<Vec<_>>(), stale), (vec![1], 0));
+        heap.texture_slot_done(1, due[0].1, None);
+        // Its read began at 12: a write numbered 12 is in it, 13 is not.
+        stamp.store(12, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(heap.slots_written_under(&write(12), 60), [] as [u32; 0]);
+        // Memory elsewhere: nothing.
+        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000, 13)], 60), [] as [u32; 0]);
+        assert_eq!(heap.slots_written_under(&write(13), 60), [1]);
+        // Stale, out of the queue (`VICTORY_PAGE_WRITES` bit 2 is not
+        // asked for here); due at once before a bake, as written then.
+        assert_eq!(slots(u64::MAX), [] as [u32; 0]);
+        let (due, stale) = heap.texture_slots_stale(70, 0);
+        assert_eq!((due.iter().map(|d| d.0).collect::<Vec<_>>(), stale), (vec![1], 1));
+        assert_eq!(slots(70), [1]);
+        // Stale until uploaded again: then a bake finds nothing (its read
+        // has begun).
+        heap.texture_slot_stamp(1, Arc::new(AtomicU64::new(14)), list);
+        heap.texture_slot_done(1, due[0].1, None);
+        assert_eq!(heap.texture_slots_stale(71, bake_list).0, []);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

@@ -71,6 +71,8 @@ mod texback;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod writes;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -81,3 +83,5 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
+#[cfg(windows)]
+pub use writes::{PendingWrite, title_memory_will_write};

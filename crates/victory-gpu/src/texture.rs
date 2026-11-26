@@ -96,6 +96,11 @@ pub(crate) struct Staging {
     /// holds zeros): a refresh that could not read memory leaves a texture
     /// that held bytes as it was, but must not leave this one empty.
     filled: std::sync::atomic::AtomicBool,
+    /// The number the last read of title memory into the buffer began at
+    /// (`crate::writes::stamp`); `crate::writes::NOT_READ` until the first
+    /// refresh, 0 if that read nothing. The texture pass keeps it per slot
+    /// (`crate::descriptor::host::HostHeap::texture_slot_stamp`).
+    stamp: Arc<std::sync::atomic::AtomicU64>,
     /// The first level its views show while its most detailed levels' pages
     /// are not there; 0: all ([`Staging::note_levels_there`]).
     shown_from: std::sync::atomic::AtomicU32,
@@ -1202,9 +1207,25 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
         let started = std::time::Instant::now();
+        // The writes numbered so far are in memory before the read begins
+        // (`crate::writes`); a read the title has submitted into this memory
+        // and not done reads what is there before it.
+        let stamp = crate::writes::stamp();
+        let (start, size) = (self.memory as u64, self.layout.size);
+        let under = crate::writes::pending_over(start, start + size);
         let read = self.refresh_now();
+        if read > 0 {
+            self.stamp.store(stamp, SeqCst);
+            if under {
+                READ_UNDER_PENDING.fetch_add(1, Relaxed);
+            }
+        } else if self.stamp.load(SeqCst) == crate::writes::NOT_READ {
+            // Nothing read (the memory could not be had): as if read before
+            // any write.
+            self.stamp.store(0, SeqCst);
+        }
         // A spare buffer nothing filled whole yet (the memory was all zeros,
         // or could not be read): zeros, as a new buffer holds, before the
         // first upload from it runs.
@@ -1626,6 +1647,19 @@ pub(crate) fn unstage_later(resource: This) {
     }
 }
 
+/// The read stamp of title texture `resource`'s staging buffer
+/// ([`Staging::stamp`]), shared: the texture pass keeps it for the slot it
+/// uploaded, and the refresh at the list's submission fills it in.
+pub(crate) fn read_stamp(resource: This) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?.get(&(resource as usize)).map(|s| s.stamp.clone())
+}
+
+/// Since the start: reads of texture memory into a staging buffer that a
+/// read the title had submitted was still to write
+/// (`crate::writes::pending_over`): they took what was there before it.
+pub(crate) static READ_UNDER_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -2038,6 +2072,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let s = Arc::new(Staging {
         remapped,
         filled: std::sync::atomic::AtomicBool::new(false),
+        stamp: Arc::new(std::sync::atomic::AtomicU64::new(crate::writes::NOT_READ)),
         shown_from: std::sync::atomic::AtomicU32::new(0),
         buffer,
         #[cfg(feature = "diagnostics")]

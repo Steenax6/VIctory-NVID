@@ -1944,27 +1944,31 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
-/// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
-/// not see once its bytes are there ([`title_memory_written`]), as bits:
-/// 1, the guarded blocks under it are opened and count as written (host
-/// copies of buffers and textures read through tables take them again);
-/// 2, the placed textures picked by index that lie under it are due again;
-/// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
+/// What `VICTORY_PAGE_WRITES` asks to be done with a write into physical
+/// pages that the guards do not see, once its bytes are there
+/// ([`title_memory_written`]), as bits: 1, the guarded blocks under it are
+/// opened and count as written (host copies of buffers and textures read
+/// through tables take them again); 2, the placed textures picked by index
+/// whose last upload read before the write (by the writes' numbers,
+/// `crate::writes`) are due again at once, at every pass, not only before
+/// the title's bake (`crate::draw` `early_textures`, which does that
+/// whatever this says). Unset or `guards`: bit 1 alone. `0`: nothing.
+/// `1` or `all`: bits 1 and 2. `slots`: bit 2 alone. Every such write and
+/// every read to a plain address that finished is numbered and noted for
+/// the texture pass whatever this says (a read to a plain address writes
+/// from user mode, which the guards see).
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
-/// it. Bit 2 makes texture slots due and is the one that flooded the
-/// queue in an earlier form: still asked for by name.)
+/// it. Bit 2 uploads some 120 textures a second again in the opening
+/// cutscene (12,011 in 100 s); in its earlier form, two frames after the
+/// write, it cost 8 ms a frame.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
         Ok("0") => 0,
-        Ok("1") => 3,
+        Ok("1") | Ok("all") => 3,
         Ok("slots") => 2,
-        Ok("all") => 7,
         _ => 1,
     })
 }
@@ -1986,10 +1990,11 @@ pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 ///
 /// Upstream's c75fdba does the same for its trackers (its `Writing` marks
 /// the pages once more when dropped; page destinations are reported at
-/// each address showing them). Here it is counted always and acted on as
-/// [`page_writes`] says. Called without the runtime's page-table lock;
-/// takes the guards' lock, then, alone, the lock of the ranges kept for
-/// the texture pass.
+/// each address showing them). Here it is counted always, the guards are
+/// acted on as [`page_writes`] says, and the range is kept with a number
+/// for the texture pass (`crate::writes`). Called without the runtime's
+/// page-table lock; takes the guards' lock, then, alone, the lock of the
+/// ranges kept for the texture pass.
 pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     if len == 0 {
@@ -2002,16 +2007,11 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
-        if mode & 4 == 0 {
-            return;
-        }
     }
-    {
+    if pages {
         let mut g = guards();
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
-        if pages {
-            WRITTEN[2].fetch_add(guarded, Relaxed);
-        }
+        WRITTEN[2].fetch_add(guarded, Relaxed);
         if mode & 1 != 0 && guarded != 0 {
             // Written through another view: these addresses need not be
             // writable, only copied again (`mark_only`).

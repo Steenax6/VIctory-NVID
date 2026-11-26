@@ -9120,15 +9120,23 @@ impl Meter {
             {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
-                let [kept, dropped, slots, uploaded] =
-                    [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
+                let [kept, dropped, slots, stale, left] =
+                    [0, 1, 2, 3, 4].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the \
+                     title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to \
+                     plain addresses finished; {kept} ranges of both under texture views kept for the texture pass ({dropped} dropped); \
+                     {slots} slots of placed textures held their bytes, {stale} of them stale (their upload read before the write \
+                     ended, by the writes' numbers: {}), {} stale now; {left} due slots left for after a read the title had \
+                     submitted, {} such reads so far (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 neither, \
+                     slots, 1 or all makes stale slots due at once)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
-                    if mode & 4 != 0 { "told as well" } else { "counted only" },
-                    if mode & 2 != 0 { "made due again" } else { "left as they were" }
+                    if mode & 2 != 0 { "made due at once" } else { "uploaded again before a bake" },
+                    crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed),
+                    crate::writes::PENDING_COUNTS[0].load(Ordering::Relaxed)
                 );
+                crate::draw::bake_writes_line(0);
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(

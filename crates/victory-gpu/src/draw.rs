@@ -68,8 +68,63 @@ thread_local! {
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
-    /// pass's own per frame.
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// pass's own per frame, and whether it runs for a bake draw.
+    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the pass before a bake draw first uploads again every texture
+/// picked by index whose last upload read its memory before a write the
+/// guards do not see had its bytes there, by the writes' numbers
+/// (`crate::writes`), and every one whose upload a list recorded before
+/// and has not submitted yet (`VICTORY_BAKE_WRITES`, on; `0`: counted
+/// only, to compare).
+///
+/// The bake reads its sources once, at load, and the title bakes as soon
+/// as it has a read's status: a source uploaded while its pages still held
+/// what they held before the read (the title maps them, writes the view,
+/// then has them filled) was baked from those bytes, a 256x256 piece of a
+/// head's decorations noise for the run, page by page: blocks or rows of
+/// garbage beside right texels, other ones in every run. The finished
+/// write made no slot due at all by default, and two frames late with
+/// `VICTORY_PAGE_WRITES=all`.
+fn bake_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// Since the start, for the bake (`bake_writes`): bake draws the texture
+/// pass ran for; of them, draws at which slots were stale (uploaded before
+/// a finished write, not uploaded again); those slots, summed over the
+/// draws; of the slots made due first at those draws (the stale ones and
+/// the next), the ones the pass uploaded before the draw; the ones it did
+/// not reach (its budget ran out) or the card refused; slots whose upload
+/// was recorded and not yet submitted, made due first as well;
+/// the slots made due at bakes that lay under a read the title had
+/// submitted and not finished (the bake samples what is there before it);
+/// bake draws for which no pass ran (the frame's bake budget was spent)
+/// while slots were stale.
+pub(crate) static BAKE_WRITES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// The line on bake sources and the writes behind the guards
+/// ([`BAKE_WRITES`]), after the 1st, 2nd, 4th, ... bake draw's pass and
+/// with the periodic lines (`frame`: 0 there).
+pub(crate) fn bake_writes_line(frame: u64) {
+    let [bakes, stale_bakes, stale, uploaded, missed, unread, pending, passless] =
+        BAKE_WRITES.each_ref().map(|c| c.load(Ordering::Relaxed));
+    if bakes == 0 && passless == 0 {
+        return;
+    }
+    tracing::info!(
+        frame,
+        stale_now = crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed),
+        reads_under_pending = crate::texture::READ_UNDER_PENDING.load(Ordering::Relaxed),
+        "bake sources, since the start: {bakes} bake draws with a texture pass, {stale_bakes} of them with slots \
+         stale by the writes' numbers ({stale} such slots in all; read before a DirectStorage write ended, not \
+         uploaded again), {unread} slots whose upload was recorded and not submitted yet; of the slots made due first \
+         {uploaded} uploaded before the draw, {missed} not reached or refused; {pending} slots under a read still to \
+         finish at a bake; {passless} bake draws without a pass while slots were stale (VICTORY_BAKE_WRITES={})",
+        if bake_writes() { "on" } else { "0: counted only" }
+    );
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -1843,11 +1898,14 @@ impl State {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+        if bake && left == 0 && crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed) > 0 {
+            BAKE_WRITES[7].fetch_add(1, Ordering::Relaxed);
+        }
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
-            (left, 2 << 30)
+            (left, 2 << 30, true)
         } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+            (early_ms, 64 << 20, false)
         } else {
             return;
         };
@@ -1873,6 +1931,7 @@ impl State {
                 queued_at_the_last_pass = slots,
                 due_at_the_last_pass = due,
                 uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                stale_now = crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed),
                 "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
             );
         }
@@ -1880,6 +1939,9 @@ impl State {
         PASS_BUDGET.set(Some(budget));
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);
+        if bake && n.is_power_of_two() {
+            bake_writes_line(frame);
+        }
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
@@ -2020,9 +2082,35 @@ impl State {
         if room {
             host.texture_slots_room(frame);
         }
+        // Writes the guards do not see since the last pass: the slots whose
+        // upload read before them are stale (`crate::writes`).
+        host.texture_slots_page_written(frame);
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        // Before a bake draw: the stale slots, and those whose upload is
+        // recorded in a list not submitted yet, go up first (`bake_writes`).
+        let bake = PASS_BUDGET.get().is_some_and(|b| b.2);
+        let first: Vec<(u32, u64)> = if bake {
+            BAKE_WRITES[0].fetch_add(1, Ordering::Relaxed);
+            let stale = crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed);
+            if stale > 0 {
+                BAKE_WRITES[1].fetch_add(1, Ordering::Relaxed);
+                BAKE_WRITES[2].fetch_add(stale, Ordering::Relaxed);
+            }
+            if bake_writes() {
+                let (slots, stale) = host.texture_slots_stale(frame, std::ptr::from_ref(list) as usize);
+                BAKE_WRITES[5].fetch_add(slots.len().saturating_sub(stale) as u64, Ordering::Relaxed);
+                slots
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let urgent: std::collections::HashSet<u32> = first.iter().map(|s| s.0).collect();
+        // Of `first`: reached by the pass before it stopped, and refused.
+        let (mut reached, mut refused_first) = (0u64, 0u64);
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
@@ -2032,6 +2120,8 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let (due, census) = host.texture_slots_due(frame, 4096);
+        let first_count = first.len() as u64;
+        let due: Vec<(u32, u64)> = first.into_iter().chain(due.into_iter().filter(|s| !urgent.contains(&s.0))).collect();
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -2091,7 +2181,7 @@ impl State {
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
+            Some((ms, bytes, _)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
             None => (span, per_frame),
@@ -2101,6 +2191,8 @@ impl State {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
             }
+            let is_first = urgent.contains(&index);
+            reached += u64::from(is_first);
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2148,6 +2240,26 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                // A read the title has submitted is still to write some of
+                // it: left for after it (uploaded now, it would go up again
+                // once the read is done). Not before a bake, which reads
+                // now: the title should not bake from it, and it is said.
+                if crate::writes::pending_over(address, address + len) {
+                    if !bake {
+                        crate::descriptor::host::PAGE_WRITES[4].fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_after(index, write, frame + 1);
+                        continue;
+                    }
+                    if BAKE_WRITES[6].fetch_add(1, Ordering::Relaxed) == 0 {
+                        tracing::warn!(
+                            slot = index,
+                            address = format_args!("{address:#x}"),
+                            bytes = len,
+                            "a bake draw: a texture picked by index lies under a read the title has submitted and not \
+                             finished; uploaded with what is there"
+                        );
+                    }
+                }
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -2197,6 +2309,7 @@ impl State {
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
+                    refused_first += u64::from(is_first);
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
@@ -2283,6 +2396,12 @@ impl State {
             } else {
                 None
             };
+            // The number its read begins at, filled in at the list's
+            // submission: a later write under it makes the slot stale.
+            if let Some(stamp) = crate::texture::read_stamp(resource) {
+                host.texture_slot_stamp(index, stamp, std::ptr::from_ref(list) as usize);
+                BAKE_WRITES[3].fetch_add(u64::from(is_first), Ordering::Relaxed);
+            }
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
@@ -2301,6 +2420,9 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        // The slots that were to go up first and did not: the pass stopped
+        // before them, or the card refused them.
+        BAKE_WRITES[4].fetch_add(first_count.saturating_sub(reached) + refused_first, Ordering::Relaxed);
         // Host copies made without their most detailed levels get them back
         // while the card has room and nothing waits for it
         // (`resource::promote_reduced`).
