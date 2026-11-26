@@ -27,10 +27,10 @@ AMD Ryzen 7 9800X3D and 64 GB of memory, with the settings of
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase, boat, binoculars |
 | Open world | played from a save at the first boat mission: the boat floats, casts off and steers; on foot; a car is entered and driven |
 | Saves | the game's autosave is written and continued at the next start; a save made with another fork loads |
-| Frame rate | opening cutscene about 10 fps (100 ms a frame), first room 13 fps (76 ms), open world 10 to 13 fps (77 to 97 ms, by scene; 77 ms by boat and by car over 22 minutes) |
-| Stability | 22 minutes in the open world in one session, ended by hand: no device loss, no error in the log |
+| Frame rate | opening cutscene 7 to 10 fps (100 to 140 ms a frame, differs from run to run), first room 13.6 fps (74 ms), open world 11 to 12 fps in the first interior (82 to 92 ms); an earlier build held 77 ms by boat and by car over 22 minutes |
+| Stability | 22 minutes in the open world in one session, ended by hand: no device loss, no error in the log (an earlier build). The entry into the open world lost the host device now and then; since a list holds the targets it binds, 22 entries in a row came through |
 | Memory | the process peaks at 20 to 26 GB. The card's 12 GB are full: textures that do not fit lose their most detailed levels first and go to the PC's memory last; none waits for room, in the prologue or in the open world |
-| Known problems | the game's ray-traced lighting does not run yet: a stand-in fills in for its indirect light (`VICTORY_AMBIENT`), so what the sun does not reach is evenly lit, not black, and bright scenes overexpose; black blocky patches on the water, most of them in the shallows |
+| Known problems | the game's ray-traced lighting does not run yet: a stand-in fills in for its indirect light (`VICTORY_AMBIENT`), so what the sun does not reach is evenly lit, not black, and bright scenes overexpose; the black squares on the water are gone in the scene checked (the open world's opening shot), the shallows seen from a boat are not checked again yet |
 
 In the first boat mission the "cast off" prompt comes back until the map
 has been opened once (View; Tab on the keyboard): a tutorial step of the
@@ -114,7 +114,7 @@ measured, what was tried and not kept, and the debugging switches.
 
 A build that changes the shader translator starts with an empty shader
 cache. The shaders can be translated beforehand, on the processor only
-(about a minute with 14 jobs on the machine above):
+(about three minutes with 10 jobs on the machine above):
 
 ```powershell
 $env:VICTORY_CACHE_DIR = "$env:LOCALAPPDATA\steenax\cache"; $env:VICTORY_HOST_WAVE = 32; $env:VICTORY_VIEW_LIMIT = 999999

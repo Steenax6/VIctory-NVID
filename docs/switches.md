@@ -103,7 +103,9 @@ census's "guarded blocks opened by the layer's own writes" should fall to
 nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
 pull request 3069; this tree's own code).
 
-`VICTORY_REFRESH_EVENTS` (2026-11-26; off, not run in the game yet): a
+`VICTORY_REFRESH_EVENTS` (2026-11-26; off: its check `=2` found 7 refreshes with
+bytes to copy and no event in the prologue's 205 s and 2 in the open
+world's first 130 s, so `=1` would have left writes out): a
 copy in view memory is not asked about again while nothing happened in
 its memory since it was last brought up to date. What can make a guarded
 block count as written (a write that faults, one of ours that opens or
