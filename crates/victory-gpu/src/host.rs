@@ -1088,6 +1088,9 @@ pub(crate) struct HostList {
     preludes_again: Mutex<Vec<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The first three of them in the order they were bound
+    /// ([`crate::resubmit::Summary`]).
+    first_bound: Mutex<Vec<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -4658,6 +4661,7 @@ impl Host {
                 prelude,
                 preludes_again: Mutex::default(),
                 pipelines: Mutex::default(),
+                first_bound: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -7140,6 +7144,7 @@ impl HostList {
         // Every run of the list has finished: the extra preludes are done.
         self.preludes_again.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.first_bound.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -7674,7 +7679,16 @@ impl HostList {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+            let mut first = self.first_bound.lock().unwrap_or_else(|e| e.into_inner());
+            if first.len() < 3 {
+                first.push(name.to_owned());
+            }
         }
+    }
+
+    /// The first three pipelines the list bound, in order.
+    pub(crate) fn first_bound(&self) -> Vec<String> {
+        self.first_bound.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {

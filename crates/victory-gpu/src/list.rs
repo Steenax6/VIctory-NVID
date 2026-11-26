@@ -127,6 +127,84 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// What the recording holds, counted as it is made, and what it held
+    /// when its host side was taken at a submission that does not wait
+    /// ([`note_detached`]); both go at the title's reset.
+    #[cfg(windows)]
+    tally: Tally,
+    #[cfg(windows)]
+    after: std::sync::Mutex<Option<crate::resubmit::Summary>>,
+}
+
+/// Indices into [`Tally::counts`].
+#[cfg(windows)]
+const KIND_DRAW: usize = 0;
+#[cfg(windows)]
+const KIND_INDEXED: usize = 1;
+#[cfg(windows)]
+const KIND_INDIRECT: usize = 2;
+#[cfg(windows)]
+const KIND_DISPATCH: usize = 3;
+#[cfg(windows)]
+const KIND_CLEAR: usize = 4;
+#[cfg(windows)]
+const KIND_COPY: usize = 5;
+#[cfg(windows)]
+const KIND_RESOLVE: usize = 6;
+
+/// The commands a list's recording holds, by kind (the draws count mesh
+/// dispatches too).
+#[cfg(windows)]
+#[derive(Default)]
+struct Tally {
+    counts: [std::sync::atomic::AtomicU32; 7],
+    targets: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(windows)]
+fn tally(this: This, what: usize) {
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        unsafe { &*this.cast::<List>() }.tally.counts[what].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn tally_targets(this: This) {
+    if !this.is_null() {
+        // SAFETY: as above.
+        unsafe { &*this.cast::<List>() }.tally.targets.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The host side of `list` is taken at a submission that is not waited
+/// for, and the list is left a new, empty one. A list taken from again
+/// before its reset runs that empty one: counted
+/// ([`crate::resubmit::ran_empty`]); the summary kept is that of the
+/// recording.
+#[cfg(windows)]
+fn note_detached(list: &List, host: &crate::host::HostList) {
+    let mut after = list.after.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(recorded) = after.as_ref() {
+        crate::resubmit::ran_empty(recorded);
+        return;
+    }
+    let mut pipelines = Vec::new();
+    for part in list.earlier.iter().map(|p| &p.host).chain([host]) {
+        pipelines.extend(part.first_bound());
+        if pipelines.len() >= 3 {
+            break;
+        }
+    }
+    pipelines.truncate(3);
+    let counts = std::array::from_fn(|i| list.tally.counts[i].load(std::sync::atomic::Ordering::Relaxed));
+    *after = Some(crate::resubmit::Summary {
+        kind: list.kind,
+        counts,
+        targets: list.tally.targets.load(std::sync::atomic::Ordering::Relaxed),
+        parts: list.earlier.len() as u32 + 1,
+        pipelines,
+    });
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -406,6 +484,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
+        note_detached(list, &host);
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -479,6 +558,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
+            note_detached(&*list, &host);
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
@@ -596,6 +676,10 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        tally: Tally::default(),
+        #[cfg(windows)]
+        after: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -661,6 +745,14 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes one of our lists.
+        let list = unsafe { &*this.cast::<List>() };
+        list.tally.counts.iter().for_each(|c| c.store(0, std::sync::atomic::Ordering::Relaxed));
+        list.tally.targets.store(false, std::sync::atomic::Ordering::Relaxed);
+        *list.after.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -838,6 +930,8 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    tally(this, KIND_COPY);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -864,6 +958,8 @@ fn unlike(dst: This, src: This) -> bool {
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    tally(this, KIND_COPY);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -931,6 +1027,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    tally(this, KIND_COPY);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1158,6 +1256,8 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    tally(this, KIND_RESOLVE);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -1234,6 +1334,8 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    tally(this, KIND_CLEAR);
+    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -1292,6 +1394,8 @@ extern "system" fn clear_dsv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    tally(this, KIND_CLEAR);
+    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
@@ -1330,6 +1434,8 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(windows)]
+    tally(this, KIND_COPY);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1881,6 +1987,9 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
+        if !handles.is_empty() || depth != 0 {
+            super::tally_targets(this);
+        }
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
     }
     pub(super) extern "system" fn draw(
@@ -1891,6 +2000,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::tally(this, super::KIND_DRAW);
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
@@ -1900,12 +2010,14 @@ mod state {
     }
     pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
         super::count_dispatch();
+        super::tally(this, super::KIND_DISPATCH);
         with_state(this, |list, s| s.dispatch(list, [x, y, z], flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
+        super::tally(this, super::KIND_DRAW);
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
@@ -1930,6 +2042,7 @@ mod state {
         payload: u64,
     ) {
         super::count_draw();
+        super::tally(this, super::KIND_DRAW);
         if flags != 0 || payload != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -1970,6 +2083,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::tally(this, super::KIND_INDEXED);
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -2034,6 +2148,8 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    #[cfg(windows)]
+    tally(this, KIND_INDIRECT);
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;

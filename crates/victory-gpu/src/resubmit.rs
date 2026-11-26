@@ -157,8 +157,73 @@ pub(crate) fn forget(list: This) {
     }
 }
 
+/// What a title list's last recording held, kept when its host side is
+/// taken (`crate::list::note_detached`).
+pub(crate) struct Summary {
+    /// The title list's type.
+    pub(crate) kind: u32,
+    /// Draws (mesh dispatches too), indexed draws, indirect executions,
+    /// dispatches, clears, copies, resolves.
+    pub(crate) counts: [u32; 7],
+    /// Whether it set render targets.
+    pub(crate) targets: bool,
+    /// Host lists the recording is in (cut at waits for memory values).
+    pub(crate) parts: u32,
+    /// The first pipelines it bound, in order (shader stages and hashes).
+    pub(crate) pipelines: Vec<String>,
+}
+
+impl Summary {
+    fn text(&self) -> String {
+        let [draws, indexed, indirect, dispatches, clears, copies, resolves] = self.counts;
+        format!(
+            "{draws} draws, {indexed} indexed draws, {indirect} indirect, {dispatches} dispatches, {clears} clears, {copies} copies, \
+             {resolves} resolves, {} host lists, render targets {}, first pipelines {:?}",
+            self.parts,
+            if self.targets { "set" } else { "not set" },
+            self.pipelines
+        )
+    }
+}
+
+/// Lists run empty, and the draws and dispatches they did not run: since the
+/// last periodic line, and since the start.
+static EMPTY_INTERVAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static EMPTY_TOTAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A title list was submitted again, without a reset, on a path that takes
+/// its host list away: what runs is the empty list left in its place, and
+/// the recording `recorded` is not replayed.
+pub(crate) fn ran_empty(recorded: &Summary) {
+    let [draws, indexed, indirect, dispatches, ..] = recorded.counts;
+    let lost = [1, u64::from(draws + indexed + indirect), u64::from(dispatches)];
+    for (i, n) in lost.into_iter().enumerate() {
+        EMPTY_INTERVAL[i].fetch_add(n, Relaxed);
+        EMPTY_TOTAL[i].fetch_add(n, Relaxed);
+    }
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let seen = LOGGED.fetch_add(1, Relaxed);
+    if seen < 8 {
+        tracing::warn!(
+            "a title list ran empty ({} of the first 8 logged): submitted again without a reset after its host list was taken \
+             away, frame {}, list type {}; its recording held {}",
+            seen + 1,
+            crate::frame::current(),
+            recorded.kind,
+            recorded.text()
+        );
+    }
+}
+
 /// The line with the others every few seconds.
 pub(crate) fn line() {
+    let [empty, empty_draws, empty_dispatches] = std::array::from_fn(|i| EMPTY_INTERVAL[i].swap(0, Relaxed));
+    let [empty_all, draws_all, dispatches_all] = std::array::from_fn(|i| EMPTY_TOTAL[i].load(Relaxed));
+    tracing::info!(
+        "title lists that ran empty (submitted again without a reset on a path that gives the host list away): {empty} in the \
+         interval, {empty_draws} draws and {empty_dispatches} dispatches not replayed; since the start: {empty_all} lists, \
+         {draws_all} draws, {dispatches_all} dispatches"
+    );
     let [flying, unfenced, after] = std::array::from_fn(|i| INTERVAL[i].swap(0, Relaxed));
     let [flying_all, unfenced_all, after_all] = std::array::from_fn(|i| TOTAL[i].load(Relaxed));
     tracing::info!(
@@ -219,5 +284,14 @@ mod tests {
         assert_eq!(t.submit(1, &[10, 10], reached(0)), Again::default());
         t.signal(1, 5, || 0);
         assert_eq!(t.submit(1, &[10, 10], reached(0)), Again { flying: 1, ..Again::default() });
+    }
+
+    #[test]
+    fn a_list_run_empty_adds_what_it_did_not_replay() {
+        let before = std::array::from_fn::<u64, 3, _>(|i| EMPTY_TOTAL[i].load(Relaxed));
+        ran_empty(&Summary { kind: 0, counts: [5, 2, 1, 4, 0, 0, 0], targets: true, parts: 2, pipelines: vec![] });
+        let after = std::array::from_fn::<u64, 3, _>(|i| EMPTY_TOTAL[i].load(Relaxed));
+        // (other tests may add too: at least this one's)
+        assert!(after[0] > before[0] && after[1] >= before[1] + 8 && after[2] >= before[2] + 4);
     }
 }
