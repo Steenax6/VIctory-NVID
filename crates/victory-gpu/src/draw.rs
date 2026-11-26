@@ -348,6 +348,9 @@ pub(crate) struct State {
     threads_x: Option<u32>,
     /// What the list's draws made ready so far.
     seen: Seen,
+    /// The buffer views its tables hold, made once
+    /// (`descriptor::host::KeptViews`).
+    kept: crate::descriptor::host::KeptViews,
     /// What a draw works its tables and user data out in.
     scratch: Scratch,
 }
@@ -453,8 +456,11 @@ pub(crate) fn seen_line(frames: f64) {
     tracing::info!(
         "views of tables per frame: {asked:.0} asked to be made ready, {known:.0} of them known ready in their list; {slots:.0} \
          slots known made; what the lists knew was thrown away {thrown:.1} times (a frame began, a title copy, a resource or a \
-         copy went); views known ready that were not, since the start: {}{}",
+         copy went); buffer views copied from their list's kept ones, since the start: {}; views known ready that were not, and \
+         kept ones that were not the view made now, since the start: {} and {}{}",
+        crate::descriptor::host::KEPT_VIEW_COUNTS[0].load(Ordering::Relaxed),
         SEEN_COUNTS[4].load(Ordering::Relaxed),
+        crate::descriptor::host::KEPT_VIEW_COUNTS[1].load(Ordering::Relaxed),
         if seen_check() { " (VICTORY_SEEN_CHECK=1: every one is made ready again and compared)" } else { " (not looked for: VICTORY_SEEN_CHECK=1)" }
     );
 }
@@ -489,8 +495,8 @@ impl Seen {
     /// (`descriptor::forgotten`); a buffer came or went, or a copy went
     /// (`shadow::changes`); a texture the host writes came or went
     /// (`resource::targets_changed`: a view placed in its memory shows its
-    /// texels from then on, or no longer).
-    fn fresh(&mut self, list: &HostList) {
+    /// texels from then on, or no longer). True if something did.
+    fn fresh(&mut self, list: &HostList) -> bool {
         let now = [
             crate::frame::current(),
             std::ptr::from_ref(list) as u64,
@@ -499,7 +505,8 @@ impl Seen {
             crate::shadow::changes(),
             crate::resource::targets_changed(),
         ];
-        if now != self.stamp {
+        let moved = now != self.stamp;
+        if moved {
             if !(self.slots.is_empty() && self.views.is_empty()) {
                 SEEN_COUNTS[3].fetch_add(1, Ordering::Relaxed);
                 self.slots.clear();
@@ -507,6 +514,7 @@ impl Seen {
             }
             self.stamp = now;
         }
+        moved
     }
 
     /// Whether the list has the view of record `key` ready for `way`.
@@ -550,6 +558,7 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.seen.clear();
+        self.kept.clear();
         self.tables_gone = true;
     }
 }
@@ -1745,7 +1754,10 @@ impl State {
         let l = &list.list;
         // What the slots made here showed before is retired at the end.
         let _together = crate::descriptor::host::Together::begin();
-        self.seen.fresh(list);
+        if self.seen.fresh(list) {
+            // (The views kept go by the same word: a resource or a copy went.)
+            self.kept.clear();
+        }
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -3951,9 +3963,10 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        match halved(self, slot, k * 8) {
-                            Some(shown) => host.make_at(index, &shown),
-                            None => host.make_at(index, &view),
+                        match (halved(self, slot, k * 8), record) {
+                            (Some(shown), _) => host.make_at(index, &shown),
+                            (None, Some(key)) => host.make_at_kept(index, &view, key, &mut self.kept),
+                            (None, None) => host.make_at(index, &view),
                         }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))

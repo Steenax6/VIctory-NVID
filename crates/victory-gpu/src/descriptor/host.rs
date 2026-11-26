@@ -2832,6 +2832,21 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// [`HostHeap::make_at`] for the view of record `key` in a list that
+    /// keeps the buffer views it made (`kept`): a shader view of a buffer is
+    /// made once there and copied into the slot from then on; any other
+    /// view is made in the slot, as before.
+    pub(crate) fn make_at_kept(&self, index: u32, view: &View, key: u64, kept: &mut KeptViews) {
+        let Some((from, resource)) = kept.view(view, key) else {
+            self.make_at(index, view);
+            return;
+        };
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap and one of the list's own, of one type.
+        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(index), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        self.keep(index, Some(resource));
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -3350,6 +3365,156 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// The shader views of buffers one list's tables hold, each made once in a
+/// heap of the list's own (one only the CPU reads) and copied from there
+/// into every table slot that shows it ([`HostHeap::make_at_kept`]).
+///
+/// A draw's tables are made anew in dynamic slots (they hold the draw's
+/// constants), and with them every buffer view in them: the copy of the
+/// buffer looked up, the view worked out and checked, the host asked to make
+/// it, some 60,000 times a frame in the first room for a few hundred views
+/// that differ (22 ms a frame of the recording threads in `buffer_srv`, 15
+/// of them in the host's call; the profile of 2026-11-26). A view made of
+/// the same record again is the same descriptor as long as the record
+/// names the same view (`super::forgotten`) and the copies' tables answer
+/// as they did (`crate::shadow::changes`): what the list kept is thrown
+/// away when either moves ([`KeptViews::clear`], by `crate::draw::Seen`'s
+/// stamp). Only views that could be made are kept; one the host would
+/// refuse, or whose copy could not be made, is asked for every time, as
+/// before. Textures' views are not kept: they change with the levels a
+/// texture holds.
+#[derive(Default)]
+pub(crate) struct KeptViews {
+    /// The heap, its first slot and the bytes of a slot, once a view is
+    /// kept.
+    heap: Option<KeptHeap>,
+    /// By record key: the slot of `heap` and the host buffer viewed.
+    made: std::collections::HashMap<u64, (u32, ID3D12Resource), std::hash::BuildHasherDefault<super::slots::SlotHasher>>,
+    /// Views copied from here since the count was last handed on
+    /// ([`KEPT_VIEW_COUNTS`]).
+    copied: u64,
+}
+
+/// A heap of [`KeptViews`]: the heap, its first slot, the bytes of a slot.
+type KeptHeap = (ID3D12DescriptorHeap, usize, u32);
+
+/// The views a list keeps at most; the rest are made in place.
+const KEPT_VIEWS_MOST: u32 = 1024;
+
+/// Heaps of [`KeptViews`] no list has now: a list's draw state is made anew
+/// at every reset, and a heap for each would be made a few hundred times a
+/// frame.
+static KEPT_HEAPS: Mutex<Vec<KeptHeap>> = Mutex::new(Vec::new());
+
+/// Since the start: buffer views copied from a list's kept ones, and those
+/// `VICTORY_SEEN_CHECK=1` found another descriptor or another buffer when
+/// it made them again.
+pub(crate) static KEPT_VIEW_COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl KeptViews {
+    /// Nothing is kept any more (the heap stays).
+    pub(crate) fn clear(&mut self) {
+        self.made.clear();
+        if self.copied > 0 {
+            KEPT_VIEW_COUNTS[0].fetch_add(std::mem::take(&mut self.copied), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Slot `slot` of the list's heap.
+    fn at(start: usize, slot: u32, step: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + slot as usize * step as usize }
+    }
+
+    /// The kept view of record `key` (`view`), made now if it is a shader
+    /// view of a buffer not kept yet and there is room: where it is, and
+    /// the host buffer it views. `None` for any other view and for one that
+    /// cannot be made.
+    fn view(&mut self, view: &View, key: u64) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+        let buffer = match view {
+            View::Shader(resource, Some(_)) => crate::resource::buffer_bytes(*resource as crate::object::This).is_some(),
+            View::Placed(false, resource, _) => resource[0] == 1,
+            _ => false,
+        };
+        if !buffer {
+            return None;
+        }
+        if let Some((slot, resource)) = self.made.get(&key) {
+            let &(_, start, step) = self.heap.as_ref()?;
+            let from = Self::at(start, *slot, step);
+            self.copied += 1;
+            #[cfg(feature = "diagnostics")]
+            if kept_check() {
+                // Made again in the slot past the kept ones and compared:
+                // the same buffer, and the same bytes where the slots are
+                // memory this process can read.
+                let again = Self::at(start, KEPT_VIEWS_MOST, step);
+                let made = make(view, again).flatten();
+                let same_buffer = made.as_ref().is_some_and(|b| windows::core::Interface::as_raw(b) == windows::core::Interface::as_raw(resource));
+                let read = |at: D3D12_CPU_DESCRIPTOR_HANDLE| {
+                    crate::texture::committed(at.ptr as *const u8, step as usize)
+                        // SAFETY: committed memory of this process, `step` bytes of it.
+                        .then(|| unsafe { std::slice::from_raw_parts(at.ptr as *const u8, step as usize) })
+                };
+                let same_bytes = read(from) == read(again);
+                if !(same_buffer && same_bytes) && KEPT_VIEW_COUNTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    tracing::warn!(same_buffer, same_bytes, ?view, "a buffer view a list kept is not the one made of its record now");
+                }
+            }
+            return Some((from, resource.clone()));
+        }
+        let host = host()?;
+        if self.made.len() as u32 >= KEPT_VIEWS_MOST {
+            return None;
+        }
+        if self.heap.is_none() {
+            self.heap = KEPT_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).pop().or_else(|| {
+                let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    // (One more: where the check makes a view again.)
+                    NumDescriptors: KEPT_VIEWS_MOST + 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                };
+                // SAFETY: a plain heap of ours.
+                let heap: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&desc) }.ok()?;
+                // SAFETY: a live heap; a plain query.
+                let (start, step) = unsafe {
+                    (
+                        heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                        host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                    )
+                };
+                Some((heap, start, step))
+            });
+        }
+        let &(_, start, step) = self.heap.as_ref()?;
+        let slot = self.made.len() as u32;
+        let at = Self::at(start, slot, step);
+        // (One that cannot be made is not kept: asked for every time.)
+        let resource = make(view, at).flatten()?;
+        self.made.insert(key, (slot, resource.clone()));
+        Some((at, resource))
+    }
+}
+
+impl Drop for KeptViews {
+    fn drop(&mut self) {
+        self.clear();
+        if let Some(heap) = self.heap.take() {
+            KEPT_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push(heap);
+        }
+    }
+}
+
+/// Whether a buffer view a list kept is made again and compared each time
+/// it is copied (`VICTORY_SEEN_CHECK=1`, diagnostics builds; see
+/// `crate::draw::Seen`).
+#[cfg(feature = "diagnostics")]
+fn kept_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEEN_CHECK").is_some_and(|v| v == "1"))
 }
 
 thread_local! {
