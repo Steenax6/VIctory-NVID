@@ -165,6 +165,60 @@ unsafe extern "system" fn ticket_release(this: *mut c_void) -> u32 {
     left
 }
 
+/// Whether new texture memory is made resident, and waited for, before
+/// anything can name it (on by default; `VICTORY_WAIT_RESIDENT=0`: as
+/// before). Memory of the default kind is resident once it is made, but
+/// its mapping into the card's address space is the system's work that
+/// runs later, and only lists sent after it wait for it. Lists already on
+/// the card read the descriptor heaps as they are: a slot that shows a
+/// texture in new memory was a page fault for them until it was mapped
+/// (avatarmanz/VIctory-7900XTX 0322b39ab: the losses there lay in textures
+/// made in the same tenth of a second). For heaps (placed textures, tiles
+/// of textures made level by level) and committed host textures; a texture
+/// placed in a heap that is there needs no more.
+fn wait_resident() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
+}
+
+/// The flag new texture memory is made with for [`resident`].
+pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
+    if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// Memory made with [`not_resident`] is resident, and mapped, when this
+/// returns ([`wait_resident`]).
+pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    if !wait_resident() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let object: ID3D12Pageable = object.cast()?;
+    // SAFETY: a live heap or resource of the device's.
+    let made = unsafe { device.MakeResident(&[Some(object)]) };
+    let us = started.elapsed().as_micros() as u64;
+    RESIDENT[0].fetch_add(1, Relaxed);
+    RESIDENT[1].fetch_add(us, Relaxed);
+    RESIDENT[2].fetch_max(us, Relaxed);
+    made
+}
+
+/// Since the start: memory waited for by [`resident`], the microseconds
+/// and the longest wait.
+static RESIDENT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The line on [`resident`], every few seconds; nothing before the first.
+pub(crate) fn resident_line() {
+    let [n, us, longest] = [0, 1, 2].map(|i| RESIDENT[i].load(Relaxed));
+    if n > 0 {
+        tracing::info!(
+            "new texture memory made resident before anything names it (VICTORY_WAIT_RESIDENT=0: not), since the start:              {n} times, {:.1} ms, the longest {:.1} ms",
+            us as f64 / 1e3,
+            longest as f64 / 1e3
+        );
+    }
+}
+
 /// Whether such textures are placed (`VICTORY_PLACED_TEX=1`; off by default).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -275,7 +329,7 @@ fn take(device: &ID3D12Device, size: u64, align: u64, shared: bool) -> Option<(I
             }
         },
         Alignment: NORMAL,
-        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | not_resident(),
     };
     let mut heap: Option<ID3D12Heap> = None;
     // SAFETY: plain creation.
@@ -283,6 +337,10 @@ fn take(device: &ID3D12Device, size: u64, align: u64, shared: bool) -> Option<(I
         tracing::warn!(error = %e, "no heap for host textures");
     }
     let heap = heap?;
+    if let Err(e) = resident(device, &heap) {
+        tracing::warn!(error = %e, "a heap for host textures is not resident");
+        return None;
+    }
     COUNTS[0].fetch_add(1, Relaxed);
     if shared {
         SHARED_HEAPS.fetch_add(1, Relaxed);

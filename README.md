@@ -186,6 +186,14 @@ always left free. The log line "host copies of textures in the PC's memory"
 counts them and their bytes. Not yet measured in a run here: compare the
 frame rate and the memory line with `=0`.
 
+`VICTORY_WAIT_RESIDENT` (on by default; `=0`: as before): new heaps for
+textures and committed host textures are made resident, and waited for,
+before anything names them. Lists already on the card read the descriptor
+heaps as they are, and a slot showing a texture in memory the system had
+not mapped yet was a page fault for them (avatarmanz/VIctory-7900XTX
+`0322b39ab`, a device loss about every 15 minutes there). The log line "new
+texture memory made resident" says how often and how long it waited.
+
 ## Shader warm-up (optional)
 
 A build that changes the shader translator starts with an empty shader

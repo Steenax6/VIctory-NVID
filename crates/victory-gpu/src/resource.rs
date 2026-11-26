@@ -2660,13 +2660,14 @@ fn host_texture_as(
         let made = unsafe {
             host.device.CreateCommittedResource(
                 &crate::placed::shared_heap(),
-                D3D12_HEAP_FLAG_NONE,
+                crate::placed::not_resident(),
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
                 None,
                 &mut texture,
             )
         };
+        let made = made.and_then(|()| texture.as_ref().map_or(Ok(()), |t| crate::placed::resident(&host.device, t)));
         match made {
             Ok(()) if texture.is_some() => {
                 crate::host::name(texture.as_ref()?, || {
@@ -2709,7 +2710,7 @@ fn host_texture_as(
         unsafe {
             host.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                crate::placed::not_resident(),
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(
                     crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
@@ -2719,9 +2720,12 @@ fn host_texture_as(
                 &mut texture,
             )
         }
+        // Resident before anything names it (`crate::placed::resident`).
+        .and_then(|()| texture.as_ref().map_or(Ok(()), |t| crate::placed::resident(&host.device, t)))
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
+        texture = None;
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
