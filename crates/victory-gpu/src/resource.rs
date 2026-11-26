@@ -3339,6 +3339,19 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
+/// How many textures [`texture_at`] made for views placed in the title
+/// memory `[address, address + bytes)`, `this` itself left out: each has a
+/// host copy of its own, filled from that memory (for the count of
+/// `crate::texture::CARD_WRITTEN`, when the card first copies into the
+/// texture that owns the memory).
+#[cfg(windows)]
+pub(crate) fn placed_within(address: u64, bytes: u64, this: This) -> u64 {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.range((address, [0; 14])..(address.saturating_add(bytes), [0; 14]))
+        .filter(|&(_, &texture)| texture != this as usize)
+        .count() as u64
+}
+
 /// The resource [`texture_at`] made for a texture placed at `address` with
 /// the description `desc`, if it has made one: never made here (for the
 /// frame listing, which must not count as a use).

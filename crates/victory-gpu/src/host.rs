@@ -9146,6 +9146,7 @@ impl Meter {
                     crate::writes::PENDING_COUNTS[0].load(Ordering::Relaxed)
                 );
                 crate::draw::bake_writes_line(0);
+                crate::texture::card_written_line();
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(
