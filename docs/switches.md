@@ -103,8 +103,9 @@ census's "guarded blocks opened by the layer's own writes" should fall to
 nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
 pull request 3069; this tree's own code).
 
-`VICTORY_REFRESH_EVENTS` (2026-11-26; off: its check counts 0 now, and with it and
-`VICTORY_LAND_TAKEN` on the frame did not move): a
+The refresh by event (2026-11-26; the way since its check counted 0; the
+old way, asking every time, is gone; `VICTORY_REFRESH_EVENTS=2` is the
+check): a
 copy in view memory is not asked about again while nothing happened in
 its memory since it was last brought up to date. What can make a guarded
 block count as written (a write that faults, one of ours that opens or
@@ -118,9 +119,9 @@ refresh is asked as before, and each one that `=1` would have left out
 and that found bytes to copy is counted and named ("a refresh found bytes
 to copy where no event was counted", with the block the guards reported
 and what it was to them); the line "refreshes by event" must say 0 of
-those in the prologue and at the open world's entry and in its bedroom
-before `=1` is used. Copies in private memory are asked as before: only
-the kernel knows what was written there.
+those, and it did in the prologue and at the open world's entry. Copies
+in private memory are asked as before: only the kernel knows what was
+written there.
 
 The check's first form found 7 such refreshes in the prologue's 205 s and
 2 in the open world's first 130 s. It decided that nothing had happened
@@ -142,17 +143,17 @@ then). The line now counts those askings as well: the ones that found
 blocks that had been absent, which is what they are for, and the ones
 that found other bytes no event had announced, which must be 0 too.
 
-Measured with both this switch and `VICTORY_LAND_TAKEN` at `=1` against
-unset, same build, back to back in the first room: preparing 36.4 against
+Measured with both this and the landings' taking below against the old
+way, same build, back to back in the first room: preparing 36.4 against
 40.6 ms a frame, the copies read 70 against 89 MB a frame, the frame 67.8
 against 66.6 ms. The work comes off the submitting thread and the frame
-does not follow, because the title's render thread and the submitting
-thread take turns (see "Where the time goes"); both stay off until that
-is changed.
+did not follow then, because the title's render thread and the
+submitting thread take turns (see "Where the time goes"); it is work not
+done, with checks that found nothing, so both are the way now.
 
-`VICTORY_LAND_TAKEN=1` (2026-11-26; off; `=2` is its check, which counted 0 of
-743,252 pages in the prologue and 0 of 181,911 at the open world's entry):
-what shaders wrote into private title memory (which the kernel
+The landings' taking (2026-11-26; the way; `VICTORY_LAND_TAKEN=2` is its
+check, which counted 0 of 743,252 pages in the prologue and 0 of 181,911
+at the open world's entry): what shaders wrote into private title memory (which the kernel
 write-watches; no guard there) set the written bits of its pages, the
 next refresh took them for the title's, and the landing's own copy read
 the pages it had just been given: 22.8 MB a frame in the first room,
@@ -174,6 +175,11 @@ memory" says how many pages a frame the copy no longer reads, and the
 guards line's "equal to the CPU side, not sent up" should fall by about
 that. Each taking costs a kernel call of 30 to 70 microseconds on the
 landing thread.
+
+To check both in a run: `VICTORY_REFRESH_EVENTS=2 VICTORY_LAND_TAKEN=2
+VICTORY_REFRESH_CHECK=1`; the lines "refreshes by event", "landings'
+written bits taken" and "refresh check, since the start" must count no
+finds.
 
 `VICTORY_REFRESH_CHECK=1` (a diagnostic, slow): after every refresh the
 first 256 bytes of each 64 KiB block of it are read from title memory

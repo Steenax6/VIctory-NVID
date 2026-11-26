@@ -3974,7 +3974,7 @@ impl Shadow {
         use crate::watch::{Checked, Look, Seen};
         let by_event = crate::watch::events_mode();
         let watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
-        let looked = (by_event != 0 && watched && crate::inplace::view_at(from).is_some() && crate::inplace::view_at(to - 1).is_some())
+        let looked = (watched && crate::inplace::view_at(from).is_some() && crate::inplace::view_at(to - 1).is_some())
             .then(|| {
                 let seen = *self.events_seen.lock().unwrap_or_else(|e| e.into_inner());
                 let inside = seen.holds(from, to);
@@ -5089,8 +5089,10 @@ pub(crate) fn refresh_check_line() {
 
 /// Whether a landing takes the kernel's written bits of the private title
 /// memory it wrote, right behind its write, and counts the pages that then
-/// hold what its copy holds as taken by that copy (`VICTORY_LAND_TAKEN=1`;
-/// `=2`: the check; off by default until measured).
+/// hold what its copy holds as taken by that copy (1: the way, unset or any
+/// value but 2; `VICTORY_LAND_TAKEN=2`: the check, below). Leaving the bits
+/// to the refresh (the old way) is gone: the check counted 0 of 743,252
+/// pages in the prologue and 0 of 181,911 at the open world's entry.
 ///
 /// Private title memory is write-watched by the kernel, not guarded. A
 /// landing's write sets the pages' bits like any write, the next refresh's
@@ -5133,9 +5135,8 @@ pub(crate) fn refresh_check_line() {
 pub(crate) fn land_taken() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_LAND_TAKEN").as_deref().map(str::trim) {
-        Ok("1") => 1,
         Ok("2") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
@@ -5160,9 +5161,6 @@ static LANDED: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 /// still closed to refreshes: see [`land_taken`].
 pub(crate) fn landed(pieces: &[(Arc<Shadow>, usize, usize)]) {
     let mode = land_taken();
-    if mode == 0 {
-        return;
-    }
     // The pieces in private memory, as title addresses.
     let mut private: Vec<(&Arc<Shadow>, usize, usize)> = pieces
         .iter()
@@ -5197,9 +5195,6 @@ const KERNEL_PAGE: usize = 4096;
 /// With the frame line.
 pub(crate) fn landed_line(frames: f64) {
     let mode = land_taken();
-    if mode == 0 {
-        return;
-    }
     let [takings, kernel_pages, marked, bytes, outside, differed, not_taken, small] =
         [0, 1, 2, 3, 4, 5, 6, 7].map(|i| LANDED[i].swap(0, Ordering::Relaxed) as f64 / frames);
     let [looked, written_since, finds] = [8, 9, 10].map(|i| LANDED[i].load(Ordering::Relaxed));

@@ -169,12 +169,14 @@ impl Pages {
     }
 }
 
-/// Whether a copy in view memory is brought up to date only when
-/// something happened in its memory since it last was
-/// (`VICTORY_REFRESH_EVENTS`): 0, unset: it asks the guards every time, as
-/// before; 1: it does not ask while nothing happened; 2: it asks as before,
-/// and every refresh that 1 would have left out and that found bytes to
-/// copy is counted and named (the check: 0 of them is what 1 needs).
+/// How a copy in view memory is brought up to date: only when something
+/// happened in its memory since it last was (1, the way; unset or any value
+/// but 2), or, `VICTORY_REFRESH_EVENTS=2`, the check: it asks the guards
+/// every time, and every refresh that 1 would have left out and that found
+/// bytes to copy is counted and named (0 of them is what 1 needs). Asking
+/// every time with no check (the old way) is gone: the check counted 0 in
+/// the prologue and at the open world's entry (runs s_y2_p_check and
+/// s_we_y2_check of 2026-11-26).
 ///
 /// A submission brings some 6,350 ranges of copies up to date a frame in
 /// the first room and about 5,900 of them find nothing written (the census
@@ -210,9 +212,8 @@ impl Pages {
 pub(crate) fn events_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_REFRESH_EVENTS").as_deref().map(str::trim) {
-        Ok("1") => 1,
         Ok("2") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
@@ -436,9 +437,6 @@ pub(crate) fn event_checked(c: Checked, copy: (u64, u64), from: usize, to: usize
 pub(crate) fn events_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
     let mode = events_mode();
-    if mode == 0 {
-        return;
-    }
     let [quiet, wrong, happened, outside, between, arrived, late] = [0, 1, 2, 3, 4, 5, 6].map(|i| EVENT_CHECKS[i].swap(0, Relaxed));
     tracing::info!(
         "refreshes by event, of ranges in view memory, per frame (VICTORY_REFRESH_EVENTS={mode}): {:.0} with nothing happened since \

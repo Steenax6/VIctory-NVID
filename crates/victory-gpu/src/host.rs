@@ -5459,7 +5459,7 @@ impl Host {
         // bits there: taken now, while the ranges are closed to refreshes
         // still (`crate::shadow::land_taken`; not for pieces merged out of
         // the flights' own slots, `relay_card_inflight`).
-        if crate::shadow::land_taken() != 0 {
+        {
             let landed: Vec<_> = pieces.iter().map(|(shadow, lo, hi, _)| (shadow.clone(), *lo, *hi)).collect();
             crate::shadow::landed(&landed);
         }
