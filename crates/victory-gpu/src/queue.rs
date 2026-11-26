@@ -118,12 +118,28 @@ impl Drop for Stands {
             standing.1.swap_remove(at);
         }
         STANDING_NOW.store(standing.1.len() as u64, Ordering::Release);
+        // What was let go while it stood waits for it no longer
+        // (`crate::host::stands_gone`), with the table held: an object let go
+        // now sees either this one standing or its number taken.
+        crate::host::stands_gone(standing.1.iter().copied().min().unwrap_or(u64::MAX));
+    }
+}
+
+/// With the table of the submissions that stand held, if any does: `keep`
+/// is given the last ticket handed out (every one that stands has that or
+/// an older one), to keep by it what must wait for them
+/// (`crate::host::retire`).
+#[cfg(windows)]
+pub(crate) fn newest_standing(keep: impl FnOnce(u64)) {
+    let standing = STANDING.lock().unwrap_or_else(|e| e.into_inner());
+    if !standing.1.is_empty() {
+        keep(standing.0);
     }
 }
 
 /// How many submissions the title has made stand in a line and have not
 /// begun.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn standing() -> u64 {
     STANDING_NOW.load(Ordering::Acquire)
 }
@@ -1643,6 +1659,32 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    /// A host object let go while a submission stands in a line is kept:
+    /// the submission has no number yet, and nothing was running. (It is
+    /// dropped at the landing after the submissions begun once that one
+    /// has; here none lands.)
+    #[cfg(windows)]
+    #[test]
+    fn what_is_let_go_while_a_submission_stands_is_kept() {
+        struct Flag(std::sync::Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let gone = std::sync::Arc::new(AtomicBool::new(false));
+        let stands = Stands::new();
+        let part = stands.again();
+        crate::host::retire(Flag(gone.clone()));
+        assert!(!gone.load(Ordering::Relaxed));
+        // Cut into parts: its parts stand in its place.
+        drop(stands);
+        assert!(standing() > 0);
+        assert!(!gone.load(Ordering::Relaxed));
+        drop(part);
+        assert!(!gone.load(Ordering::Relaxed), "kept for the submissions begun by then");
     }
 
     #[test]

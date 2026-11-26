@@ -272,24 +272,71 @@ fn sweep() {
     crate::placed::let_go_idle();
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
-pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
-        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        #[cfg(feature = "diagnostics")]
-        let_go_standing(0);
-        drop(object);
+/// Host objects let go while submissions the title had made stood in a
+/// queue's line and had not begun (`crate::queue::Stands`), each with the
+/// last ticket given by then. A submission that stands has no number yet
+/// ([`STARTED`] counts those the host has begun to prepare), and its lists
+/// were recorded before the object went: nothing that waits "for every
+/// submission started by now" waits for it. Counting those that stand into
+/// the number would not do either: a queue that stands at a wait keeps its
+/// parts while other queues' submissions, and those of ours that are waited
+/// for, take the next numbers. So the object waits here until every
+/// submission that stood has begun, and then for the submissions started
+/// by that moment, as any other ([`stands_gone`]).
+static AWAITED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+
+/// Keeps `object` for the submissions that stand in a line now
+/// ([`AWAITED`]); gives it back if none does.
+fn await_standing(object: Retired) -> Option<Retired> {
+    let mut object = Some(object);
+    crate::queue::newest_standing(|ticket| {
+        if let Some(object) = object.take() {
+            AWAITED.lock().unwrap_or_else(|e| e.into_inner()).push((ticket, object));
+        }
+    });
+    object
+}
+
+/// A submission has left the lines' table, which the caller holds: `least`
+/// is the oldest ticket that still stands (`u64::MAX`: none does). What
+/// waited for older ones ([`AWAITED`]) now waits for the submissions
+/// started so far: each of those that stood has its number.
+pub(crate) fn stands_gone(least: u64) {
+    let mut awaited = AWAITED.lock().unwrap_or_else(|e| e.into_inner());
+    // (In the order of their tickets: each was put in with the table held
+    // and the last ticket given.)
+    let done = awaited.partition_point(|(ticket, _)| *ticket < least);
+    if done == 0 {
         return;
     }
+    let started = STARTED.load(Ordering::Acquire);
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(awaited.drain(..done).map(|(_, object)| (started, object)));
+}
+
+/// Drops `object` once every submission running now has finished, and
+/// every one the title has made that stands in a line ([`AWAITED`]): at
+/// once if there is none.
+pub(crate) fn retire<T: 'static>(object: T) {
+    let started = STARTED.load(Ordering::Acquire);
+    let running = started > FINISHED.load(Ordering::Acquire);
+    // (Boxed only where it is kept.)
+    let object = if crate::queue::standing() > 0 {
+        let Some(object) = await_standing(Retired(Box::new(object))) else {
+            RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            let_go_standing(usize::from(running));
+            return;
+        };
+        object
+    } else if running {
+        Retired(Box::new(object))
+    } else {
+        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        drop(object);
+        return;
+    };
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    #[cfg(feature = "diagnostics")]
-    let_go_standing(1);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((started, object));
 }
 
 /// Drops `object` at the next landing after every submission started by
@@ -300,30 +347,29 @@ pub(crate) fn retire<T: 'static>(object: T) {
 /// space), 20 ms a frame of that thread in the opening cutscene.
 pub(crate) fn retire_later<T: 'static>(object: T) {
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    #[cfg(feature = "diagnostics")]
-    let_go_standing(2);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((STARTED.load(Ordering::Acquire), Retired(Box::new(object))));
+    let started = STARTED.load(Ordering::Acquire);
+    let Some(object) = await_standing(Retired(Box::new(object))) else {
+        #[cfg(feature = "diagnostics")]
+        let_go_standing(2);
+        return;
+    };
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((started, object));
 }
 
 /// Diagnostics: objects let go ([`retire`], [`retire_later`]) while a
-/// submission the title had made stood in a line and had not begun
-/// (`crate::queue::standing`): dropped at once, kept for the submissions
-/// started by then, and the same by [`retire_later`]; since the last line
-/// and since the start. A submission that stands has no number yet, so
-/// none of the three waits for it; whether its lists name the object is
-/// not looked at here.
+/// submission the title had made stood in a line and had not begun, which
+/// now wait for it ([`AWAITED`]): those that were dropped at once before
+/// (nothing was running), those kept only for the submissions started by
+/// then, and the same by [`retire_later`]; since the last line and since
+/// the start. Whether the lists that stood named the object is not looked
+/// at.
 #[cfg(feature = "diagnostics")]
 static LET_GO_STANDING: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 #[cfg(feature = "diagnostics")]
 fn let_go_standing(how: usize) {
-    if crate::queue::standing() > 0 {
-        LET_GO_STANDING[how].fetch_add(1, Ordering::Relaxed);
-        LET_GO_STANDING[how + 3].fetch_add(1, Ordering::Relaxed);
-    }
+    LET_GO_STANDING[how].fetch_add(1, Ordering::Relaxed);
+    LET_GO_STANDING[how + 3].fetch_add(1, Ordering::Relaxed);
 }
 
 /// The line of [`LET_GO_STANDING`], where anything was counted.
@@ -335,13 +381,15 @@ fn standing_line() {
     }
     let ever = [3, 4, 5].map(|i| LET_GO_STANDING[i].load(Ordering::Relaxed));
     tracing::info!(
-        "host objects let go while a submission stood in a line not begun, since the last line: {at_once} dropped at once \
-         (nothing was running), {kept} kept only for the submissions begun by then, {later} more of those by the sweeps; \
-         since the start: {}, {} and {}; {} stand now",
+        "host objects let go while a submission stood in a line not begun, which wait for it now, since the last line: \
+         {at_once} that were dropped at once before (nothing was running), {kept} that were kept only for the submissions \
+         begun by then, {later} more of those by the sweeps; since the start: {}, {} and {}; {} submissions stand now, {} \
+         objects wait for them",
         ever[0],
         ever[1],
         ever[2],
-        crate::queue::standing()
+        crate::queue::standing(),
+        AWAITED.lock().unwrap_or_else(|e| e.into_inner()).len()
     );
 }
 
