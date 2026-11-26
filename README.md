@@ -194,6 +194,15 @@ to 23.0 ms, and `VICTORY_CARD_HASH_LEN=1` (hash a copy's own bytes, not its
 whole 64 KiB) is meant to take that back. A line with the frame-rate line
 says how many copies went where, by size.
 
+`VICTORY_PIPELINE_EARLY_WORKERS=<n>` sets how many of them may make the
+pipelines the run before drew with, before anything asks for them (default:
+an eighth of the logical processors, at least one); pipelines a draw asks
+for take every worker. Each translation keeps its pipeline library in
+`pipelines\<16 hex digits>\`, filled at first from the libraries of the two
+translations before and of the one file earlier builds kept in
+`pipelines\` (left as it is; it can be deleted once a run has passed the
+loading screens).
+
 `VICTORY_PIPELINE_WORKERS=<n>` sets how many threads build pipelines that
 are not cached yet (default: half the logical processors, at most 8). On a
 Ryzen 7 9800X3D (16 threads) with an RTX 4070 Ti, 14 cut the intro's time
