@@ -103,8 +103,9 @@ census's "guarded blocks opened by the layer's own writes" should fall to
 nearly nothing (avatarmanz/VIctory-7900XTX `0d5e4c8cb`, Marvisak/VIctory
 pull request 3069; this tree's own code).
 
-`VICTORY_REFRESH_EVENTS` (2026-11-26; off: its check counts 0 now, and with it and
-`VICTORY_LAND_TAKEN` on the frame did not move): a
+The refresh by event (2026-11-26; the way since its check counted 0; the
+old way, asking every time, is gone; `VICTORY_REFRESH_EVENTS=2` is the
+check): a
 copy in view memory is not asked about again while nothing happened in
 its memory since it was last brought up to date. What can make a guarded
 block count as written (a write that faults, one of ours that opens or
@@ -118,9 +119,9 @@ refresh is asked as before, and each one that `=1` would have left out
 and that found bytes to copy is counted and named ("a refresh found bytes
 to copy where no event was counted", with the block the guards reported
 and what it was to them); the line "refreshes by event" must say 0 of
-those in the prologue and at the open world's entry and in its bedroom
-before `=1` is used. Copies in private memory are asked as before: only
-the kernel knows what was written there.
+those, and it did in the prologue and at the open world's entry. Copies
+in private memory are asked as before: only the kernel knows what was
+written there.
 
 The check's first form found 7 such refreshes in the prologue's 205 s and
 2 in the open world's first 130 s. It decided that nothing had happened
@@ -142,17 +143,17 @@ then). The line now counts those askings as well: the ones that found
 blocks that had been absent, which is what they are for, and the ones
 that found other bytes no event had announced, which must be 0 too.
 
-Measured with both this switch and `VICTORY_LAND_TAKEN` at `=1` against
-unset, same build, back to back in the first room: preparing 36.4 against
+Measured with both this and the landings' taking below against the old
+way, same build, back to back in the first room: preparing 36.4 against
 40.6 ms a frame, the copies read 70 against 89 MB a frame, the frame 67.8
 against 66.6 ms. The work comes off the submitting thread and the frame
-does not follow, because the title's render thread and the submitting
-thread take turns (see "Where the time goes"); both stay off until that
-is changed.
+did not follow then, because the title's render thread and the
+submitting thread take turns (see "Where the time goes"); it is work not
+done, with checks that found nothing, so both are the way now.
 
-`VICTORY_LAND_TAKEN=1` (2026-11-26; off; `=2` is its check, which counted 0 of
-743,252 pages in the prologue and 0 of 181,911 at the open world's entry):
-what shaders wrote into private title memory (which the kernel
+The landings' taking (2026-11-26; the way; `VICTORY_LAND_TAKEN=2` is its
+check, which counted 0 of 743,252 pages in the prologue and 0 of 181,911
+at the open world's entry): what shaders wrote into private title memory (which the kernel
 write-watches; no guard there) set the written bits of its pages, the
 next refresh took them for the title's, and the landing's own copy read
 the pages it had just been given: 22.8 MB a frame in the first room,
@@ -174,6 +175,11 @@ memory" says how many pages a frame the copy no longer reads, and the
 guards line's "equal to the CPU side, not sent up" should fall by about
 that. Each taking costs a kernel call of 30 to 70 microseconds on the
 landing thread.
+
+To check both in a run: `VICTORY_REFRESH_EVENTS=2 VICTORY_LAND_TAKEN=2
+VICTORY_REFRESH_CHECK=1`; the lines "refreshes by event", "landings'
+written bits taken" and "refresh check, since the start" must count no
+finds.
 
 `VICTORY_REFRESH_CHECK=1` (a diagnostic, slow): after every refresh the
 first 256 bytes of each 64 KiB block of it are read from title memory
@@ -534,10 +540,35 @@ less work in `State::bind` on the recording threads.
 
 ## Tried and not kept
 
-- `VICTORY_ASYNC_PRESENT=1` (the title records the next frame while the
-  last is sent): as it stands the title faults with it within two minutes,
-  because waits between its queues are passed at the present; a variant
-  that met them in order ran without a fault and no faster.
+- `VICTORY_ASYNC_PRESENT=1` (opt-in; the title records the next frame
+  while the last is sent): its first form passed every wait the queues
+  held at the present call, and the title faulted within two minutes. A
+  present in the line now keeps those waits in order: it is shown only
+  once every wait before it is met, and the title stands at its next
+  present until then; a stand that reaches two seconds passes the waits
+  from the title's thread, as a present there does, and is counted. Run
+  that way (2026-11-26, `VICTORY_WAIT_FORCE=0` then) it was 175 s clean
+  in the first room with the picture right, 63.6 against 65.2 ms a frame.
+  The line "presents in the line per frame" says how many went into a
+  line, how long the title stood at its present, and the two-second
+  stands since the start. For it to become the default: a run of the
+  prologue into the open world and some minutes there with that count at
+  0, no fault, no device loss, and the picture and the boat as without
+  it.
+- The heap sync on a thread of its own beside the refreshes (2026-11-26,
+  after Xeltax/VIcky `d2d40ca6e`; its askings first, the walk beside, the
+  join before the send): the submitting thread still waited 2.5 to 4 ms a
+  frame for the askings and 4 to 5 ms at the joins, the sync itself took
+  10.5 to 12.5 ms a frame instead of 8.5 to 9, and the refreshes beside it
+  slowed ("copies" 28 against 20 ms): the first room 75 to 80 against 67
+  to 69 ms a frame, back to back on the same build (s_plain1, s_plain0).
+  Taken out again.
+- `VICTORY_WIDE_REFRESH=1` (opt-in; a flush's copies refreshed on the
+  wide threads) with the refresh by event: the first room 85 against 69
+  ms a frame, "copies" 29 against 20 ms (s_wide1 against s_plain0, 2026-11-26).
+  The longest send of a frame is the list that makes the heap's buffers
+  ready: one flush of about 4,600 copies, almost all with nothing to
+  copy, 7 to 13 ms; spread over threads they cost more than on one.
 - `VICTORY_HOT_BLOCKS=1`, `VICTORY_NAMED_WRITES=1`: not yet tried in a run.
   (`VICTORY_MERGE_FORGET` is gone: it dropped the kernel's written bits a
   landing set, and with them the title's of before the landing;

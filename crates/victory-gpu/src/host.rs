@@ -5517,7 +5517,7 @@ impl Host {
         // bits there: taken now, while the ranges are closed to refreshes
         // still (`crate::shadow::land_taken`; not for pieces merged out of
         // the flights' own slots, `relay_card_inflight`).
-        if crate::shadow::land_taken() != 0 {
+        {
             let landed: Vec<_> = pieces.iter().map(|(shadow, lo, hi, _)| (shadow.clone(), *lo, *hi)).collect();
             crate::shadow::landed(&landed);
         }
@@ -6320,6 +6320,7 @@ impl Host {
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
+        crate::timeline::ev("sub.", 1, runs.len() as u64);
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -6337,6 +6338,7 @@ impl Host {
         steps.mark("p.blocked", runs.len() as u64);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
+        crate::timeline::ev("sub.", 2, runs.len() as u64);
         crate::descriptor::sync_heaps();
         steps.mark("p.heap", 0);
         let behind = late && flying();
@@ -6359,6 +6361,7 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        crate::timeline::ev("sub.", 3, runs.len() as u64);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         steps.mark("p.sweep", this_submission);
         // The ranges shaders write are counted for it (with the relay).
@@ -6421,12 +6424,14 @@ impl Host {
         }
         // The lists run so far: a list run again records a prelude of its
         // own (`HostList::prelude`).
+        crate::timeline::ev("sub.", 4, runs.len() as u64);
         let mut run_before: Vec<*const HostList> = Vec::new();
         // (For the timeline: the steps' time and the preludes', apart; the
         // refreshes inside the steps are a sum of the thread's.)
         let (mut steps_us, mut preludes_us) = (steps.lap(), 0);
         let _ = (crate::timeline::took(0), crate::timeline::took(1));
         for list in runs {
+            crate::timeline::ev("list.", list.deferred().copies.len() as u64, 0);
             list.run_deferred(&mut batch);
             steps_us += steps.lap();
             firsts.push(lists.len());
@@ -6450,6 +6455,7 @@ impl Host {
             crate::timeline::ev("p.texture", texture_us, 0);
             crate::timeline::ev("p.prelude", preludes_us, 0);
         }
+        crate::timeline::ev("sub.", 5, runs.len() as u64);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -6461,6 +6467,7 @@ impl Host {
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
         steps.mark("p.snap", 0);
+        crate::timeline::ev("sub.", 6, runs.len() as u64);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -6470,12 +6477,14 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        crate::timeline::ev("sub.", 7, runs.len() as u64);
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         steps.mark("p.card", card.as_ref().map_or(0, |c| c.ranges.len() as u64));
         let prepared = std::time::Instant::now();
+        crate::timeline::ev("sub.", 8, runs.len() as u64);
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
@@ -8247,16 +8256,28 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // The copies and fills are timed by stretches of them: the clock is
+        // read where a stretch begins and where it ends, not around every
+        // one. A frame of the first room has 12,800 copies and fills, most
+        // of them next to each other, and a clock read around each was
+        // still 1 ms of the submitting thread a frame (the profile of
+        // 2026-11-26: `Instant::now` 0.83, `elapsed` 0.19 under
+        // `run_deferred`). The sum is the same: a stretch is the steps'
+        // bodies back to back (Marvisak/VIctory pull request 3096 times
+        // its preparing in parts too).
+        let mut stretch: Option<(std::time::Instant, usize)> = None;
+        let end_stretch = |stretch: &mut Option<(std::time::Instant, usize)>| {
+            if let Some((started, copied)) = stretch.take() {
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
+        };
         for step in &self.deferred().copies {
-            // The clock is read for the steps that are timed, the copies
-            // and the fills (and, with diagnostics, the title's own work),
-            // not for every step: a frame of the first room has 12,800
-            // copies and fills and 21,700 refreshes besides the declared
-            // writes and the textures, and the clock was 1.7 ms of the
-            // submitting thread's 69 ms a frame (the profile of 2026-11-26;
-            // Marvisak/VIctory pull request 3096 does the same in its own
-            // preparing).
-            let (started, copied) = match step {
+            // (A refresh only joins the batch here: it stays in the stretch.)
+            if !matches!(step, Step::Copy(..) | Step::Fill(..) | Step::Refresh(..)) {
+                end_stretch(&mut stretch);
+            }
+            let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     // Left to the submission's landing (`copy_goes_late`).
                     if let Some(at) = batch.late.iter().position(|c| *c == (dst, src, len)) {
@@ -8264,7 +8285,7 @@ impl HostList {
                         batch.went_late.push((dst, src, len));
                         continue;
                     }
-                    let started = std::time::Instant::now();
+                    stretch.get_or_insert_with(|| (std::time::Instant::now(), 0));
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8285,10 +8306,10 @@ impl HostList {
                     // And the texture pass, by a number taken now that the
                     // bytes are there: an upload that read before is stale.
                     crate::descriptor::host::title_copied(dst, len);
-                    (started, len)
+                    len
                 }
                 &Step::Fill(dst, src, len) => {
-                    let started = std::time::Instant::now();
+                    stretch.get_or_insert_with(|| (std::time::Instant::now(), 0));
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8297,7 +8318,7 @@ impl HostList {
                         crate::copystat::buffers::cpu_read(src, len);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    (started, len)
+                    len
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8354,9 +8375,11 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            if let Some((_, bytes)) = stretch.as_mut() {
+                *bytes += copied;
+            }
         }
+        end_stretch(&mut stretch);
     }
 }
 
@@ -8438,6 +8461,7 @@ impl Batch {
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let _span = crate::timeline::span("upd>", "upd<", (to - from) as u64, from as u64);
         let started = std::time::Instant::now();
         let clock = crate::timeline::clock();
         let copied = shadow.update(from, to - from);
@@ -8466,6 +8490,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let _span = crate::timeline::span("flush>", "flush<", self.refreshes.len() as u64, 0);
         self.index.clear();
         // Copies of one title buffer that lie close together become one:
         // the refresh moves 460 to 1,370 MB a frame in 25,000 to 90,000
@@ -9066,6 +9091,7 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::queue::present_line(frames);
         crate::queue2::line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::placed_line();
