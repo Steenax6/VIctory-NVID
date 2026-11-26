@@ -387,7 +387,9 @@ Diagnostics build: `cargo build --profile diag -p victory --features diagnostics
 | `VICTORY_GPU_TIMING=1` + `VICTORY_D3D12_DRED=1` | the card's time per command and per pass of ours (diagnostics build; submissions are waited for, so not for frame rate); `VICTORY_TIMING_LINES=<n>` lists that many commands |
 | `VICTORY_WINDOW_MAX=1920x1080` | largest size of the game window; unset, it is fitted to the screen's work area. The game's render targets keep their size |
 
-Two more lines come with the frame-rate line, without a switch (counters only, nothing waits):
+Three more lines come with the frame-rate line, without a switch (counters only, nothing waits):
+
+- `lists submitted with a texture the title had released before: ...` once any was found: lists submitted holding a host texture whose title texture the title had released, counted per list and texture, as held by a state of the list (a texture a draw or copy of the list uses: held before the keep of bound targets too) or by a keep alone (without it the texture would have been freed before the list ran), since the start and since the last line, with the first eight named (size, format, frame released, frame submitted).
 
 - `pipelines made by the driver: ...` while pipelines were made in the interval: the driver calls (create, library load, library store) of the pipeline workers, their summed time over the wall time (the average number at once) and the most in flight at once. A most near 2 with an average near 2 on many workers says the driver builds about two at a time.
 - `title lists submitted again in a later submission ...`: lists the title submits again without a reset, by the fence of the earlier submission (not reached, no signal behind it yet, reached). The first of the first two is logged once with the frame number.
