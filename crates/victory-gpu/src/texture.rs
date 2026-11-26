@@ -3975,6 +3975,60 @@ mod remap_tests {
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
+    /// A level in memory nothing watches and nobody told of is read and
+    /// staged, and again when its bytes change; the level before it, with
+    /// no page there, is zeros beside it. (The case of Marvisak/VIctory
+    /// pull request #2639, where a mip off the runtime's memory was never
+    /// read: here nothing is concluded from what is watched, a level is
+    /// read if it is the title's and its pages are there.)
+    #[test]
+    fn a_level_in_memory_nothing_watches_is_brought_and_brought_again() {
+        use windows_sys::Win32::System::Memory::*;
+        const RUN: usize = 0x1_0000;
+        // Two runs, the second alone there.
+        // SAFETY: a private reservation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * RUN, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let there = base.cast::<u8>().wrapping_add(RUN);
+        // SAFETY: the second run of the reservation above.
+        assert!(!unsafe { VirtualAlloc(there.cast(), RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        // SAFETY: the run committed above.
+        unsafe { std::ptr::write_bytes(there, 0x40, RUN) };
+        super::blocks_remapped(base as usize, 2 * RUN);
+        // A linear 128x128 RGBA8 texture of two levels: level 1 (16 KiB)
+        // lies first, in the run that is not there; level 0 (64 KiB) after
+        // it, the committed run whole.
+        let address = base as u64 + RUN as u64 - (16 << 10);
+        let description = [3, 0, 0, 0, 128, 0, 128, 0x2_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(address, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            super::unstage(resource);
+            super::staging(resource, host_texture)
+        });
+        if let Some(staging) = staged {
+            assert_eq!(staging.place.parts, [(0, 16 << 10), (16 << 10, 80 << 10)], "level 1 first, then level 0");
+            let key = |level: usize| staging.staged[usize::from(staging.place.part_of_level[level])].load(Relaxed);
+            let texel = |level: usize| {
+                // SAFETY: inside the mapped staging buffer.
+                unsafe { staging.data.add(staging.footprints[level].Offset as usize).read_volatile() }
+            };
+            staging.refresh();
+            assert_eq!(key(1), 1, "the level with no page there: zeros");
+            let first = key(0);
+            assert!(first > 1, "the level in memory nothing watches is read");
+            assert_eq!((texel(0), texel(1)), (0x40, 0));
+            // Its bytes change, and nobody is told.
+            // SAFETY: the committed run.
+            unsafe { std::ptr::write_bytes(there, 0x80, RUN) };
+            staging.refresh();
+            assert!(key(0) > 1 && key(0) != first, "and read again when it changed");
+            assert_eq!(texel(0), 0x80);
+        }
+        // SAFETY: the reservation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+        super::blocks_remapped(base as usize, 2 * RUN);
+    }
+
     /// A texture with pages missing whose memory holds nothing but zeros
     /// where it is there is left as it is: nothing is staged for it and
     /// its host copy keeps what it has. When bytes come, they go up.
