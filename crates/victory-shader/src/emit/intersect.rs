@@ -444,8 +444,10 @@ impl<'a> Lower<'a> {
             let off = self.is_nan_f32(bx[0]);
             let on = self.s.m.bool(true);
             let on = self.s.m.bin(c, Bin::Xor, off, on);
+            let there = self.s.m.cmp(c, pred::NE, children[n], none);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            let hit = self.s.m.bin(c, Bin::And, hit, there);
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }

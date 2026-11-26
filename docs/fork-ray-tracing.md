@@ -85,8 +85,10 @@ shaders and emulates the one instruction.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
-  of two boxes entered at the same distance, and the result for a ray exactly
-  through an edge.
+  of two boxes entered at the same distance, the result for a ray exactly
+  through an edge, and that a child whose pointer is "none" is a miss
+  whatever its box (sorted, it would otherwise stand before children that
+  are there).
 - Cost on the GPU is unmeasured.
 
 ## Where to look
