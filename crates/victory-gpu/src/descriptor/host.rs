@@ -122,9 +122,6 @@ pub(crate) struct HostHeap {
     /// had its bytes there (by those numbers), until uploaded again.
     /// With what wrote the memory: `BY_STORAGE` or `BY_COPY`.
     stale: Mutex<std::collections::BTreeMap<u32, u8>>,
-    /// Of `stamps`, those whose read may not have begun, with the address
-    /// of the list that holds the upload; pruned at each bake.
-    unread: Mutex<std::collections::HashMap<u32, (std::sync::Arc<std::sync::atomic::AtomicU64>, usize)>>,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1267,7 +1264,6 @@ impl HostHeap {
             },
             stamps: Mutex::default(),
             stale: Mutex::default(),
-            unread: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1607,8 +1603,7 @@ impl HostHeap {
     /// whose last upload read before a write's bytes were there
     /// ([`HostHeap::slots_written_under`]). With `VICTORY_PAGE_WRITES` bit
     /// 2 (`crate::watch::page_writes`) every stale slot is due at once as
-    /// well; without, a stale slot waits for a bake
-    /// ([`HostHeap::texture_slots_stale`]) or for whatever else makes it due.
+    /// well; without, a stale slot waits for whatever else makes it due.
     /// Returns how many slots it noted stale.
     /// shortcut: the ranges are kept in one place for all heaps; the heap
     /// whose pass runs first takes them (a title has one view heap).
@@ -1686,56 +1681,12 @@ impl HostHeap {
     /// will begin (or began) at the number in `stamp` (`crate::writes`;
     /// `NOT_READ` until it does): kept for the writes that come after it
     /// ([`HostHeap::slots_written_under`]); the slot is stale no more.
-    /// `list` is the list that holds the upload (its address), for a bake
-    /// recorded in another ([`HostHeap::texture_slots_stale`]).
-    pub(crate) fn texture_slot_stamp(&self, index: u32, stamp: std::sync::Arc<std::sync::atomic::AtomicU64>, list: usize) {
-        self.stamps.lock().unwrap_or_else(|e| e.into_inner()).insert(index, stamp.clone());
-        {
-            let mut unread = self.unread.lock().unwrap_or_else(|e| e.into_inner());
-            // Bakes are few: the ones read since go now and then here too.
-            if unread.len() >= 1 << 14 {
-                unread.retain(|_, (s, _)| s.load(std::sync::atomic::Ordering::SeqCst) == crate::writes::NOT_READ);
-            }
-            unread.insert(index, (stamp, list));
-        }
+    pub(crate) fn texture_slot_stamp(&self, index: u32, stamp: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.stamps.lock().unwrap_or_else(|e| e.into_inner()).insert(index, stamp);
         let mut stale = self.stale.lock().unwrap_or_else(|e| e.into_inner());
         if stale.remove(&index).is_some() {
             STALE_NOW.store(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-    }
-
-    /// For a bake (`crate::draw` `early_textures`) recorded in the list at
-    /// `list`: the slots noted stale ([`HostHeap::slots_written_under`]),
-    /// and unless `list` is 0 the slots whose last upload sits in another
-    /// list that has not been submitted (its read has not begun: the
-    /// bake's list may run first), each due at once as written in `frame`,
-    /// with its write number, for the pass to upload first. Slots tables
-    /// read lately are left to their draws. Returns them and how many of
-    /// them were stale.
-    pub(crate) fn texture_slots_stale(&self, frame: u64, list: usize) -> (Vec<(u32, u64)>, usize) {
-        use std::sync::atomic::Ordering::SeqCst;
-        let mut slots: Vec<u32> = self.stale.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-        let stale = slots.len();
-        {
-            let mut unread = self.unread.lock().unwrap_or_else(|e| e.into_inner());
-            // Read since: no longer of interest here.
-            unread.retain(|_, (stamp, _)| stamp.load(SeqCst) == crate::writes::NOT_READ);
-            if list != 0 {
-                slots.extend(unread.iter().filter(|(_, (_, at))| *at != list).map(|(&slot, _)| slot));
-            }
-        }
-        slots.sort_unstable();
-        slots.dedup();
-        slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        let due = slots
-            .into_iter()
-            .map(|slot| {
-                textures.changed(slot, frame, frame);
-                (slot, textures.writes)
-            })
-            .collect();
-        (due, stale)
     }
 
     /// Title slot `index` was left for after a write the title has
@@ -5904,9 +5855,8 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     /// writes' numbers: a slot never uploaded, or whose upload has not read
     /// yet, or read after the write, holds its bytes; one whose upload read
     /// before it is stale, whatever the queue knows of it, until uploaded
-    /// again; before a bake the stale slots (and those not read yet, when
-    /// asked) are due at once. (The ranges are handed over here, not
-    /// through the list all heaps share.)
+    /// again. (The ranges are handed over here, not through the list all
+    /// heaps share.)
     #[test]
     fn a_page_write_after_an_uploads_read_makes_its_slot_stale() {
         use std::sync::Arc;
@@ -5929,35 +5879,23 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Uploaded by the pass, the list not submitted yet: its read comes
         // after any write numbered now.
         let stamp = Arc::new(AtomicU64::new(crate::writes::NOT_READ));
-        let (list, bake_list) = (0x1000usize, 0x2000usize);
-        heap.texture_slot_stamp(1, stamp.clone(), list);
+        heap.texture_slot_stamp(1, stamp.clone());
         heap.texture_slot_done(1, w, None);
         assert_eq!(heap.slots_written_under(&write(11), 50), [] as [u32; 0]);
-        // Before a bake in another list it goes up again all the same (the
-        // bake's list may run before the one that holds the upload); in
-        // the same list, or when not asked for, not.
-        assert_eq!(heap.texture_slots_stale(51, 0).0, []);
-        assert_eq!(heap.texture_slots_stale(51, list).0, []);
-        let (due, stale) = heap.texture_slots_stale(51, bake_list);
-        assert_eq!((due.iter().map(|d| d.0).collect::<Vec<_>>(), stale), (vec![1], 0));
-        heap.texture_slot_done(1, due[0].1, None);
+        assert_eq!(heap.texture_slots_stale_by(), [0, 0]);
         // Its read began at 12: a write numbered 12 is in it, 13 is not.
         stamp.store(12, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(heap.slots_written_under(&write(12), 60), [] as [u32; 0]);
         // Memory elsewhere: nothing.
         assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000, 13, BY_STORAGE)], 60), [] as [u32; 0]);
         assert_eq!(heap.slots_written_under(&write(13), 60), [1]);
-        // Stale, out of the queue (`VICTORY_PAGE_WRITES` bit 2 is not
-        // asked for here); due at once before a bake, as written then.
+        // Stale, and out of the queue all the same (`VICTORY_PAGE_WRITES`
+        // bit 2 is not asked for here).
         assert_eq!(slots(u64::MAX), [] as [u32; 0]);
-        let (due, stale) = heap.texture_slots_stale(70, 0);
-        assert_eq!((due.iter().map(|d| d.0).collect::<Vec<_>>(), stale), (vec![1], 1));
-        assert_eq!(slots(70), [1]);
-        // Stale until uploaded again: then a bake finds nothing (its read
-        // has begun).
-        heap.texture_slot_stamp(1, Arc::new(AtomicU64::new(14)), list);
-        heap.texture_slot_done(1, due[0].1, None);
-        assert_eq!(heap.texture_slots_stale(71, bake_list).0, []);
+        assert_eq!(heap.texture_slots_stale_by(), [1, 0]);
+        // Stale until uploaded again.
+        heap.texture_slot_stamp(1, Arc::new(AtomicU64::new(14)));
+        assert_eq!(heap.texture_slots_stale_by(), [0, 0]);
     }
 
     /// A copy of the title's that the layer does into a texture's memory
@@ -5984,7 +5922,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // The copy first, then the upload's read: it holds the copy.
         let before = title_copied(at as usize, 0x1000);
         assert_ne!(before, 0, "the view's memory counts as spanned");
-        heap.texture_slot_stamp(1, Arc::new(AtomicU64::new(crate::writes::stamp())), 0x1000);
+        heap.texture_slot_stamp(1, Arc::new(AtomicU64::new(crate::writes::stamp())));
         assert_eq!(heap.slots_written_under(&[(at, at + 0x1000, before, BY_COPY)], 50), [] as [u32; 0]);
         // The read first, then the copy: stale, by a copy.
         let after = title_copied(at as usize + 0x800, 0x100);

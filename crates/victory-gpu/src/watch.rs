@@ -1950,9 +1950,8 @@ pub fn writing(at: usize, len: usize) {
 /// opened and count as written (host copies of buffers and textures read
 /// through tables take them again); 2, the placed textures picked by index
 /// whose last upload read before the write (by the writes' numbers,
-/// `crate::writes`) are due again at once, at every pass, not only before
-/// the title's bake (`crate::draw` `early_textures`, which does that
-/// whatever this says). Unset or `guards`: bit 1 alone. `0`: nothing.
+/// `crate::writes`) are due again at once, at every pass (without it they
+/// are counted and left as they are). Unset or `guards`: bit 1 alone. `0`: nothing.
 /// `1` or `all`: bits 1 and 2. `slots`: bit 2 alone. Every such write and
 /// every read to a plain address that finished is numbered and noted for
 /// the texture pass whatever this says (a read to a plain address writes

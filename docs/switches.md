@@ -178,23 +178,19 @@ its bytes are there, and every
 upload of the texture pass keeps the number its read began at: one that
 read before a write under its texture is stale until uploaded again.
 
-`VICTORY_BAKE_WRITES` (on by default; `=0`: counted only, to compare):
-before a draw of the game's decoration bake (which picks its sources by
-index once, at load, and bakes skin and clothing for the whole run), the
-stale slots and the slots whose upload sits in a list not submitted yet
-are uploaded first, within the bake's budget (`VICTORY_BAKE_TEXTURES_MS`,
-1,500 ms a frame). Without it, a character's head came out with blocks or
-rows of colourful noise in about half the runs. The log line "bake
-sources, since the start" counts bake draws, the ones with stale slots,
-those slots, how many went up before the draw and how many did not (the
-budget ran out), slots under a read still running at a bake (one warning
-says so), and bake draws that got no pass while slots were stale.
+The stale slots are counted, in all and at each draw of the game's
+decoration bake (the log line "bake sources, since the start": bake draws,
+the ones with stale slots, those slots by what wrote them, and slots under
+a read still running at a bake). For two runs the texture pass uploaded
+them again ahead of every bake draw (`VICTORY_BAKE_WRITES`, some 25,000
+uploads a run): the head was baked with noise as before, and a character's
+body came apart in the run that did it, so that is gone.
 
 `VICTORY_PAGE_WRITES` (unset or `guards`: the guarded blocks under such a
 write are opened, so host copies of buffers and of textures read through
 tables take its bytes; `0`: not; `slots`, `1` or `all`: the stale slots are
-also due at once at every pass, not only before a bake, about 120
-uploads a second more in the opening cutscene). The line "writes behind
+also due at once at every pass, about 120 uploads a second more in the
+opening cutscene). The line "writes behind
 the guards" counts the writes, the slots under them, the stale ones and
 the stale ones now.
 

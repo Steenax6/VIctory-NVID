@@ -9141,7 +9141,7 @@ impl Meter {
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                     copy_bytes >> 20,
-                    if mode & 2 != 0 { "made due at once" } else { "uploaded again before a bake" },
+                    if mode & 2 != 0 { "made due at once" } else { "left as they were" },
                     crate::descriptor::host::STALE_NOW.load(Ordering::Relaxed),
                     crate::writes::PENDING_COUNTS[0].load(Ordering::Relaxed)
                 );
