@@ -3589,7 +3589,14 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => {
+                let bound = self.bind(list, p, true);
+                // as a direct dispatch of the builder's ([`State::dispatch`])
+                if !bound && crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("one of its indirect dispatches could not be bound");
+                }
+                bound
+            }
             _ => false,
         };
         if !ran {

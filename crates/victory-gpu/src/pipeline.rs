@@ -315,13 +315,22 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
-/// A stage of the builder was dropped after all: none runs from here on.
+/// A stage of the builder was dropped after all: none runs from here on,
+/// and the programs that walk its structures are held again
+/// ([`walker_held`]): what it built goes stale as the title moves on.
+/// (fxceless/victory-fork PR #1217, BradRoland.)
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
-        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+        b.whole = false;
+        BUILT.store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            why,
+            "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none, \
+             and the programs that walk its structures are held again"
+        );
     }
 }
 
