@@ -123,11 +123,14 @@ Beside them: `victory-wide-N` (four: finds and snapshots),
 
 The locks between them: `RELEASING` and the queues' lines (the render
 thread's present waits there until the frame is sent, unless the present
-is in the line); `Host::submitted`; the journal and the guards
-(`watch.rs`, one lock each for all title memory; the guards' lock is also
-the fault handler's on the title's threads, and the journal's is held
-across the kernel's asking and the guards' check, with one standing
-asking for the one submission being prepared); per copy the side lock
+is in the line); `Host::submitted`; the journal (`watch.rs`, one lock for
+all title memory, held across the kernel's asking and the guards' check,
+with one standing asking for the one submission being prepared); the
+guards (`watch.rs`: a lock a region of 4 MiB since S3's third step,
+taken in the order of addresses where an operation needs several and
+never held across a call into the kernel; the fault handler on the
+title's threads takes its block's region, and those of the block's other
+views; what only asks reads without a lock); per copy the side lock
 (`Shadow::side`: held across a whole merge of a fetched run, and across
 each page of the title's bytes put in under flights), `copied`,
 `pending` with `flights`, `dirty` with `sent`; `LINE` with its condition
@@ -273,7 +276,7 @@ were measured).
 | S1a less on the submitting thread | a flush leaves out, before it joins, asks or walks, every copy whose counts of events are those it remembered (one look without a lock each); the pass over picked buffer views no longer puts the slots it made itself on the changed list | the refresh by event's own rule, applied at the same moment (the flush), before the walk instead of inside it | `VICTORY_REFRESH_EVENTS=2`: refreshes left out that found bytes; `VICTORY_REFRESH_CHECK=1` not above the base (see "Open") | `host.rs` `Batch::flush`; `shadow.rs` `Shadow::update_free` and what it remembers; `draw.rs` `picked_pass`; `descriptor/host.rs` `mirror_picked` |
 | S1b lanes ahead, per burst (not before S3) | the heap sync starts when the burst is queued and is waited for at the send; helper threads bring the copies the burst's parts refresh up to date ahead, and the refresh in the part's turn stays as it is; the lock of R2 | the records are read after the title's submit and before any list of the burst goes; nothing rests on the refresh ahead, since the one in order still runs and asks (R1); R2 keeps bytes out of ranges shaders write | bytes written into a pending range outside `merge_under_writes`, counted under R2's lock; the old heap pass run at the send in a check mode: records it still finds that were written before the burst's submit; `VICTORY_REFRESH_CHECK=1` | `host.rs` `Host::submit`, `Batch`; `shadow.rs` `Shadow::update`, `Shadow::writing`; `descriptor.rs` `sync_heaps`; `queue.rs` (the burst's stamp) |
 | S2 landing on several threads | the side lock per 64 KiB piece; merges as jobs per copy and megabyte on the pool, as the way (`VICTORY_WIDE_MERGE` goes); a run that changed whole is not read from title memory first where nothing of it waits to go up; telling stays in order | the runs are apart in title memory and in the CPU side; one copy's flights stay in order (R4); `merge_under_writes` takes the same piece's lock | the merge-race count (`VICTORY_MERGE_RACE`); `VICTORY_LAND_BESIDE=2` (writes not at the title's address); new: at the tell, a sample of landed stretches whose title bytes are not the CPU side's | `shadow.rs` `Shadow::side`, `card_merge_relay_fast`, `card_merge_relay_whole`, `relay_merge`, `merge_under_writes_into`; `host.rs` `Host::relay_card_back`; `card_fine.rs` |
-| S3 write tracking without global holds | first an event for every hold of the guards' lock of 0.2 ms and more, by holder; then: `known_view` and `watchable` answered without the lock, changes of protection and walks over other regions outside it, the fault handler on its region's lock only; the journal by chunk and the standing asking the burst's (asked once a burst; the layer's own writes tell the journal as now); a landing takes its own marks in view memory as it takes the kernel's bits in private memory (the other 23 MB a frame the refreshes read back) | every count of an event is still raised under the lock under which an asking sees it; locks are taken in the order of addresses; the parts of a burst read what was written before the same submit, and a write of the title's after it is found by the next burst's asking (R1); the taking tells every other copy through the journal and passes a page by only where it holds the copy's bytes | `VICTORY_REFRESH_EVENTS=2`; the taking's check as `VICTORY_LAND_TAKEN=2`, for view memory; `VICTORY_REFRESH_CHECK=1` not above the base, by kind; a test of faults against checks in two regions at once | `watch.rs` (`guards`, `guard_fine`, `known_view`, `watchable`, `on_write`, `open_tail`, `mark_with_views`, `title_memory_remapped`, `journal`, `ask_once`, `writes_fine_look`, `take_landed`); `beside.rs`; `inplace.rs` `pages_of`; one call in `shadow.rs` `landed` |
+| S3 write tracking without global holds (steps 1 to 3 built, see "S3 as built"; the journal's step is open) | first an event for every hold of the guards' lock of 0.2 ms and more, by holder; then: `known_view` and `watchable` answered without the lock, changes of protection and walks over other regions outside it, the fault handler on its region's lock only; the journal by chunk and the standing asking the burst's (asked once a burst; the layer's own writes tell the journal as now); a landing takes its own marks in view memory as it takes the kernel's bits in private memory (the other 23 MB a frame the refreshes read back) | every count of an event is still raised under the lock under which an asking sees it; locks are taken in the order of addresses; the parts of a burst read what was written before the same submit, and a write of the title's after it is found by the next burst's asking (R1); the taking tells every other copy through the journal and passes a page by only where it holds the copy's bytes | `VICTORY_REFRESH_EVENTS=2`; the taking's check as `VICTORY_LAND_TAKEN=2`, for view memory; `VICTORY_REFRESH_CHECK=1` not above the base, by kind; a test of faults against checks in two regions at once | `watch.rs` (`guards`, `guard_fine`, `known_view`, `watchable`, `on_write`, `open_tail`, `mark_with_views`, `title_memory_remapped`, `journal`, `ask_once`, `writes_fine_look`, `take_landed`); `beside.rs`; `inplace.rs` `pages_of`; one call in `shadow.rs` `landed` |
 | S4 a part's bulk as jobs | fills, the title's bytes under flights page by page, texture stagings and preludes on the pool, joined where the one thread flushes now | the same order of effects at every flush | those of S1b and S2; the fills' check (`fill_ahead`) | `host.rs` `HostList::run_deferred`, `Batch`, `stale_under_flights` |
 | S5 parts in a pipeline | the plan of part k+1 while the jobs of part k run; sends in order; `Host::submitted` no longer over bulk work; the line of all queues as one sequencer (avatarmanz/VIctory-7900XTX `queue/behind.rs` is the shape) | R1 to R6 | jobs of parts up to k not done at the send of k; a refresh not done under a write of ours over its pages; a copy's flights landed out of order | `host.rs`, `queue.rs`, `shadow.rs` |
 | S6a transfer heaps on title memory | for buffers in private memory that shaders write and the title's processor side does not (the census names them): a heap opened on the title's pages (`OpenExistingHeapFromAddress1`, `inplace.rs`) is the end of our copies only, card to title memory and title memory to card; shaders keep the copy in the card's memory. A block whose written bit the kernel holds, or with bytes still to go up, lands the old way | the bytes are in title memory before the flight is told, as now; a block the title wrote since goes through the merge byte by byte | in a check mode the same blocks fetched a second time into memory of ours: bytes that differ | `inplace.rs`, `shadow.rs`, `host.rs` `Host::relay_card_back`, `Host::card_before` |
@@ -287,6 +290,135 @@ of asking on the submitting thread, and it is what S1b, S4 and S5 need
 to scale; S6a about 10 ms of the landing thread and the refresh of some
 21 MB; S1b, S4 and S5 together the submitting thread's serial rest down
 to 20 to 25 ms a frame, below the card's 41.
+
+#### S3 as built
+
+Steps 1 to 3 (2026-11-26; `watch.rs`, `inplace.rs`, one call in
+`shadow.rs` `landed`), measured as the table above was: twelve frames of
+a timeline of the first room each, single runs, indications.
+
+Who held the guards' lock (step 1: `H:*` and `HS:*` of the timeline; runs
+k_hold_plain and k_hold_thin), ms a frame:
+
+| | before thin recording | thin recording, present in the line |
+|---|---|---|
+| the lock held, all holders (holds a frame) | 11.5 (4,500) | 12.3 (4,600) |
+| faults of the title's stores, each across its change of protection | 5.7 (1,190; 4 to 5 us) | 5.7 (1,130; 4 to 5.5 us) |
+| checks (the submitting thread) | 2.0 (1,020; 2 us) | 2.3 (1,100; 2 us) |
+| the landing opening blocks for its writes | 1.7 (420; 4 us) | 2.1 (430; 5 us) |
+| looks (is this a view; two a frame of 0.35 ms sorting the views out of a burst's ranges) | 1.3 (1,120) | 1.4 (1,220) |
+| the landing marking what it wrote beside the guards | 0.8 (730) | 0.8 (750) |
+| waits of 0.2 ms and more, all threads | 15.2 | 58.2 |
+| the title's recording threads; its other threads | 9.4; 4.0 | 44.6; 5.4 |
+| submitting; landing | 1.2; 0.6 | 4.4; 3.9 |
+
+No holder kept the lock long (the longest hold was a fault of 3.0 ms, a
+thread taken off its processor), and it was waited for four to five times
+as long as it was held: a waiter that sleeps is woken late on a machine
+whose processors are all busy, and under one lock every thread that
+stores into guarded memory meets every other. So step 3 makes the
+meetings fewer: a lock a region, what only asks without a lock, nothing
+of the kernel's under one.
+
+After steps 2 and 3 (runs k_after_plain and k_after_thin), ms a frame:
+
+| | before thin recording | thin recording, present in the line |
+|---|---|---|
+| frame | 60.2 (62.2 before) | 57.0 (68.8 before) |
+| the guards' locks held, all holders | 0.95 | 1.23 |
+| waits of 0.2 ms and more for them, all threads | none (15.2) | none (58.2) |
+| the submitting thread inside sends | 40.2 (49.6) | 50.8 (62.8) |
+| refreshes of host copies; write-watch asking | 10.8; 2.5 (13.6; 3.6) | 11.7; 2.8 (16.4; 4.4) |
+
+Of the holds that are left, the checks are 0.6 ms a frame (620 to 730 of
+0.8 us, each with only the regions locked that have a block to look
+at), the faults 0.2 to 0.5 ms (1,320 to 1,370 a frame, two takings of
+0.1 to 0.3 us each with the change of protection between them), the
+landing's markings 0.1 and its openings 0.06 (those of private memory
+take no lock any more). The title's stores fault a tenth to a fifth
+more often than before: a view it stores through is made read-only
+again by the checks of the other views of its pages, where it stayed
+open for good (that was the hole, below). The landing waits for the
+journal's lock now and then (0.1 and 0.5 ms a frame; it takes it for
+its marks).
+
+The frame did not follow in these runs: the medians of the frame lines
+over the first room (115 to 172 s) are 61.0 ms without thin recording
+(57.1 to 60.2 in three runs of the tree before) and 60.6 with it (60.4
+and 61.8). The waits were the title's recording threads', and the frame
+is bound behind them: with thin recording the submitting thread is
+never idle (50.8 ms a frame in sends, 62.8 before) and the card busy
+38.8 ms; without it the submitting thread idles 18 ms a frame for want
+of work (10 before) while the render thread stands in its present. What
+the regions free is for the stages that add threads (S1b, S4, S5) and
+for the landing on several threads (S2), which met here.
+
+The hole (step 2). The refresh check's blocks that "differed for two
+seconds with nothing told" were stores of the title's own, through
+another view of the same physical pages that the guards had left
+writable while the view a 4 MiB window lies over was noted clean again.
+The title shows its streamed pages three times (its own view, the
+GPU's, one more), stores through its own and has the shaders read the
+GPU's. Its view was writable because a read to a plain address had been
+told to the guards, which opens the blocks (96 of the 137 blocks a run
+with a trail of every block named), or because an earlier store had
+faulted there and opened the block from its kernel page on (41); in both
+the other views were counted written once and noted clean by their next
+check, and nothing guarded the opened view again, since no copy of ours
+lies over it. The rule kept now: **while a block is noted clean, no view
+of its pages is writable**; what opens or maps a view notes the guarded
+views of its pages as apart, and the check that reports such a block
+makes the other views read-only before it notes the block clean. A
+block opened whole counts as written anywhere at its other views. The
+check read 1,614 such blocks before (2,081 that differed three times in
+a row; 1,191,289 differing looks), 11 with the rule and without the
+last sentence, and 0 of both with it (7,615 looks, each a store between
+a refresh and the look; run k_chk1, all checks on). At the open world's
+entry (run k_we_chk, all checks on) it reads 0 for two seconds too; the
+35 blocks that differed three times in a row there are windows over
+private memory the title was writing, which the kernel watches, and all
+matched again. The texture pass
+asks the same guards: of the textures a look found changed, 255 of 280
+were "guarded and clean (nothing seen)" before and 0 of 457 after (435
+"a store the guards saw"). What the picture could show for it: geometry,
+tables and texels read through the GPU's view as they were before the
+title finished them in place.
+
+A landing takes its own marks in view memory (`take_landed_views`, the
+twin of the taking in private memory): some 360 blocks a frame with
+1,400 kernel pages (5.7 MB) in the first room, noted in the journal at
+the landing and counted taken by the landing's copy where they hold its
+bytes (500 blocks and 8.2 MB a frame at the open world's entry). Its
+check is `VICTORY_LAND_TAKEN=2`, which counted 0 of 448,385 pages
+(29,625 written again since) in k_chk1 and 0 of 586,657 (19,601) in
+k_we_chk. The other checks in those two runs: the events' 0 finds in
+149 and 156 lines; the seen check 0 and 0; no subresource copied from
+title memory over what the card had written last, no level a view may
+show left with nothing. The thin check is not 0, and in one line of each
+run above the tree before: draws that would have drawn otherwise in the
+call, a frame, 0.10 and 4.49 in two of the prologue's 31 lines (0.04 in
+one of 32 before) and 0.02 to 0.07 in four and 63.86 in one of the
+world's 31 (0.04 to 0.08 in six of 28 before). They are of the kind the
+tree before has: a table the title wrote again between a call and its
+translation. Whether the two lines come of the refresh check, which was
+on in these runs and not in those and holds the frame at 140 ms, or of
+the title's threads no longer waiting for the guards, is not told apart
+here: it wants the thin check alone on this tree.
+
+Open of S3, its fourth step: the journal by chunk of its table, and the
+standing asking the burst's. The journal's lock is still one, held
+around each asking with the guards' check inside it, and checks do not
+interleave for that reason alone: the exactness of the check's four
+steps and of the landing's taking is argued with it held. Taken apart,
+a check and a taking lock the chunks of their pages in the order of
+addresses, the numbers of the askings come from one counter, and the
+standing asking (`ask_once`, with what the guards learn for a
+submission) becomes an object of the burst that `Host::submit` hands
+down: that is in `host.rs` (`Batch`, where the asking is begun and
+ended) and wants the burst's stamp of S1b. Also left where it is: the
+landing still opens guards for the pieces no one view of ours holds
+whole (some 100 a frame; `shadow.rs` `card_merge_relay_fast`), and so do
+the title's buffer copies (`host.rs`); both could go beside the guards.
 
 Settled, not to be tried again as they are: shaders reading title memory
 in place (`VICTORY_INPLACE`: over the bus, slower); a copy queue for the
@@ -305,11 +437,9 @@ results a frame old; with the present in the line the frame-begin signal
 is set 72 to 100 ms after its call, 0 to 19 without, and whether the
 title's next frame waits for it is not measured).
 
-Open: with `VICTORY_REFRESH_CHECK=1` some 1,500 blocks in a run of the
-prologue "differed for two seconds with nothing told" (4 MiB windows not
-in the card's memory, guarded, "not written since taken"), in the build
-before this work too: a hole of the write tracking that S3 has to find
-before it restructures anything; until then the check of every stage is
-"not above the base". Who holds the guards' lock for up to 8.8 ms is not
-known (S3's first step). What of the bytes sent up the card never reads
-cannot be seen from here.
+Open: what of the bytes sent up the card never reads cannot be seen from
+here. (The blocks the refresh check found differing with nothing told,
+some 1,500 a run of the prologue, were a hole of the write tracking: see
+"S3 as built". The check reads 0 of them since, so the check of every
+stage is 0 there, not "not above the base". Who held the guards' lock is
+in the same place.)

@@ -176,6 +176,22 @@ guards line's "equal to the CPU side, not sent up" should fall by about
 that. Each taking costs a kernel call of 30 to 70 microseconds on the
 landing thread.
 
+The same for view memory (2026-11-26; no switch of its own,
+`VICTORY_LAND_TAKEN=2` is its check too): there the kernel keeps no
+bits, the landing writes beside the guards and tells them, and the next
+refresh's check reported the blocks to the landing's own copy as to
+every other. The landing takes the guards' marks of its blocks right
+behind the telling (the journal's lock held; noted in the journal at
+once), and its copy compares and counts as above. Only blocks a check
+could note clean without a call are taken: one a store of the title's
+opened meanwhile, or a view of whose pages became writable, is its next
+check's. The line "landings' marks taken in view memory" counts the
+landings, blocks and kernel pages (some 360 blocks and 5.7 MB a frame in
+the first room); what the copies count taken is in the line above it,
+with the pages of private memory. For the check, "written again since"
+is asked of the guards where the kernel's bit is asked for private
+memory.
+
 To check both in a run: `VICTORY_REFRESH_EVENTS=2 VICTORY_LAND_TAKEN=2
 VICTORY_REFRESH_CHECK=1`; the lines "refreshes by event", "landings'
 written bits taken" and "refresh check, since the start" must count no
@@ -195,7 +211,13 @@ with what the guards hold of the block); of them, those that matched
 again once a write behind the guards was told there and those that
 matched again with none told; and blocks that differed for two seconds
 with nothing told. Only the last are copies that keep old bytes; each is
-named a second time.
+named a second time, with what the guards hold of every other view of
+the block's pages and whether that view is writable. Until 2026-11-26 a
+run of the prologue had some 1,600 of them, every one a block with a
+writable view of its pages elsewhere (the title's own, opened for a read
+or by a fault and never guarded again); a check that notes a block clean
+now makes every view of its pages read-only first, and the count is 0
+(`docs/architecture.md`, "S3 as built").
 
 A read of the kernel's into title memory (`ReadFile`) now says when it is
 done, and blocks a check guarded again while the kernel was writing count
