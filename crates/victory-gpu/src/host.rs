@@ -407,33 +407,48 @@ fn submitting(phase: u64, lists: usize) {
     SUBMITTING[0].store(phase, Ordering::Relaxed);
 }
 
-/// What was going on when the host device went: whether a submission was
-/// on the card, the pipeline library's state and the calls running in it,
-/// and the trail.
+/// What was going on when the host device went, as far as it is known at
+/// once: what the submitting thread was doing, how many submissions were
+/// sent ahead and had not landed (their lists were on the card, or waiting
+/// for it, whatever the submitting thread did meanwhile), and the pipeline
+/// library's calls. Atomics and one short lock: nothing here waits.
 pub(crate) fn removal_context() -> String {
-    use std::fmt::Write;
     let now = now_us();
     let ms = |at: u64| now.saturating_sub(at) as f64 / 1000.0;
-    let phase = match SUBMITTING[0].load(Ordering::Relaxed) {
-        0 => "between submissions (nothing of ours was running on the card)",
-        1 => "preparing a submission (nothing of ours was running on the card)",
+    let phase = SUBMITTING[0].load(Ordering::Relaxed);
+    let doing = match phase {
+        0 => "between submissions",
+        1 => "preparing a submission",
         2 => "waiting for the card to run a submission",
-        _ => "copying back what a submission wrote (nothing of ours was running on the card)",
+        _ => "copying back what a submission wrote",
     };
-    let mut text = format!(
-        "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {}",
+    let (started, finished) = (STARTED.load(Ordering::Relaxed), FINISHED.load(Ordering::Relaxed));
+    // Started and not landed, less the one being prepared: sent ahead.
+    let ahead = started.saturating_sub(finished).saturating_sub(u64::from(phase == 1));
+    let card = match (phase, ahead) {
+        (2, _) => String::new(),
+        (_, 0) => " (nothing of ours was running on the card)".to_owned(),
+        (_, n) => format!(" ({n} submissions sent ahead had not landed: their lists were on the card or waiting for it)"),
+    };
+    format!(
+        "the submitting thread was {doing}{card}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {started} finished {finished}",
         SUBMITTING[1].load(Ordering::Relaxed),
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
         crate::pipeline::library_removal_note(),
         RETIREMENTS[0].load(Ordering::Relaxed),
         RETIREMENTS[1].load(Ordering::Relaxed),
-        STARTED.load(Ordering::Relaxed),
-        FINISHED.load(Ordering::Relaxed),
-    );
+    )
+}
+
+/// The trail, for the same report: the last things done to the host's
+/// objects, newest last.
+fn removal_trail() -> String {
+    use std::fmt::Write;
+    let now = now_us();
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = write!(text, "; the last {} things done, newest last:", trail.len());
+    let mut text = format!("the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
-        let _ = write!(text, "\n  {:.1} ms before, thread {thread}: {what}", ms(*at));
+        let _ = write!(text, "\n  {:.1} ms before, thread {thread}: {what}", now.saturating_sub(*at) as f64 / 1000.0);
     }
     text
 }
@@ -563,16 +578,46 @@ fn removal_memory() -> String {
     )
 }
 
-/// Says [`removal_context`] in the log, once: called by whoever finds the
-/// host device removed.
+/// Says in the log what was going on when the host device went, once:
+/// called by whoever finds it removed. A line for each thing, as soon as it
+/// is known, the quick ones first; whoever else finds the removal
+/// meanwhile waits here until the first has said it all (five seconds at
+/// most), since what follows for both is the end of the run.
+///
+/// It was one line made whole before any of it was said, and the making
+/// read the pipeline library's file for pages of zeros, from the disk if
+/// need be, for up to two seconds; a second caller came straight back.
+/// At the two losses of 2026-11-26 at the open world's entry the thread
+/// that found the removal first was still reading when the submitting
+/// thread found it too, reported the failure and ended the run: the log
+/// had the failure and not a word of the context, nor the device-removed
+/// data that had been asked for.
 pub(crate) fn log_removal_context() {
-    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if SAID.swap(true, Ordering::Relaxed) {
-        return;
+    // 0: not said; 1: being said; 2: said.
+    static SAID: Mutex<u8> = Mutex::new(0);
+    static DONE: std::sync::Condvar = std::sync::Condvar::new();
+    {
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        match *said {
+            0 => *said = 1,
+            1 => {
+                let _ = DONE.wait_timeout_while(said, std::time::Duration::from_secs(5), |said| *said == 1);
+                return;
+            }
+            _ => return,
+        }
     }
-    if trail_on() {
-        tracing::error!("when the host device went: {}", removal_context());
-    }
+    // SAFETY: a plain query.
+    let reason = match host().map(|host| unsafe { host.device.GetDeviceRemovedReason() }) {
+        Some(Err(e)) => format!("{:#010X}", e.code().0),
+        Some(Ok(())) => "none: the device is not removed".to_owned(),
+        None => "no host device".to_owned(),
+    };
+    tracing::error!(
+        "when the host device went (found by thread {}, removal reason {reason}): {}",
+        thread_id(),
+        removal_context()
+    );
     // The memory at this moment: the memory line is up to five seconds
     // old, and a card or a PC out of memory would not be in it.
     tracing::error!("memory when the host device went: {}", removal_memory());
@@ -597,6 +642,27 @@ pub(crate) fn log_removal_context() {
             "device-removed data, asked where the removal was found{}",
             host.removal_data_of(&[], false)
         );
+    }
+    if trail_on() {
+        tracing::error!("before the host device went: {}", removal_trail());
+    }
+    // Last, because it may read the file from the disk.
+    tracing::error!("when the host device went: {}", crate::pipeline::library_removal_pages());
+    *SAID.lock().unwrap_or_else(|e| e.into_inner()) = 2;
+    DONE.notify_all();
+}
+
+/// A call that makes a buffer or a list for the host failed with `e`: if
+/// that is the device being removed, this may be the first to find it, and
+/// says the context ([`log_removal_context`]). The failure that ends the
+/// run comes later and from whoever cannot go on without what was to be
+/// made; at the two losses of 2026-11-26 that was up to 4 ms after the
+/// first such call had failed.
+fn found_removed(e: &windows::core::Error) {
+    // Removed, hung, reset: what a call answers once the device is gone.
+    const GONE: [u32; 3] = [0x887A_0005, 0x887A_0006, 0x887A_0007];
+    if GONE.contains(&(e.code().0 as u32)) {
+        log_removal_context();
     }
 }
 
@@ -4647,6 +4713,7 @@ impl Host {
             Ok(prelude) => Some(prelude),
             Err(e) => {
                 tracing::warn!(error = %e, "no host list for a prelude");
+                found_removed(&e);
                 None
             }
         }
@@ -8970,6 +9037,7 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                found_removed(&e);
                 None
             }
         }
@@ -9786,6 +9854,7 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                found_removed(&e);
                 None
             }
         }
@@ -9830,6 +9899,7 @@ impl Host {
             Ok(()) => buffer,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
+                found_removed(&e);
                 None
             }
         }
@@ -10072,6 +10142,7 @@ mod trail {
         let text = super::removal_context();
         assert!(text.contains("the submitting thread was"));
         assert!(text.contains("pipeline library: no call running"));
+        let text = super::removal_trail();
         assert!(text.contains(&format!("thing {} done", super::TRAIL_MOST + 4)));
         assert!(!text.contains("thing 4 done"), "the oldest entries are dropped");
     }

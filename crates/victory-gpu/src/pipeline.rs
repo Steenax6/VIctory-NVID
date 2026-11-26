@@ -942,6 +942,12 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// The slow part of that report, said last (`library::removal_pages`).
+#[cfg(windows)]
+pub(crate) fn library_removal_pages() -> String {
+    library::removal_pages()
+}
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
