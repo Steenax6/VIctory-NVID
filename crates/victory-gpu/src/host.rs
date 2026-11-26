@@ -2049,6 +2049,10 @@ struct Deferred {
     /// What this recording's shaders that store by address declared and named
     /// (`crate::memory::ready`): [`AddressWrites`].
     address_writes: AddressWrites,
+    /// `VICTORY_BVH_QUARANTINE`: the recording has a stage of the
+    /// structure builder, so nothing its shaders write is copied back into
+    /// title memory ([`HostList::quarantine`]).
+    quarantined: bool,
 }
 
 /// Per recording, of shaders that read and write title memory by address
@@ -4579,6 +4583,7 @@ impl Host {
             let Some(before) = before else {
                 continue;
             };
+            let size = shadow.card_hashed(size);
             let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                 vec![shadow.card_run(0, usize::MAX)]
             } else {
@@ -4778,6 +4783,7 @@ impl Host {
                         let Some(before) = before else {
                             continue;
                         };
+                        let size = shadow.card_hashed(size);
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
@@ -4907,7 +4913,8 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
+                        let hashed = r.shadow.card_hashed(size) as u32;
+                        let constants = [r.span.first, r.span.skew, hashed, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
@@ -6060,6 +6067,14 @@ impl Host {
         crate::copystat::submission_begins();
         #[cfg(feature = "diagnostics")]
         crate::profile::seen(crate::profile::Seen::Submit);
+        // A quarantined builder stage in one list keeps the whole
+        // submission's shader writes from the title: the copy-back compares
+        // every list's declared ranges after all of them ran, so a range of
+        // another list over memory the builder wrote would carry its stores
+        // back all the same.
+        if runs.iter().any(|r| r.deferred().quarantined) {
+            runs.iter().for_each(|r| r.quarantine());
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -7217,9 +7232,28 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        if deferred.quarantined {
+            return;
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// The recording has a quarantined stage of the structure builder
+    /// (`VICTORY_BVH_QUARANTINE=1`): no shader write of the whole recording
+    /// is copied back into title memory, those declared before it included.
+    /// Copy-backs are declared per list, not per dispatch: a range another
+    /// shader of the same list declared written carried the builder's
+    /// stores in it back to the title all the same, and the quarantine
+    /// leaked (fxceless/victory-fork#1013). The builder's lists then give
+    /// the title none of their other shaders' writes either; it is a test,
+    /// not a way to run.
+    pub(crate) fn quarantine(&self) {
+        let mut deferred = self.deferred();
+        if !deferred.quarantined {
+            deferred.quarantined = true;
+            deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -8376,6 +8410,16 @@ impl Meter {
             );
         }
         {
+            let [counted, partial] = std::array::from_fn(|k| crate::draw::THREAD_DISPATCHES[k].swap(0, Ordering::Relaxed));
+            if counted > 0 {
+                tracing::info!(
+                    "dispatches that count threads: {:.1} a frame, {:.1} of them end in a partial group (run whole)",
+                    counted as f64 / frames,
+                    partial as f64 / frames,
+                );
+            }
+        }
+        {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
                 "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
@@ -8389,6 +8433,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::shadow::back_line(frames);
+        crate::shadow::placed_line();
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
@@ -9353,9 +9398,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 /// the switches under test in the environment (they are read once per
 /// process); it does nothing unless the host device is the software
 /// adapter (`VICTORY_D3D12_WARP=1` in a diagnostics build) and the copy is
-/// in the card's memory (`VICTORY_CARD_BUFFERS_MIN_MB=1`):
+/// in the card's memory (`VICTORY_CARD_BUFFERS_MIN_KB=1024`):
 ///
-/// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 [VICTORY_QUEUE2=n]
+/// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_KB=1024 [VICTORY_QUEUE2=n]
 ///  [VICTORY_RELAY=2 | VICTORY_LATE_WAIT=3] cargo test -p victory-gpu
 ///  --features diagnostics queue2_tests`
 ///
@@ -9415,7 +9460,7 @@ void main() {
         crate::shadow::register(0x51_5151, title as u64, LEN as u64);
         let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
         if !shadow.carded() {
-            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_KB=1024)");
             return;
         }
         let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
@@ -9538,7 +9583,7 @@ void main() {
     /// bytes. With the fix B's landing fetches the piece all the same
     /// (`BESIDE`).
     ///
-    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_QUEUE2=1
+    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_KB=1024 VICTORY_QUEUE2=1
     ///  VICTORY_RELAY=1 cargo test -p victory-gpu --features diagnostics
     ///  fetched_again -- --nocapture` (alone: it lands its two flights
     /// itself; `VICTORY_QUEUE2_REFETCH=0` shows the fault).
@@ -9577,7 +9622,7 @@ void main() {
         crate::shadow::register(0x52_5252, title as u64, LEN as u64);
         let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
         if !shadow.carded() {
-            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_KB=1024)");
             return;
         }
         let code = compile(TWICE, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");

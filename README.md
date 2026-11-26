@@ -96,6 +96,7 @@ to about 47 ms of work a frame.
 | `VICTORY_INDIRECT_HOIST`, `VICTORY_INDIRECT_HOIST_ALL` | single indirect records are clamped in their list's prelude, one pass for all records of a buffer, where no shader of the list has declared a write over them (some 1,900 of 4,700 a frame; each used to be a compute pass of ours between two draws) |
 | `VICTORY_INDIRECT_WINDOW_SIZES=16,64`, `VICTORY_INDIRECT_WINDOW_KEEP` | windows of records clamped ahead grow 64, 256, 1024 and outlive direct draws whose shaders store nothing |
 | `VICTORY_FILL_HOT`, `VICTORY_FILL_DIRECT`, `VICTORY_LATE_COPY` | only reads of the 64 KiB of title memory where shaders were seen to change bytes under a fill wait for flights (one such fill used to make every fill wait); constants there are bound from the buffer's host copy; a title buffer copy out of such memory is done when its submission lands |
+| `VICTORY_CARD_CONSTANTS` (added 2026-11-26, not measured here yet) | constant buffers of fresh descriptor tables that lie in a host copy in the card's memory are bound there, not filled into upload memory behind the flights (theinkbit/victory-lot9-next ffd04e130) |
 | `VICTORY_HEAP_SYNC_FAST`, `VICTORY_DESCRIPTOR_STRIPES` | descriptor records the title copies into its heap are found by the write watch's 4 KiB pages and mirrored in runs; slots have striped locks, so recording threads no longer stand behind that pass |
 | `VICTORY_SHADOW_CACHE` | recording threads remember which host copy an address range has |
 | `VICTORY_USER_COPY`, `VICTORY_REFRESH_PARTS`, `VICTORY_REFRESH_4K`, `VICTORY_GUARD_4K`, `VICTORY_MARK_ONLY`, `VICTORY_VIEW_KNOWN`, `VICTORY_ABSENT_ONCE`, `VICTORY_ASK_SKIP_VIEWS`, `VICTORY_ALIAS_RUNS`, `VICTORY_SEND_CHANGED` | title memory is copied by the processor (a fault falls back to the kernel's copy), by 4 KiB pages and only where written; guards are not re-armed over other views; unmapped runs are remembered (`VICTORY_ABSENT_FRAMES`, 30); bytes the copy-back itself wrote are not sent up to the card again |
@@ -128,8 +129,9 @@ in this tree), DirectStorage workers by physical cores (8 against 16: no
 gain, not in this tree), `VICTORY_INPLACE=1` (slower here: the first room
 99.6 ms a frame against 87), `VICTORY_CARD_WINDOWS_MB=1024` (the cutscene
 within the spread of runs, the card nearly full), `VICTORY_BVH_BUILDER=1`
-with `VICTORY_BVH_QUARANTINE=1` (the builder starts and the title faults
-within seconds of the first 3D frame; see `docs/fork-ray-tracing.md`),
+with `VICTORY_BVH_QUARANTINE=1` (the builder started and the title faulted
+within seconds of the first 3D frame; the likely causes are fixed since,
+not yet tried again; see `docs/fork-ray-tracing.md`),
 `--console series-s` (a quarter faster, but the
 picture is black: the title upscales with FidelityFX there, whose programs
 do not run yet).
@@ -148,6 +150,17 @@ title take some 34 ms of it and the other 8,700 commands share 27 ms. Why
 those passes are slow as translated is open, and it is where the next gain
 would be; 30 frames a second would need the title's commands, twice a
 frame's time there now, to halve.
+
+To measure, not yet the default: `VICTORY_CARD_BUFFERS_MIN_KB=64` (with
+`VICTORY_CARD_BUFFERS_MB=1280`) puts the host copy of every title buffer in
+the card's memory; by default only those of 1 MiB and more are there
+(`=1024`), and a shader's every load and store on the others crosses the
+bus. On an RTX 4070 (fxceless/victory-fork c36971b) the title's lists went
+from 68.0 to 49.8 ms of card time a frame, single passes from 6.7 to 1.6
+ms; our passes that send and hash before each submission went from 11.6
+to 23.0 ms, and `VICTORY_CARD_HASH_LEN=1` (hash a copy's own bytes, not its
+whole 64 KiB) is meant to take that back. A line with the frame-rate line
+says how many copies went where, by size.
 
 `VICTORY_PIPELINE_WORKERS=<n>` sets how many threads build pipelines that
 are not cached yet (default: half the logical processors, at most 8). On a

@@ -72,7 +72,19 @@ shaders and emulates the one instruction.
   (`victory translate --pipelines` with `VICTORY_HOST_MAX_WAVE=32`). Switched
   on in game runs on an RTX 5090, with or without `VICTORY_BVH_QUARANTINE=1`,
   the title crashed about 80 s into the gameplay, reading a pointer of all
-  ones.
+  ones; on an RTX 4070 Ti it faulted within seconds of the first 3D frame.
+  Fixed since (2026-11-26, from the forks), not yet tried in a game here:
+  the builder's `DispatchX` calls count threads, not groups, and ran up to
+  64 times over, writing past its structures; the quarantine leaked through
+  other shaders' write declarations in the same list; numbered copies taken
+  by one list were missed by another; walkers declared every copy written;
+  the upload memory the builder's records lie in was out of reach of
+  addresses; free memory and the process heap could be guarded (a freeze).
+  With the builder on, the walkers wait until it has run once.
+- The last group of a dispatch that counts threads runs whole: the
+  translated program has no thread count to stop at yet (a shader change).
+- The directory of title memory by address does not follow buffers the
+  title releases or replaces.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
