@@ -104,7 +104,13 @@ pub(crate) struct Lowered {
     /// Whether its UAVs are globally coherent ([`crate::ir::orders_across_groups`]).
     #[cfg(test)]
     pub coherent: bool,
+    /// Whether depth and stencil are tested before it runs (`[earlydepthstencil]`).
+    #[cfg(test)]
+    pub early_depth: bool,
 }
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (bit 12, as AMD's register headers name it).
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -1168,6 +1174,19 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
+        // A pixel program the console runs after the depth and stencil test
+        // (`DEPTH_BEFORE_SHADER`, what its compiler sets for `[earlydepthstencil]`) runs
+        // after it on the host too. Without the flag a host tests a program that writes
+        // views or discards after running it: it ran for hidden pixels and kept their
+        // writes, which the console never makes. Kept with a depth export as well: the
+        // console tests the rasterized depth first then too. (`VICTORY_EARLY_DEPTH=0`:
+        // as before, the host's order.)
+        if let StageIo::Ps { db_shader_control, .. } = &x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && super::early_depth()
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         s.coherent = crate::ir::orders_across_groups(
             p.blocks.iter().flat_map(|b| &b.insts).map(|i| (i.name(), i.fields.clone())),
         );
@@ -2408,6 +2427,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             coherent: self.s.coherent,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,

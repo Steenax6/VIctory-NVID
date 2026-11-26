@@ -183,6 +183,21 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether a pixel program the console tests depth and stencil before
+/// (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`) gets DXIL's
+/// `ForceEarlyDepthStencil`, so that the host does not run it for pixels the
+/// test hides. `VICTORY_EARLY_DEPTH`:
+/// - unset or `1`: yes, as the console orders them.
+/// - `0`: no; the host decides (a program writing views or discarding then
+///   runs before the test), as before. For comparing pictures and card time.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn early_depth() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EARLY_DEPTH").ok().as_deref().map(str::trim) != Some("0"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
@@ -227,6 +242,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(early_depth()));
     out
 }
 
@@ -2265,6 +2281,60 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// A pixel program the console tests depth before (`DEPTH_BEFORE_SHADER`, bit 12 of
+    /// `DB_SHADER_CONTROL`) is `[earlydepthstencil]` on the host; one without the bit is
+    /// not, whatever the Z order bits next to it say. (After Marvisak/VIctory PR #2085,
+    /// 0xkn0wh3r3.)
+    #[test]
+    fn pixel_programs_tested_before_they_run_force_early_depth() {
+        let words = [
+            0xF800_1890, 0x0000_0000, // exp null off, off, off, off done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let lowered = |db_shader_control: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: Vec::new(),
+                used: Vec::new(),
+                io: StageIo::Ps {
+                    inputs: Vec::new(),
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .unwrap()
+        };
+        assert!(early_depth(), "VICTORY_EARLY_DEPTH=0 in the test environment");
+        // with early Z then late Z (bits 4-5) as the console pairs it
+        let early = lowered(1 << 12 | 1 << 4);
+        assert!(early.early_depth);
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut early.dxil.clone()).unwrap();
+        }
+        assert!(!lowered(1 << 4).early_depth);
+        assert!(!lowered(0).early_depth);
     }
 
     /// Quad permutations in pixel programs read through quad operations
