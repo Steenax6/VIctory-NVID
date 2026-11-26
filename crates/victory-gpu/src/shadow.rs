@@ -3755,6 +3755,20 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        // Title memory is read into one buffer a thread, kept between
+        // calls: a zeroed 64 KiB made for every call that looks at a page
+        // was most of such a call's own time (Marvisak/VIctory pull request
+        // 3246, lhnizdo, does the same for its marked pages' copy-back).
+        // Every byte of it that is used was read from title memory first.
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        TITLE.with(|title| self.merge_under_writes_into(address, len, runs_left, &mut title.borrow_mut()))
+    }
+
+    /// [`Shadow::merge_under_writes`]; `title` is room to read title
+    /// memory into.
+    fn merge_under_writes_into(&self, address: usize, len: usize, runs_left: &mut usize, title: &mut Vec<u8>) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -3777,9 +3791,6 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        // Made when a page is to be looked at: most calls find none, and a
-        // zeroed 64 KiB each was most of their own time.
-        let mut title: Vec<u8> = Vec::new();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -3796,8 +3807,8 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_runs_in(base, &copied, (start, end), a, e, &written, refresh_kernel_pages())
             };
-            if !stale.is_empty() && title.is_empty() {
-                title = vec![0u8; PAGE];
+            if !stale.is_empty() && title.len() < PAGE {
+                title.resize(PAGE, 0);
             }
             for (page, runs) in stale {
                 let mut taken = true;
@@ -4272,7 +4283,15 @@ impl Shadow {
             while at < to {
                 let n = (STEP - at % STEP).min(to - at);
                 let read = &mut scratch[..n];
-                read.fill(0);
+                // Not zeroed first (0.5 ms a frame of the submitting
+                // thread in the profile of 2026-11-26): the copy writes
+                // every byte of it, the title's or, for a page that is not
+                // there, zero. Only the diagnostics mode that measures by
+                // leaving the copy out writes nothing.
+                #[cfg(feature = "diagnostics")]
+                if crate::copystat::mode() == 2 {
+                    read.fill(0);
+                }
                 crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, n, false);
                 // SAFETY: inside the mapping (`[at, at + n)` is within the
                 // buffer); only the submitting thread writes these bytes.
