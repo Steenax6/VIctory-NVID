@@ -10,7 +10,8 @@
 //! A first use queues the pipeline and waits for it within a budget per
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
 //! bake) are there at once as before; past the budget a draw or dispatch
-//! whose pipeline is not ready is dropped, as an untranslated one is.
+//! whose pipeline is not ready is dropped, as an untranslated one is. A
+//! pipeline is waited for one frame's budget in all, not in every frame.
 //!
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
@@ -33,6 +34,10 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Microseconds draws and dispatches have waited for it, over all
+    /// frames ([`wait`]), and whether it is counted in [`PASSED_OVER`].
+    waited_us: AtomicU64,
+    passed_over: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,12 +61,17 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
+            passed_over: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        if self.passed_over.swap(false, Ordering::SeqCst) {
+            PASSED_OVER.fetch_sub(1, Ordering::SeqCst);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -159,10 +169,26 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Pipelines still being made that draws no longer wait for: each has had
+/// a whole frame's budget of waiting ([`wait`]).
+static PASSED_OVER: AtomicU64 = AtomicU64::new(0);
+
+/// [`PASSED_OVER`] now (for the frame line).
+pub(crate) fn passed_over() -> u64 {
+    PASSED_OVER.load(Ordering::Relaxed)
+}
+
+/// Waits for `p` while frame `frame` has budget left, unless `p` has had a
+/// whole frame's budget of waiting already, over the frames before: then
+/// its draws are dropped until it is made, without waiting (whether it is
+/// made is looked at on every use all the same). A pipeline the driver
+/// takes seconds for, or never finishes, cost the whole budget in every
+/// frame that used it: fxceless/victory-fork issue #1181, four such
+/// pipelines a whole session long, 500 ms waited in every frame of the
+/// world (761 ms a frame against 252 with the budget at 50 ms).
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
-    if budget.is_zero() {
+    if budget.is_zero() || p.waited_us.load(Ordering::Relaxed) >= budget.as_micros() as u64 {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -195,6 +221,15 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    let total = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed) + waited.as_micros() as u64;
+    if total >= budget.as_micros() as u64 && !p.passed_over.swap(true, Ordering::SeqCst) {
+        PASSED_OVER.fetch_add(1, Ordering::SeqCst);
+        // Made meanwhile: not passed over after all (whichever of this and
+        // `Pending::make` takes the mark back counts it out).
+        if p.made.get().is_some() && p.passed_over.swap(false, Ordering::SeqCst) {
+            PASSED_OVER.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
@@ -406,6 +441,35 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline that is never made is waited for one frame's budget in
+    /// all: once that is spent, later frames do not wait for it again, and
+    /// it counts as passed over until it is made (fxceless #1181).
+    #[test]
+    fn a_pipeline_never_made_is_waited_for_once() {
+        let p = Pending::new(Vec::new(), None);
+        // A worker has taken it and does not finish.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let budget = wait_budget();
+        if budget.is_zero() {
+            return;
+        }
+        // Frames of the test's own (the budget is shared per frame).
+        let mut frame = u64::MAX / 2;
+        while !p.passed_over.load(Ordering::SeqCst) {
+            assert!(frame < u64::MAX / 2 + 64, "the pipeline was never passed over");
+            wait(&p, frame);
+            frame += 1;
+        }
+        assert!(passed_over() >= 1);
+        let started = Instant::now();
+        wait(&p, frame);
+        assert!(started.elapsed() < budget / 4, "a passed-over pipeline was waited for again");
+        // Made at last: counted out.
+        p.make();
+        assert!(!p.passed_over.load(Ordering::SeqCst));
+        assert!(p.made.get().is_some());
     }
 
     #[test]

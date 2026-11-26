@@ -400,6 +400,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Of [`making`], those draws no longer wait for (`make::wait`).
+#[cfg(windows)]
+pub(crate) fn passed_over() -> u64 {
+    make::passed_over()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
