@@ -37,6 +37,15 @@
 //! is the extent of the title's allocation around an address, which the
 //! memory module of the layer knows and this one does not ask yet.
 //!
+//! With the structure builder asked for (`crate::pipeline::builder_allowed`)
+//! the directory follows the title's buffers: a filled page in memory whose
+//! buffer the title registered, released or replaced since
+//! ([`ownership_changed`]) is given the copy of what holds it now, or none
+//! ([`Memory::follow`]), before the next dispatch that reads the directory.
+//! Without it a builder stage stored through such a page into the copy of a
+//! buffer the title had released, and the programs reading the buffer now
+//! there never saw it (ka1qux/BRVIctory-ka1qux 4c9dff93d).
+//!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
 //! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
 //! most). Every list with such a shader brings all numbered copies up to
@@ -62,6 +71,32 @@ const COPIES: u32 = 1023;
 const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+
+/// Spans of title memory (first page, page past the end) whose buffers
+/// changed since the directory last followed them ([`Memory::follow`]), and
+/// whether more changed than are kept (then every filled page is looked
+/// at). Collected only once the directory exists with the builder asked for
+/// ([`FOLLOW`]).
+static CHANGES: Mutex<(Vec<(u64, u64)>, bool)> = Mutex::new((Vec::new(), false));
+/// See [`CHANGES`].
+static FOLLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Spans [`CHANGES`] keeps.
+const CHANGES_KEPT: usize = 4096;
+
+/// The title registered, released or replaced a buffer over
+/// `[start, start + len)`: filled pages of the directory there may now
+/// belong to another copy.
+pub(crate) fn ownership_changed(start: u64, len: u64) {
+    if !FOLLOW.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut changes = CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if changes.0.len() == CHANGES_KEPT {
+        changes.1 = true;
+        return;
+    }
+    changes.0.push((start / PAGE, start.saturating_add(len).div_ceil(PAGE)));
+}
 
 struct Memory {
     /// Buffer, its mapping, its GPU address.
@@ -105,6 +140,9 @@ impl Memory {
             Some((buffer, data.cast::<u32>(), gpu))
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        if crate::pipeline::builder_allowed() {
+            FOLLOW.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
@@ -129,29 +167,48 @@ impl Memory {
         if unsafe { entry.read() } != 0 {
             return;
         }
-        let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
             return;
         }
+        if let Some((n, offset)) = self.place(page) {
+            self.set(page, n, offset);
+        }
+    }
+
+    /// Directory entry `page`: copy `n` (0: none), at byte `offset` in it.
+    fn set(&mut self, page: u64, n: u32, offset: u32) {
+        // The offset first: a shader that sees the number sees it too.
+        // SAFETY: inside the directory's mapping (`page` is below its last
+        // entry).
+        unsafe {
+            let entry = self.directory.1.add(page as usize * 2);
+            entry.add(1).write_volatile(offset);
+            entry.write_volatile(n);
+        }
+    }
+
+    /// The copy that holds `page` now (its number, from 1, and the page's
+    /// byte in it), numbering it if it has no number yet; None if the
+    /// memory is not the title's, no buffer with unordered access holds the
+    /// page whole, or no number is left.
+    fn place(&mut self, page: u64) -> Option<(u32, u32)> {
+        let start = page * PAGE;
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            return None;
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let Some(shadow) = crate::shadow::find(start, 1)
+        let shadow = crate::shadow::find(start, 1)
             .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
-        else {
-            return;
-        };
+            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))?;
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return None;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
@@ -199,15 +256,59 @@ impl Memory {
                 ONCE.call_once(|| {
                     tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
                 });
-                return;
+                return None;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
-        // The offset first: a shader that sees the number sees it too.
-        // SAFETY: inside the directory's mapping.
-        unsafe {
-            entry.add(1).write_volatile(offset as u32);
-            entry.write_volatile(n as u32 + 1);
+        Some((n as u32 + 1, shadow.offset_in(start).unwrap_or(0) as u32))
+    }
+
+    /// Follows the buffers the title registered, released or replaced since
+    /// the last look ([`ownership_changed`]): a filled page there whose copy
+    /// is no longer what holds it gets the copy of what does, or none (a
+    /// shader that touches it then notes it, as an empty page). In place:
+    /// the title gives up memory only once the work that uses it has run,
+    /// so a list recorded before reads no page that changed.
+    fn follow(&mut self) {
+        let (spans, all) = {
+            let mut changes = CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+            if changes.0.is_empty() && !changes.1 {
+                return;
+            }
+            let all = std::mem::take(&mut changes.1);
+            (std::mem::take(&mut changes.0), all)
+        };
+        let last = u64::from(MEMORY_PAGES) - 1;
+        let pages: Vec<u64> = if all {
+            (0..last).collect()
+        } else {
+            let mut pages: Vec<u64> =
+                spans.iter().flat_map(|&(first, end)| first.min(last)..end.min(last)).collect();
+            pages.sort_unstable();
+            pages.dedup();
+            pages
+        };
+        let mut moved = 0u64;
+        for page in pages {
+            // SAFETY: inside the directory's mapping.
+            let (n, offset) = unsafe {
+                let entry = self.directory.1.add(page as usize * 2);
+                (entry.read(), entry.add(1).read())
+            };
+            if n == 0 {
+                continue;
+            }
+            self.refused.remove(&page);
+            let now = self.place(page).unwrap_or((0, 0));
+            if now != (n, offset) {
+                self.set(page, now.0, now.1);
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                tracing::info!(moved, "title memory by address: pages whose buffer changed follow it to its copy");
+            }
         }
     }
 
@@ -284,6 +385,7 @@ pub(crate) fn ready(
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    m.follow();
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;

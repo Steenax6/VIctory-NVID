@@ -306,6 +306,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// The threads in x of the dispatch being bound, if it counts threads
+    /// (`victory_shader::emit::USER_DISPATCH_THREADS`).
+    threads_x: Option<u32>,
 }
 
 impl Drop for State {
@@ -551,9 +554,10 @@ pub(crate) fn group_pieces() -> u32 {
 }
 
 /// Since the last frame line: direct dispatches that count threads
-/// ([`crate::list::USE_THREAD_DIMENSIONS`]), and those of them whose last
-/// group is partial (run whole, see [`State::dispatch`]).
-pub(crate) static THREAD_DISPATCHES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// ([`crate::list::USE_THREAD_DIMENSIONS`]), those of them whose last
+/// group is partial and cut at the count, and those whose partial group
+/// runs whole (see [`State::dispatch`]).
+pub(crate) static THREAD_DISPATCHES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Since the last frame line: indirect dispatch executions recorded in
 /// pieces, the `ExecuteIndirect` calls they took, and direct dispatches
@@ -925,9 +929,16 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_THREADS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_DISPATCH_THREADS {
+            // Every thread of every group, but in a dispatch that counts
+            // threads ([`State::dispatch`]).
+            return self.threads_x.unwrap_or(u32::MAX);
         }
         if kind == USER_GROUP_BASE {
             // The first group of the dispatch being bound: 0 until a
@@ -1246,6 +1257,37 @@ impl State {
                                 } else {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
+                            }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the view heap's table of view addresses (only
+                        // with the structure builder asked for: without it such
+                        // a draw is dropped, as the program was before).
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|h| h.addresses());
+                        let Some((gpu, buffer)) = table else {
+                            once!(
+                                "a shader takes view addresses from the view heap, which has no table of them \
+                                 (VICTORY_BVH_BUILDER=1 makes it): the draw is dropped"
+                            );
+                            return false;
+                        };
+                        // The list may outlive the title's heap object, which owns the table.
+                        list.keep(buffer);
+                        // SAFETY: an open list; the list holds the table.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
                             }
                         }
                         continue;
@@ -2451,22 +2493,33 @@ impl State {
                 );
             });
         }
-        // shortcut: the console starts only the threads up to the count in
-        // a partial last group; the host runs that group whole, so its
-        // threads past the count run too (at most a group less one more
-        // than asked, not 64 times as many). Cutting them needs the
-        // count in the translated program (victory_shader), which has no
-        // place for it yet.
+        // The console starts only the threads up to the count in a partial
+        // last group. A program that reads the count (the structure
+        // builder's: `victory_shader::spill::thread_limited`) has its lanes
+        // past it off in EXEC from the start, as there.
+        // shortcut: any other program, and a group partial in y or z, runs
+        // that group whole, its threads past the count too (at most a group
+        // less one more than asked, not 64 times as many).
         if partial {
-            THREAD_DISPATCHES[1].fetch_add(1, Ordering::Relaxed);
-            once!(
-                pipeline = %p.name,
-                threads = ?dims,
-                ?group,
-                "a dispatch that counts threads ends in a partial group: the host runs that group whole (counted in the frame line)"
-            );
+            let reads_count = p.stages[0].translated().host.user_data.iter().any(|u| {
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS)
+            });
+            let cut = reads_count && (1..3).all(|i| dims[i].is_multiple_of(group[i].max(1)));
+            THREAD_DISPATCHES[if cut { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+            if !cut {
+                once!(
+                    pipeline = %p.name,
+                    threads = ?dims,
+                    ?group,
+                    "a dispatch that counts threads ends in a partial group its program cannot cut: the host runs that \
+                     group whole (counted in the frame line)"
+                );
+            }
         }
-        if !self.bind(list, p, true) {
+        self.threads_x = (flags & crate::list::USE_THREAD_DIMENSIONS != 0).then_some(dims[0]);
+        let bound = self.bind(list, p, true);
+        self.threads_x = None;
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -3705,7 +3758,14 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => {
+                let bound = self.bind(list, p, true);
+                // as a direct dispatch of the builder's ([`State::dispatch`])
+                if !bound && crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("one of its indirect dispatches could not be bound");
+                }
+                bound
+            }
             _ => false,
         };
         if !ran {
@@ -4097,7 +4157,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 /// world's ray-traced pass walked from address 0 instead of the structure
 /// (Marvisak/VIctory#2098). Any other view: the first byte of the memory
 /// it reads, or 0.
-fn view_address(view: &View) -> u64 {
+pub(crate) fn view_address(view: &View) -> u64 {
     match view {
         View::Shader(_, Some(desc))
             if desc[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 =>

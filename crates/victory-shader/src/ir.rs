@@ -150,6 +150,8 @@ pub fn with_shared_slots<R>(f: impl FnOnce() -> R) -> R {
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
     let mut list = gfx10::decode(code)?;
     let lanes = 1 + u8::from(wave64);
+    // The wait for stores to land is a fence in a program that orders memory between groups.
+    let keep_vscnt = orders_across_groups(list.iter().filter_map(|i| Some((i.name()?, i.fields(wave64)))));
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
     let mut flows = Vec::with_capacity(list.len());
@@ -219,7 +221,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 Flow::Stop => Exit::End,
             };
         }
-        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, keep_vscnt)? {
             // Lanes disabled in EXEC keep the old value.
             for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
                 if !reads.contains(w) {
@@ -308,7 +310,7 @@ fn unspill(
         let Some(name) = inst.name() else { return Vec::new() };
         let fields = inst.fields(wave64);
         let park = parked(inst, &fields);
-        let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
+        let Ok(effects) = effects(inst, &fields, name, lanes, vgprs, false) else {
             return Vec::new();
         };
         let mut codes = Vec::new();
@@ -1444,6 +1446,30 @@ const DROPPED: &[&str] = &[
     "v_clrexcp",
 ];
 
+/// Whether a program orders its memory accesses between thread groups, by its instructions'
+/// names and fields: a load or store the console marks coherent (`glc` or `dlc`; on an atomic
+/// `glc` only asks for the old value), or a cache invalidation. The console's compiler marks
+/// the accesses to a `globallycoherent` view so, and invalidates its caches before reads of
+/// what another group wrote. The title's structure builder does this: a thread stores its
+/// node's box and counts itself at the parent with an atomic, and the thread that arrives
+/// second reads the first one's box. Such a program gets globally coherent views and a
+/// device-wide fence where it waits for its stores to land or invalidates its caches
+/// (`emit::lower`); a host view that is not globally coherent promises another thread's
+/// writes only within its group. `slc` (streaming) says nothing of coherence.
+pub fn orders_across_groups<'a>(insts: impl IntoIterator<Item = (&'a str, Fields)>) -> bool {
+    insts.into_iter().any(|(name, fields)| {
+        let access = (name.contains("_load") || name.contains("_store")) && !name.contains("atomic");
+        let marked = match &fields {
+            Fields::Buffer { cache, .. } | Fields::Image { cache, .. } | Fields::Flat { cache, .. } => {
+                access && (cache.glc || cache.dlc)
+            }
+            Fields::Smem { cache, .. } => name.contains("_load") && (cache.glc || cache.dlc),
+            _ => false,
+        };
+        marked || matches!(name, "buffer_gl0_inv" | "buffer_gl1_inv" | "s_gl1_inv" | "s_dcache_inv")
+    })
+}
+
 /// Registers read, registers written.
 type Effects = (Vec<Reg>, Vec<Reg>);
 
@@ -1451,21 +1477,26 @@ type Effects = (Vec<Reg>, Vec<Reg>);
 /// value of a VGPR it only writes.
 pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
     let lanes = 1 + u8::from(p.wave64);
-    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs)
+    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs, true)
         .ok()
         .flatten()
         .map_or_else(Vec::new, |e| e.0)
 }
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
-/// the IR drops it.
+/// the IR drops it. `keep_vscnt`: `s_waitcnt_vscnt` stays, with none, in a
+/// program that orders memory between groups ([`orders_across_groups`]).
 fn effects(
     inst: &Instruction,
     fields: &Fields,
     name: &'static str,
     lanes: u8,
     vgprs: u16,
+    keep_vscnt: bool,
 ) -> Result<Option<Effects>, ShaderError> {
+    if keep_vscnt && name == "s_waitcnt_vscnt" {
+        return Ok(Some((Vec::new(), Vec::new())));
+    }
     if DROPPED.contains(&name) {
         return Ok(None);
     }
