@@ -359,6 +359,40 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// The title's thread priorities, but for the lowest two, idle and lowest,
+/// which become "below normal". Some of the title's threads run at idle,
+/// its streaming pager's among them; on the console they have what the rest
+/// of the title leaves of its cores. A PC's processors are also wanted by
+/// other programs and by our own workers (pipeline workers run below
+/// normal): with every one of them busy, such a thread ran once in four
+/// seconds or so, when the host's scheduler boosted it, and the loading
+/// that waits for it with it (loads seen done 1.1 s late on average, 4.8 s
+/// at worst, by Marvisak/VIctory pull request #2903). An experiment here:
+/// `VICTORY_TITLE_PRIORITIES=0` gives them as the title sets them.
+fn title_priority(asked: i32) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    match asked {
+        // Only these two: the values between them are not priorities; they
+        // go to the host unchanged, which refuses them.
+        IDLE | LOWEST => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// [`title_priority`].
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static RAISED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
+    let given = if as_set { priority } else { title_priority(priority) };
+    if given != priority && RAISED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        tracing::info!(asked = priority, given, "a title thread's idle or lowest priority is set below normal");
+    }
+    host::set_thread_priority(thread, given)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -391,6 +425,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -495,6 +530,11 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: the title passes a thread handle; the host checks it.
+        unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    }
+
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
         // SAFETY: our filter takes the exception pointers as an opaque pointer.
         unsafe {
@@ -590,6 +630,10 @@ mod host {
         std::process::exit(code as i32)
     }
 
+    pub(super) fn set_thread_priority(_: *mut c_void, _: i32) -> i32 {
+        1
+    }
+
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
     pub(super) fn report_unhandled(_: *const c_void) {}
@@ -604,6 +648,14 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's idle and lowest threads run below normal; the others as
+    /// it sets them.
+    #[test]
+    fn no_title_thread_waits_for_idle_processors() {
+        let given: Vec<i32> = [-15, -14, -3, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
+        assert_eq!(given, [-1, -14, -3, -1, -1, 0, 1, 2, 15]);
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
