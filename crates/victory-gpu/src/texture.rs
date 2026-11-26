@@ -2692,10 +2692,12 @@ impl Staging {
         let mut digests = [0u64; c::PARTS];
         let mut census = [c::Part { bytes: 0, digest: 0, zero: false }; c::PARTS];
         let mut read = 0usize;
+        // Pages of what is the title's are missing.
+        let partial = in_place && (0..n).any(|k| through[k] || is[k] == PartIs::Zeros);
         let taken = |bytes: &[u8]| {
             let d = digest(bytes).0;
             let d = (d as u64 ^ (d >> 64) as u64).max(1);
-            (d, c::Part { bytes: bytes.len() as u64, digest: d, zero: count && all_zero(bytes) })
+            (d, c::Part { bytes: bytes.len() as u64, digest: d, zero: (count || partial) && all_zero(bytes) })
         };
         let reading = |k: usize| is[k] == PartIs::Read;
         if in_place && (0..n).all(|k| reading(k) && !through[k]) {
@@ -2730,6 +2732,19 @@ impl Staging {
                     };
                     (digests[k], census[k]) = taken(bytes);
                     read += to - from;
+                }
+                // Pages are missing and what is there is nothing but
+                // zeros, or nothing is there at all: the texture is left
+                // as it is, on the host too. Its memory went, or has not
+                // come; so it was while such a texture was read whole
+                // ("nothing at all mapped changes nothing"), and a
+                // texture whose memory goes before other memory comes in
+                // its place kept its texels meanwhile.
+                if partial && (0..n).filter(|&k| reading(k)).all(|k| census[k].zero) {
+                    return;
+                }
+                if partial {
+                    PAGES_MISSING[1].fetch_add(1, Relaxed);
                 }
                 let levels = self.stage_keys(&digests, &is, held);
                 if levels != 0 {
@@ -3812,6 +3827,43 @@ mod remap_tests {
         }
         // SAFETY: the reservation above, released once.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A texture with pages missing whose memory holds nothing but zeros
+    /// where it is there is left as it is: nothing is staged for it and
+    /// its host copy keeps what it has. When bytes come, they go up.
+    #[test]
+    fn a_texture_partly_there_with_nothing_but_zeros_changes_nothing() {
+        use windows_sys::Win32::System::Memory::*;
+        const RUN: usize = 0x1_0000;
+        // The linear 256x256 texture of nine levels again, its first two
+        // runs there (the small levels, level 1 and the start of level 0).
+        // SAFETY: a private reservation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 6 * RUN, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: the first two runs of the reservation above.
+        assert!(!unsafe { VirtualAlloc(base, 2 * RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        super::blocks_remapped(base as usize, 6 * RUN);
+        let description = [3, 0, 0, 0, 256, 0, 256, 0x9_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(base as u64, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            super::unstage(resource);
+            super::staging(resource, host_texture)
+        });
+        if let Some(staging) = staged {
+            let any = || staging.staged.iter().any(|key| key.load(Relaxed) != 0);
+            staging.refresh();
+            assert!(!any(), "zeros where it is there, pages missing: nothing staged");
+            // SAFETY: the two runs committed above.
+            unsafe { std::ptr::write_bytes(base.cast::<u8>(), 0x5a, 2 * RUN) };
+            super::remapped(base as usize, 2 * RUN);
+            staging.refresh();
+            assert!(any(), "its bytes came");
+            assert!(staging.staged[usize::from(staging.place.part_of_level[1])].load(Relaxed) > 1);
+        }
+        // SAFETY: the reservation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+        super::blocks_remapped(base as usize, 6 * RUN);
     }
 
     /// Whether anything of a range is there: by what is kept of its 64 KiB
