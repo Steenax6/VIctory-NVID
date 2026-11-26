@@ -47,20 +47,26 @@
 //!   the title (it reuses its slots); their records are copied at the call,
 //!   and the copy stands for the handle (`descriptor::rtv_record` reads the
 //!   record by value).
-//! - Descriptor tables in shader-visible heaps, root constant, shader
-//!   resource and unordered access views by address, the constants the
-//!   layer copies for a draw and the views it makes at the draw
-//!   (`draw::State::bind`), indirect argument and count buffers, upload
-//!   memory the list handed out: the console's card reads all of it when the
-//!   list runs, after the submission. The title may not change it before its
-//!   fence behind the list says the list has run, and no such fence is set
-//!   before the list is translated and sent: reading it at translation is
-//!   between the call (where the old path read it) and the card's read. A
-//!   title that changed it between call and submission would be wrong on the
-//!   console and was read too early before; it is no worse now. Diagnostics:
-//!   `VICTORY_THIN_CHECK=1` compares, for every draw and dispatch, the first
-//!   bytes of each bound table and root view at the call and at translation
-//!   (the line "thin check").
+//! - Root constant, shader resource and unordered access views by address:
+//!   no path reads their bytes at the draw. `draw::root_view`, `root_uav`
+//!   and `root_srv_table` bind the buffer's host copy and refresh it when the
+//!   list is submitted (a constant buffer not on 256 bytes is filled into
+//!   upload memory then); `crate::memory::ready` only names the address. So
+//!   the bytes are the same as before whenever they change in between.
+//! - Descriptor tables in shader-visible heaps (their records are read at
+//!   the draw: the views `draw::State::bind` makes, the key of a fresh
+//!   table), indirect argument and count buffers, upload memory the list
+//!   handed out: the console's card reads all of it when the list runs,
+//!   after the submission. The title may not change it before its fence
+//!   behind the list says the list has run, and no such fence is set before
+//!   the list is translated and sent: reading it at translation is between
+//!   the call (where the old path read it) and the card's read. A title that
+//!   changed it between call and submission would be wrong on the console
+//!   and was read too early before. Diagnostics: `VICTORY_THIN_CHECK=1`
+//!   compares, for every draw and dispatch, the first 32 bytes of each bound
+//!   table at the call and at translation; a change is a draw the path in
+//!   the call would have made otherwise (the line "thin check"; root views
+//!   are counted apart, as no difference).
 //! - Waits for memory values and bottom-of-pipe writes: they cut and order
 //!   the list of ours as they did the title's (`super::cut`); the values are
 //!   looked at when the queue comes to them, as before.
@@ -245,7 +251,7 @@ impl Front {
             let mut w = Vec::new();
             for &address in self.roots[usize::from(compute)].iter().filter(|&&a| a != 0) {
                 w.push(address);
-                w.push(hash_at(address & !TABLE));
+                w.extend_from_slice(&words_at(address & !TABLE));
             }
             if !w.is_empty() {
                 self.put(CHECK, &w);
@@ -683,8 +689,9 @@ pub(crate) fn line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     if check() {
         tracing::info!(
-            "thin check (VICTORY_THIN_CHECK=1), per frame: {:.0} draws and dispatches checked, {:.2} of them read a table or root view \
-             whose first 32 bytes changed between the call and its translation ({:.2} tables, {:.2} root views)",
+            "thin check (VICTORY_THIN_CHECK=1), per frame: {:.0} draws and dispatches checked, {:.2} of them would have drawn otherwise \
+             in the call (a table's first descriptor changed between the call and the translation: {:.2} tables); root views changed \
+             {:.2} (read by both paths at the submission: no difference)",
             s[S_CHECKED],
             s[S_CHANGED],
             s[S_CHANGED_TABLES],
@@ -709,17 +716,19 @@ const ROOTS: usize = 16;
 #[cfg(feature = "diagnostics")]
 const TABLE: u64 = 1 << 63;
 
-/// A hash of the first 32 bytes at `address` (0 if they cannot be read):
-/// the first descriptor of a table, the first two vectors of constants of
-/// a view; what the draw reads for certain (the extent of a table is its
+/// The first 32 bytes at `address` (zeros if they cannot be read): the
+/// first descriptor of a table, the first two vectors of constants of a
+/// view; what the draw reads for certain (the extent of a table is its
 /// root signature's, and the bytes after it are the next draw's in a ring).
 #[cfg(feature = "diagnostics")]
-fn hash_at(address: u64) -> u64 {
-    let mut bytes = [0u8; 32];
-    if !crate::host::read_into(address as *const u8, &mut bytes) {
-        return 0;
+fn words_at(address: u64) -> [u64; 4] {
+    let mut words = [0u64; 4];
+    // SAFETY: the words are 32 plain bytes of ours.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), 32) };
+    if !crate::host::read_into(address as *const u8, bytes) {
+        return [0; 4];
     }
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    words
 }
 
 #[inline]
@@ -1118,21 +1127,35 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             #[cfg(feature = "diagnostics")]
             CHECK => {
                 STATS[S_CHECKED].fetch_add(1, Relaxed);
+                // A table's descriptors are read at the draw by the path in
+                // the call (`draw::State::bind`: the views it makes, the key
+                // of a fresh table): a change there is a difference. A root
+                // view's bytes are read by both paths only when the list is
+                // submitted (`draw::root_view`, `root_uav`,
+                // `root_srv_table`: a refresh of the host copy or a fill at
+                // submission): a change between call and translation is
+                // none, and is counted apart.
                 let mut changed = false;
-                for pair in w.chunks_exact(2) {
-                    if hash_at(pair[0] & !TABLE) != pair[1] {
-                        changed = true;
-                        // The first few, to find out what they are.
-                        static NAMED: AtomicU64 = AtomicU64::new(0);
-                        if NAMED.fetch_add(1, Relaxed) < 16 {
-                            tracing::info!(
-                                address = format_args!("{:#x}", pair[0] & !TABLE),
-                                table = pair[0] & TABLE != 0,
-                                buffer = ?crate::shadow::find_any(pair[0] & !TABLE, 32).is_some(),
-                                "thin check: what a draw reads changed between its call and its translation"
-                            );
-                        }
-                        STATS[if pair[0] & TABLE != 0 { S_CHANGED_TABLES } else { S_CHANGED_VIEWS }].fetch_add(1, Relaxed);
+                for entry in w.chunks_exact(5) {
+                    let table = entry[0] & TABLE != 0;
+                    let address = entry[0] & !TABLE;
+                    let now = words_at(address);
+                    if now[..] == entry[1..] {
+                        continue;
+                    }
+                    changed |= table;
+                    STATS[if table { S_CHANGED_TABLES } else { S_CHANGED_VIEWS }].fetch_add(1, Relaxed);
+                    // The first few of each, to find out what they are.
+                    static NAMED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+                    if NAMED[usize::from(table)].fetch_add(1, Relaxed) < if table { 16 } else { 4 } {
+                        tracing::info!(
+                            address = format_args!("{address:#x}"),
+                            table,
+                            buffer = crate::shadow::find_any(address, 32).is_some(),
+                            at_call = format_args!("{:x?}", &entry[1..]),
+                            at_translation = format_args!("{now:x?}"),
+                            "thin check: what a draw reads changed between its call and its translation"
+                        );
                     }
                 }
                 if changed {
