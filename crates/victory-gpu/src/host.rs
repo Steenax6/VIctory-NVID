@@ -442,11 +442,31 @@ pub(crate) fn removal_context() -> String {
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !trail_on() || SAID.swap(true, Ordering::Relaxed) {
+    if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
         return;
     }
-    tracing::error!("when the host device went: {}", removal_context());
+    if trail_on() {
+        tracing::error!("when the host device went: {}", removal_context());
+    }
+    // With device-removed data on: the runtime's data too, unless a
+    // submission's own report has asked for it already. Only the places
+    // that wait for a submission asked; a removal found anywhere else (a
+    // view being made, a tile mapped) said none of it. Without the lookups
+    // in our own tables: whoever calls may hold their locks.
+    if dred_any()
+        && !DATA_SAID.load(Ordering::Relaxed)
+        && let Some(host) = host()
+    {
+        tracing::error!(
+            "device-removed data, asked where the removal was found{}",
+            host.removal_data_of(&[], false)
+        );
+    }
 }
+
+/// Whether [`Host::removal_data`] was asked for (once is enough for
+/// [`log_removal_context`]).
+static DATA_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -693,13 +713,23 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
+        if dred_any() {
+            let mode = dred_mode();
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                // `faults`: no breadcrumbs, only the faulting address.
+                if mode != Dred::Faults {
+                    dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                tracing::info!("device-removed data on: {}", mode.text());
+            } else {
+                tracing::warn!(
+                    "device-removed data was asked for ({}) and the runtime gave no settings for it: none will be kept",
+                    mode.text()
+                );
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -1391,14 +1421,71 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
-pub(crate) fn dred_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+/// The forms of device-removed data (`VICTORY_D3D12_DRED`, diagnostics
+/// builds). The full form costs about 28 ms a frame here (2026-11-25), so
+/// no long run carried it; the two others are meant for long runs. What
+/// they cost is not measured yet (fxceless/victory-fork 4cc775f57, a port of
+/// avatarmanz/VIctory-7900XTX 8a8ad35).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dred {
+    /// Not set.
+    Off,
+    /// Any value but the two below (`1`): breadcrumbs, the faulting
+    /// address, and a marker with its text before every noted command (the
+    /// report's "a list stopped at command N" says what that command ran).
+    Full,
+    /// `light`: breadcrumbs and the faulting address, no marker and no
+    /// text: the report says which list stopped at which command, and the
+    /// pipelines that list binds.
+    Light,
+    /// `faults`: the faulting address only (no breadcrumbs, so the runtime
+    /// adds nothing to the lists' commands).
+    Faults,
+}
+
+impl Dred {
+    /// For the log.
+    fn text(self) -> &'static str {
+        match self {
+            Dred::Off => "off",
+            Dred::Full => "full: breadcrumbs, page faults, a marker text per command",
+            Dred::Light => "light: breadcrumbs and page faults, no marker texts",
+            Dred::Faults => "faults: page faults only, no breadcrumbs",
+        }
+    }
+}
+
+/// The form of device-removed data asked for.
+pub(crate) fn dred_mode() -> Dred {
+    static MODE: OnceLock<Dred> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return Dred::Off;
+        }
+        match std::env::var_os("VICTORY_D3D12_DRED") {
+            None => Dred::Off,
+            Some(v) if v == "light" => Dred::Light,
+            Some(v) if v == "faults" => Dred::Faults,
+            Some(_) => Dred::Full,
+        }
     })
 }
+
+/// Whether device-removed data is on in its full form, the one in which
+/// every noted command gets a marker and a text (`HostList::note_op`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dred_on() -> bool {
+    dred_mode() == Dred::Full
+}
+
+/// Whether device-removed data is on in any form ([`Dred`]).
+pub(crate) fn dred_any() -> bool {
+    dred_mode() != Dred::Off
+}
+
+/// Host objects named since the start ([`name`]): one text and one
+/// `SetName` call each.
+static NAMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Indirect mesh dispatches since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
@@ -1459,11 +1546,18 @@ pub(crate) fn timing_on() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on, in any
+/// of its forms: the names are what a faulting address is read by).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
-    if dred_on()
+    if dred_any()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
+        // Counted, so that a log says what naming costs. Said at 4,096 and
+        // at every doubling after it.
+        let named = NAMED.fetch_add(1, Ordering::Relaxed) + 1;
+        if named >= 4096 && named.is_power_of_two() {
+            tracing::info!("device-removed data: {named} host objects named so far");
+        }
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
     }
@@ -6386,20 +6480,60 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        self.removal_data_of(runs, true)
+    }
+
+    /// [`Host::removal_data`]; `tables`: whether a faulting address is also
+    /// looked up in our own tables (title memory copies, view heaps), which
+    /// takes their locks.
+    ///
+    /// With the data on ([`Dred`]) the report says each of its parts
+    /// whatever the runtime answered: why the device went, the page fault
+    /// (an address, none reported, or the call failed) and the breadcrumbs
+    /// (how many lists came back, none after asking again, or the call
+    /// failed), so that a report without a fault or breadcrumbs says
+    /// whether the runtime was asked in vain.
+    fn removal_data_of(&self, runs: &[&HostList], tables: bool) -> String {
+        DATA_SAID.store(true, Ordering::Relaxed);
+        let said = dred_any();
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
+            return if said {
+                "; device-removed data: this device has no interface for it".to_owned()
+            } else {
+                String::new()
+            };
         };
         let mut text = String::new();
         let mut fault_va = None;
+        if said {
+            // SAFETY: a plain query.
+            let reason = match unsafe { self.device.GetDeviceRemovedReason() } {
+                Ok(()) => "none, the device is not removed".to_owned(),
+                Err(e) => format!("{:#010X}", e.code().0),
+            };
+            text.push_str(&format!(
+                "; device-removed data ({}): removal reason {reason}; {} host objects named",
+                dred_mode().text(),
+                NAMED.load(Ordering::Relaxed)
+            ));
+        }
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
         unsafe {
-            if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            let fault = dred.GetPageFaultAllocationOutput1();
+            // Said either way: no address, or no answer at all.
+            match &fault {
+                Ok(f) if said && f.PageFaultVA == 0 => text.push_str("; page fault: no fault address reported"),
+                Err(e) if said => text.push_str(&format!("; page fault: the call failed ({e})")),
+                _ => {}
+            }
+            if let Ok(fault) = fault
                 && fault.PageFaultVA != 0
             {
                 let va = fault.PageFaultVA;
                 fault_va = Some(va);
                 text.push_str(&format!("; page fault at {va:#x}"));
+                let mut found = 0;
                 for (what, head) in [
                     ("inside", fault.pHeadExistingAllocationNode),
                     ("inside freed", fault.pHeadRecentFreedAllocationNode),
@@ -6418,21 +6552,42 @@ impl Host {
                         node = n.pNext;
                     }
                     if !names.is_empty() {
+                        found += names.len();
                         text.push_str(&format!("; {what} {names:?}"));
                     }
                 }
-                text.push_str(&crate::shadow::near(va));
-                text.push_str(&crate::descriptor::host::near_heaps(va));
+                if found == 0 {
+                    text.push_str("; inside no allocation the runtime lists, alive or freed lately");
+                }
+                if tables {
+                    text.push_str(&crate::shadow::near(va));
+                    text.push_str(&crate::descriptor::host::near_heaps(va));
+                }
+            }
+            // `faults` keeps no breadcrumbs: none are asked for.
+            if dred_mode() == Dred::Faults {
+                text.push_str("; breadcrumbs: not kept in this form");
+                return text;
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
-            let crumbs = match dred.GetAutoBreadcrumbsOutput() {
+            let mut crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&format!("; no breadcrumbs (the call failed: {e})"));
                     return text;
                 }
             };
+            // An empty answer right after the removal (fxceless run 277) is
+            // asked again for half a second before it is believed.
+            let mut asked = 0u32;
+            while said && crumbs.pHeadAutoBreadcrumbNode.is_null() && asked < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                asked += 1;
+                if let Ok(again) = dred.GetAutoBreadcrumbsOutput() {
+                    crumbs = again;
+                }
+            }
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
@@ -6442,6 +6597,14 @@ impl Host {
                 let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
+            }
+            if said {
+                let again = if asked > 0 { format!(", asked {asked} more times over {} ms", asked * 50) } else { String::new() };
+                if progress.is_empty() {
+                    text.push_str(&format!("; breadcrumbs: the runtime returned none (nodes 0{again})"));
+                } else {
+                    text.push_str(&format!("; breadcrumbs: data returned (nodes {}{again})", progress.len()));
+                }
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
             let mut plain = crumbs.pHeadAutoBreadcrumbNode;
@@ -6477,7 +6640,12 @@ impl Host {
                     let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
+                    }
+                    // A list that never started; and in `light`, where no
+                    // marker says what a command ran, every stopped list.
+                    if (done == 0 || dred_mode() == Dred::Light)
+                        && let Some(r) = run
+                    {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }

@@ -170,7 +170,8 @@ these are an NVIDIA card's.
 |---|---|
 | `VICTORY_CAPTURE=<dir>` + `VICTORY_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight (diagnostics build; about 28 ms a frame here) |
+| `VICTORY_D3D12_DRED=light` / `=faults` | cheaper forms for long runs (diagnostics build; their cost is not measured yet): `light` keeps the breadcrumbs (which list stopped at which command, the pipelines it binds) without a marker text per command; `faults` keeps only the faulting address and the allocations named there. The report says the removal reason and whether the runtime gave a fault address and breadcrumbs |
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built (objects can go missing meanwhile) |
 | `VICTORY_TABLED_SKIP_FRAMES=off` | upstream's 240-frame window for table-read descriptor slots; steenax uses 2 frames, since the window crashed at world entry (upstream pull request #827) |
 | `VICTORY_BACK_RUN_GAP=0` | every run of a copy-back is a write of its own; by default runs under 64 bytes apart are one write (upstream pull request #857) |
