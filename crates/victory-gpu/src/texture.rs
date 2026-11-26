@@ -1525,12 +1525,31 @@ pub(crate) fn decide_uploads(uploads: &[TextureUpload]) -> Vec<Copies> {
         let by_level = &crate::census::BY_LEVEL;
         if subs == 0 {
             by_level[crate::census::L_NONE].fetch_add(1, Relaxed);
-            continue;
+        } else {
+            by_level[crate::census::L_SOME].fetch_add(1, Relaxed);
+            by_level[crate::census::L_COPIED].fetch_add(staging.bytes_of(subs), Relaxed);
+            staging.mark_sent(sent, subs);
+            copies.push((upload.copy.clone(), staging.clone(), subs));
         }
-        by_level[crate::census::L_SOME].fetch_add(1, Relaxed);
-        by_level[crate::census::L_COPIED].fetch_add(staging.bytes_of(subs), Relaxed);
-        staging.mark_sent(sent, subs);
-        copies.push((upload.copy.clone(), staging.clone(), subs));
+        // What a view may show of the texture and the host copy holds
+        // nothing for, neither the title's bytes nor the card's: counted,
+        // and the first of them said.
+        let bare = staging.bare(sent) & !upload.copy.card.subs.load(Relaxed);
+        if bare != 0 {
+            by_level[crate::census::L_BARE].fetch_add(u64::from(bare.count_ones()), Relaxed);
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if SAID.fetch_add(1, Relaxed) < 8 {
+                tracing::warn!(
+                    memory = ?staging.memory,
+                    bytes = staging.layout.size,
+                    levels = staging.mips,
+                    subresources = format_args!("{bare:#x}"),
+                    by_the_pass = staging.picked.load(Relaxed) != 0,
+                    "an upload was decided and levels a view may show hold nothing on the host, neither the title's bytes \
+                     nor the card's, though other levels of the texture were brought"
+                );
+            }
+        }
     }
     copies
 }
@@ -2845,6 +2864,29 @@ impl Staging {
                 sent.1[k].store(self.asked.load(std::sync::atomic::Ordering::SeqCst), Relaxed);
             }
         }
+    }
+
+    /// The subresources a view of the texture may show for which the host
+    /// copy (`sent`) holds nothing an upload brought, a bit each: for the
+    /// count of them (`crate::census::L_BARE`). A view may show every
+    /// level of a texture a draw reads through a table, and those from the
+    /// first one viewed of one the pass uploads. Not asked of a texture
+    /// made level by level, whose views stop at the levels with memory.
+    fn bare(&self, sent: &Sent) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        // (Nor of one nothing was ever read of: it is zeros all over.)
+        if self.on_demand || (sent.none() && self.staged.iter().all(|key| key.load(Relaxed) == 0)) {
+            return 0;
+        }
+        let first = if self.placed && self.picked.load(Relaxed) != 0 { self.judged[0].load(Relaxed) } else { 0 };
+        let shown = u32::MAX.checked_shl(first.min(32) as u32).unwrap_or(0);
+        let mut levels = 0u32;
+        for (k, &of_part) in self.place.levels_of_part.iter().enumerate().take(crate::census::PARTS) {
+            if sent.key(k) == 0 {
+                levels |= of_part & shown;
+            }
+        }
+        if levels == 0 { 0 } else { self.subresources(levels) }
     }
 
     /// The bytes of the staging buffer the subresources `subs` take.

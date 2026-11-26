@@ -231,6 +231,13 @@ not the game's is not read at all, and one whose pages are not there is
 zeros on the host, once. "texture uploads level by level" has the
 megabytes read, not read for either reason, detiled, not detiled because
 the host copy held them, and copied, and the uploads that copied nothing.
+It also has what would show a level gone black: the levels that went up as
+zeros because nothing of them was there and how many of those got their
+bytes since (a level with only some pages there takes the bytes that are
+there), and the times a level a view may show was left with nothing on the
+host when an upload was decided though other levels of its texture were
+brought (0: none may be; the first eight are said in a warning with the
+texture's memory).
 The megabytes in "texture uploads by reason" are those read.
 
 Whether a write would have been known without the read is counted too, to

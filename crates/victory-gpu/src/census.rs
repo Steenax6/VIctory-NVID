@@ -250,7 +250,9 @@ pub(crate) static FLAGS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// bytes read through the kernel of parts with some pages there and some
 /// not; parts that went up as zeros because none of their pages was there,
 /// and those of them that got their bytes (or the card's) since: the
-/// difference is levels a view may show that are zeros on the host.
+/// difference is levels a view may show that are zeros on the host; and
+/// subresources a view may show for which, at an upload's decision, the
+/// host copy held nothing an upload or the card brought.
 pub(crate) const L_DETILED: usize = 0;
 pub(crate) const L_WITH_COPY: usize = 1;
 pub(crate) const L_COPIED: usize = 2;
@@ -264,8 +266,9 @@ pub(crate) const L_OUT: usize = 9;
 pub(crate) const L_PARTLY: usize = 10;
 pub(crate) const L_ZERO_PARTS: usize = 11;
 pub(crate) const L_ZERO_FILLED: usize = 12;
+pub(crate) const L_BARE: usize = 13;
 /// Since the start.
-pub(crate) static BY_LEVEL: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+pub(crate) static BY_LEVEL: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
 /// The parts of the pass ([`PASS_US`]): taking what was told since the
 /// last pass; the queue's order; looks at uploaded textures (their
@@ -538,14 +541,15 @@ pub(crate) fn lines(frames: f64) {
         d[2],
         d[3]
     );
-    let l: [u64; 13] = std::array::from_fn(|k| BY_LEVEL[k].load(Relaxed));
+    let l: [u64; 14] = std::array::from_fn(|k| BY_LEVEL[k].load(Relaxed));
     tracing::info!(
         "texture uploads level by level, since the start (the pass's and those of textures read through tables): {} MB \
          of title memory read, {} MB not read because it is not the title's (levels above the first one viewed, where \
          another texture starts), {} MB not read because its pages are not there ({} MB of staging zeroed for those), \
          {} MB not read because the host copy is made without those levels, {} MB read through the kernel of levels \
          only partly there; {} levels went up as zeros because nothing of them was there, {} of them got their bytes \
-         since; {} \
+         since; {} times a level a view may show was left with nothing on the host at an upload's decision though \
+         other levels of its texture were brought (0: none may be); {} \
          uploads decided with levels to copy, {} with none (the host copy held every level as its memory is); {} MB \
          detiled into staging, {} MB of levels not detiled because the host copy held them, {} MB copied to the card",
         mb(l[L_READ]),
@@ -556,6 +560,7 @@ pub(crate) fn lines(frames: f64) {
         mb(l[L_PARTLY]),
         l[L_ZERO_PARTS],
         l[L_ZERO_FILLED],
+        l[L_BARE],
         l[L_SOME],
         l[L_NONE],
         mb(l[L_DETILED]),
