@@ -909,6 +909,16 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // Said once, for whoever weighs card memory the CPU maps (GPU upload
+        // heaps) for the copies of title buffers: the layer makes none. A
+        // runtime that does not know the question says so by failing it.
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let asked = device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32);
+        tracing::info!(
+            known = asked.is_ok(),
+            offered = asked.is_ok() && o16.GPUUploadHeapSupported.as_bool(),
+            "the card's memory mapped by the CPU (GPU upload heaps); the layer uses none"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -2748,7 +2758,10 @@ fn fine_runs(plans: &[(u64, &CardPlan)], differs: &[u32], noted: Option<&crate::
         for r in &plan.ranges {
             let copy = Arc::as_ptr(&r.shadow) as usize;
             for p in 0..r.span.pieces {
-                *masks.entry((copy, r.span.first + p)).or_default() |= range_piece_mask(r, p, differs);
+                let mask = range_piece_mask(r, p, differs);
+                #[cfg(feature = "diagnostics")]
+                r.shadow.census_flagged(number, r.span.first + p, mask);
+                *masks.entry((copy, r.span.first + p)).or_default() |= mask;
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
@@ -3115,24 +3128,174 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         if line.written.is_empty() {
             return None;
         }
-        line.written.clone()
+        (line.written.clone(), late_copied(&line))
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written.0, &written.1, runs, true)
+}
+
+/// The destinations of the title buffer copies that flights in the air
+/// have left to their landing ([`copy_goes_late`]), as (address, end): the
+/// bytes there are the ones from before until the flight lands.
+fn late_copied(line: &Line) -> Vec<(usize, usize)> {
+    line.line
+        .iter()
+        .filter_map(|item| match item {
+            Late::Run(flight) => Some(flight),
+            _ => None,
+        })
+        .flat_map(|flight| flight.copies.iter().map(|&(dst, _, len)| (dst, dst.saturating_add(len))))
+        .collect()
+}
+
+/// What a step does with title memory when its submission is prepared, as
+/// far as the order of a title buffer copy left to the landing goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Touch {
+    /// A buffer copy of the title's: destination, source, bytes.
+    Copy(usize, usize, usize),
+    /// Reads or names `[.0, .1)`: a refresh of a host copy, a fill of
+    /// upload memory, a texture's bytes, a range given to shaders.
+    Range(usize, usize),
+    /// A step of the title's own that may read or write anything.
+    Any,
+    /// Nothing of the title's memory.
+    Nothing,
+}
+
+fn touch(step: &Step) -> Touch {
+    match step {
+        &Step::Copy(dst, src, len) => Touch::Copy(dst, src, len),
+        &Step::Fill(_, src, len) => Touch::Range(src, src.saturating_add(len)),
+        Step::Refresh(_, address, len) | Step::GpuWrite(_, address, len) => Touch::Range(*address, address.saturating_add(*len)),
+        Step::Texture(staging) => {
+            let (at, len) = staging.memory();
+            Touch::Range(at, at.saturating_add(len))
+        }
+        Step::Run(_) => Touch::Any,
+        Step::Host(_) => Touch::Nothing,
+    }
+}
+
+/// Of a submission's steps in order, the title buffer copies that are left
+/// to its landing: those `goes` says read what flights may write
+/// ([`copy_goes_late`]) and whose destination no step recorded after them
+/// touches. A copy left to the landing puts its bytes there only then; a
+/// refresh, a fill, a texture or another copy recorded behind it that
+/// reads its destination at the submission would take the bytes from
+/// before it, a later copy or shader write into it would be overwritten by
+/// it at the landing (Marvisak/VIctory pull request 2810 chains such steps
+/// behind the copy; here the copy is then made at the submission, behind a
+/// wait for the flights its source needs, as every such copy was before
+/// `VICTORY_LATE_COPY`).
+fn late_among(steps: &[Touch], goes: impl Fn(usize, usize, usize) -> bool) -> Vec<(usize, usize, usize)> {
+    let mut late = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        let &Touch::Copy(dst, src, len) = step else {
+            continue;
+        };
+        if !goes(dst, src, len) {
+            continue;
+        }
+        let end = dst.saturating_add(len);
+        let over = |a: usize, b: usize| a < end && dst < b;
+        let touched = steps.get(i + 1..).unwrap_or(&[]).iter().any(|later| match *later {
+            Touch::Copy(d, s, n) => over(d, d.saturating_add(n)) || over(s, s.saturating_add(n)),
+            Touch::Range(a, b) => over(a, b),
+            Touch::Any => true,
+            Touch::Nothing => false,
+        });
+        if touched {
+            LATE_COPIES[2].fetch_add(1, Ordering::Relaxed);
+        } else {
+            late.push((dst, src, len));
+        }
+    }
+    late
+}
+
+/// Whether a title buffer copy left to its submission's landing keeps its
+/// place in the order of what reads and writes its destination
+/// (`VICTORY_LATE_COPY_ORDER=0`: it does not, as before; on by default).
+///
+/// Left to the landing, the copy's bytes reach title memory only then. A
+/// step of the same submission recorded behind it that reads its
+/// destination (a refresh of a host copy, a fill, a texture, another copy)
+/// took the bytes from before, and so did such a step of a later
+/// submission prepared before the landing; a later copy or shader write
+/// into the destination was overwritten by it at the landing. Now such a
+/// copy is made at its submission, behind the wait for the flights its
+/// source needs, when a later step of the submission touches its
+/// destination ([`late_among`]); and a later submission that reads where a
+/// flight's copy is still to land waits for that landing ([`blocked_by`]).
+/// Both are waits that `VICTORY_LATE_COPY` had taken away (20 to 30 ms
+/// each in the intro, then): the frame-rate line "title buffer copies out
+/// of memory shaders write" counts them, and the switch is there to
+/// measure what the order costs. Refreshes name wide ranges (a root view
+/// reads to its copy's end, the pass over picked buffer views a copy's
+/// whole span), so a step can touch the destination and read nothing of
+/// it: copying on the card, in the list's order, would need neither wait.
+fn late_order() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_COPY_ORDER").is_none_or(|v| v != "0"))
+}
+
+/// The title buffer copies of `runs` that are left to the submission's
+/// landing ([`late_among`]), by what the flights in the air may write.
+fn late_copies(written: &[(usize, usize)], runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
+    let goes = |dst, src, len| copy_goes_late(written, dst, src, len);
+    // Most submissions have no such copy: nothing is gathered for them.
+    let any = runs
+        .iter()
+        .any(|list| list.deferred().copies.iter().any(|step| matches!(*step, Step::Copy(dst, src, len) if goes(dst, src, len))));
+    if !any {
+        return Vec::new();
+    }
+    let mut steps: Vec<Touch> = Vec::new();
+    for list in runs {
+        steps.extend(list.deferred().copies.iter().map(touch));
+    }
+    if !late_order() {
+        // Every such copy, whatever is recorded behind it.
+        return steps
+            .iter()
+            .filter_map(|step| match *step {
+                Touch::Copy(dst, src, len) if goes(dst, src, len) => Some((dst, src, len)),
+                _ => None,
+            })
+            .collect();
+    }
+    late_among(&steps, goes)
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by(written: &[(usize, usize)], copied: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
+    // The copies of this submission that are left to its landing, and
+    // whether a step reads where a flight in the air has left one of its
+    // own (`copied`): there the bytes are known to be the ones from
+    // before, so nothing reads them ahead.
+    let mut late = late_copies(written, runs);
+    let waits = |at: usize, len: usize| {
+        let waits = late_order() && touches(copied, at, at.saturating_add(len));
+        if waits && count {
+            LATE_COPIES[3].fetch_add(1, Ordering::Relaxed);
+        }
+        waits
+    };
     for list in runs {
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if copy_goes_late(written, dst, src, len) {
+                    if let Some(at) = late.iter().position(|c| *c == (dst, src, len)) {
+                        late.swap_remove(at);
                         continue;
+                    }
+                    if waits(src, len) {
+                        return Some(WHY_READ);
                     }
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         // A copy that only READS where flights may write is
@@ -3157,6 +3320,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len) => {
+                    if waits(src, len) {
+                        return Some(WHY_READ);
+                    }
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
@@ -3184,7 +3350,15 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                // A refresh of what flights' shaders may write is not
+                // waited for (`stale_under_flights`); one of bytes a
+                // flight's copy will put there at its landing is.
+                Step::Refresh(_, address, len) => {
+                    if waits(*address, *len) {
+                        return Some(WHY_READ);
+                    }
+                }
+                Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
@@ -3466,7 +3640,13 @@ fn copy_goes_late(written: &[(usize, usize)], dst: usize, src: usize, len: usize
 
 /// Since the last frame-rate line: title buffer copies left to their
 /// submission's landing ([`copy_goes_late`]), and their bytes.
-static LATE_COPIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+///
+/// Then: copies that would have been left to the landing and were made at
+/// the submission because a later step of it touches their destination
+/// ([`late_among`]; counted at every look, so more than once a copy), and
+/// steps of later submissions that waited for a landing because they read
+/// where a flight's copy was still to land ([`blocked_by`]).
+static LATE_COPIES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// A copy left to its submission's landing ([`copy_goes_late`]), now.
 fn late_copy(dst: usize, src: usize, len: usize) {
@@ -3476,6 +3656,8 @@ fn late_copy(dst: usize, src: usize, len: usize) {
     }
     LATE_COPIES[0].fetch_add(1, Ordering::Relaxed);
     LATE_COPIES[1].fetch_add(len as u64, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::buffers::cpu_read(src, len);
     // As a shader's write that lands: reads of the destination ahead of it
     // are checked against it, and its guards are opened.
     shaders_write(dst, &new);
@@ -3483,6 +3665,207 @@ fn late_copy(dst: usize, src: usize, len: usize) {
     write_mapped(dst as *mut u8, new.as_ptr(), len);
     // Numbered for the texture pass once the bytes are there.
     crate::descriptor::host::title_copied(dst, len);
+}
+
+/// Title buffer copies recorded behind a write of their own submission's
+/// shaders, counted and looked at: an order this layer does not keep.
+///
+/// A copy is made on the CPU when its submission is prepared, before any
+/// of its lists runs. Recorded behind a dispatch whose shaders write its
+/// source, it takes the bytes from before they ran; recorded behind one
+/// whose shaders write its destination, their bytes land over the copy's
+/// with the copy-back, where the list's order has the copy over them.
+/// (Against flights in the air the order is kept: [`blocked_by`],
+/// [`copy_goes_late`], [`late_among`].)
+///
+/// Marvisak/VIctory pull request 2810 leaves such a copy until its
+/// submission's copy-backs are done, by the ranges declared. Here a
+/// declaration says what shaders may write, not what they do (the title
+/// has an unordered view over the whole of its 174 MB buffer), and a copy
+/// left to its landing makes the later submissions that read its
+/// destination wait for it ([`late_order`]). So the numbers come first:
+/// how many copies a frame are made behind such a declaration, out of the
+/// range and into it; and of how many of them the source and the
+/// destination no longer hold the same bytes once their submission's
+/// copy-back is done. Those are the copies that went wrong, and with them
+/// the ones the title, a later copy's landing or a shader recorded behind
+/// the copy wrote under since: an upper bound.
+mod copy_order {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+    /// Since the last frame line: copies made out of a declared range;
+    /// into one; looked at when their submission's copy-back was done; of
+    /// those, the ones whose two sides differed.
+    static COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    /// The copies still to be looked at: submission, destination, source,
+    /// bytes.
+    static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+    /// How many `MADE` holds (read without the lock: nearly always none).
+    static WAITING: AtomicUsize = AtomicUsize::new(0);
+    /// Kept at most, and compared of each at most.
+    const MOST: usize = 256;
+    const MOST_BYTES: usize = 64 << 10;
+
+    type Made = (u64, usize, usize, usize);
+
+    fn over(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// Notes a range a submission's shaders are declared to write among
+    /// those declared so far (address, end).
+    pub(super) fn declare(declared: &mut Vec<(usize, usize)>, address: usize, len: usize) {
+        let range = (address, address.saturating_add(len));
+        // The same few ranges, dispatch after dispatch.
+        if range.0 < range.1 && !declared.iter().rev().take(64).any(|w| w.0 <= range.0 && range.1 <= w.1) {
+            declared.push(range);
+        }
+    }
+
+    /// Whether a copy of `len` bytes from `src` to `dst` reads ([0]) or
+    /// writes ([1]) a range in `declared`.
+    pub(super) fn behind(declared: &[(usize, usize)], dst: usize, src: usize, len: usize) -> [bool; 2] {
+        let hit = |at: usize| len > 0 && declared.iter().any(|w| w.0 < at.saturating_add(len) && at < w.1);
+        [hit(src), hit(dst)]
+    }
+
+    /// `made` without the copies a write of `len` bytes at `dst` reaches:
+    /// their sides differ by that write from here on, whatever shaders did.
+    fn written_over(made: &mut Vec<Made>, dst: usize, len: usize) {
+        made.retain(|&(_, d, s, n)| !over(d, n, dst, len) && !over(s, n, dst, len));
+    }
+
+    /// The copies of `made` whose submission is `upto` or one before it,
+    /// taken out of it.
+    fn take_landed(made: &mut Vec<Made>, upto: u64) -> Vec<Made> {
+        let mut due = Vec::new();
+        made.retain(|copy| {
+            let landed = copy.0 <= upto;
+            if landed {
+                due.push(*copy);
+            }
+            !landed
+        });
+        due
+    }
+
+    /// Whether the two sides of a copy hold the same bytes now (the first
+    /// [`MOST_BYTES`] of them); `None`: one of them is not there to read.
+    fn same(dst: usize, src: usize, len: usize) -> Option<bool> {
+        let n = len.min(MOST_BYTES);
+        let (mut from, mut to) = (vec![0u8; n], vec![0u8; n]);
+        (super::read_into(src as *const u8, &mut from) && super::read_into(dst as *const u8, &mut to)).then(|| from == to)
+    }
+
+    /// A copy of submission `submission` is made now, with `declared` what
+    /// the steps before it declared.
+    pub(super) fn made(declared: &[(usize, usize)], submission: u64, dst: usize, src: usize, len: usize) {
+        let [out_of, into] = if declared.is_empty() { [false; 2] } else { behind(declared, dst, src, len) };
+        if !(out_of || into) && WAITING.load(Relaxed) == 0 {
+            return;
+        }
+        COUNT[0].fetch_add(u64::from(out_of), Relaxed);
+        COUNT[1].fetch_add(u64::from(into), Relaxed);
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        written_over(&mut made, dst, len);
+        // (A copy that overlaps itself has two sides that differ anyway.)
+        if (out_of || into) && made.len() < MOST && !over(dst, len, src, len) {
+            made.push((submission, dst, src, len));
+        }
+        WAITING.store(made.len(), Relaxed);
+    }
+
+    /// The copy-backs of the submissions up to `upto` are done, and nothing
+    /// of them has been told to the title yet.
+    pub(super) fn landed(upto: u64) {
+        if WAITING.load(Relaxed) == 0 {
+            return;
+        }
+        let due = {
+            let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+            let due = take_landed(&mut made, upto);
+            WAITING.store(made.len(), Relaxed);
+            due
+        };
+        for (_, dst, src, len) in due {
+            if let Some(same) = same(dst, src, len) {
+                COUNT[2].fetch_add(1, Relaxed);
+                COUNT[3].fetch_add(u64::from(!same), Relaxed);
+            }
+        }
+    }
+
+    /// With the frame line.
+    pub(super) fn line(frames: f64) {
+        let [out_of, into, looked, differed] = [0, 1, 2, 3].map(|i| COUNT[i].swap(0, Relaxed));
+        if out_of == 0 && into == 0 && looked == 0 {
+            return;
+        }
+        tracing::info!(
+            "title buffer copies made at their submission behind a range its shaders are declared to write before them: \
+             {:.1} a frame out of such a range, {:.1} into one (the copy is made before the shaders run, an order not kept: \
+             Marvisak/VIctory pull request 2810); looked at once the copy-back was done: {looked}, of them {differed} whose \
+             source and destination no longer held the same bytes",
+            out_of as f64 / frames,
+            into as f64 / frames
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Made, behind, declare, same, take_landed, written_over};
+
+        /// What shaders are declared to write is kept once, and a copy is
+        /// behind it by its source, by its destination, or not at all.
+        #[test]
+        fn a_copy_is_behind_a_declared_range_by_either_side() {
+            let mut declared = Vec::new();
+            declare(&mut declared, 0x1000, 0x1000);
+            declare(&mut declared, 0x1800, 0x100);
+            declare(&mut declared, 0x9000, 0);
+            declare(&mut declared, 0x4000, 0x10);
+            assert_eq!(declared, [(0x1000, 0x2000), (0x4000, 0x4010)]);
+            // (destination, source, bytes)
+            assert_eq!(behind(&declared, 0x8000, 0x1ff0, 0x20), [true, false]);
+            assert_eq!(behind(&declared, 0x400f, 0x8000, 0x20), [false, true]);
+            assert_eq!(behind(&declared, 0x1000, 0x4000, 0x10), [true, true]);
+            // Next to a range is not in it, and nothing is copied by none.
+            assert_eq!(behind(&declared, 0x2000, 0x0ff0, 0x10), [false, false]);
+            assert_eq!(behind(&declared, 0x1000, 0x1000, 0), [false, false]);
+            assert_eq!(behind(&[], 0x1000, 0x1000, 0x10), [false, false]);
+            // Ranges that are nonsense do not panic.
+            declare(&mut declared, usize::MAX - 4, usize::MAX);
+            assert_eq!(behind(&declared, usize::MAX - 2, 0, usize::MAX), [true, true]);
+        }
+
+        /// A copy is looked at when its submission has landed, unless a
+        /// later copy wrote over one of its sides; then its two sides say
+        /// whether anything changed under it.
+        #[test]
+        fn a_copy_is_looked_at_once_its_submission_has_landed() {
+            let mut made: Vec<Made> = vec![(3, 0x1000, 0x5000, 0x100), (4, 0x2000, 0x6000, 0x100), (5, 0x3000, 0x7000, 0x100)];
+            // A write over the second one's source, and one next to the
+            // first one's destination.
+            written_over(&mut made, 0x60ff, 0x10);
+            written_over(&mut made, 0x1100, 0x100);
+            assert_eq!(made, [(3, 0x1000, 0x5000, 0x100), (5, 0x3000, 0x7000, 0x100)]);
+            assert!(take_landed(&mut made, 2).is_empty());
+            assert_eq!(take_landed(&mut made, 4), [(3, 0x1000, 0x5000, 0x100)]);
+            assert_eq!(made, [(5, 0x3000, 0x7000, 0x100)]);
+            // The two sides, as they are in memory.
+            let from = vec![7u8; 4096];
+            let mut to = from.clone();
+            let (src, dst) = (from.as_ptr() as usize, to.as_ptr() as usize);
+            assert_eq!(same(dst, src, 4096), Some(true));
+            to[4095] = 8;
+            let dst = to.as_ptr() as usize;
+            assert_eq!(same(dst, src, 4096), Some(false));
+            assert_eq!(same(dst, src, 4095), Some(true));
+            // Memory that is not there says nothing.
+            assert_eq!(same(dst, 16, 64), None);
+        }
+    }
 }
 
 /// Diagnostics: the fills of upload memory that made a submission wait for
@@ -4089,13 +4472,17 @@ fn late_line(frames: f64) {
         );
     }
     {
-        let [copies, bytes] = [0, 1].map(|i| LATE_COPIES[i].swap(0, Ordering::Relaxed));
-        if copies > 0 {
+        let [copies, bytes, kept, waited] = [0, 1, 2, 3].map(|i| LATE_COPIES[i].swap(0, Ordering::Relaxed));
+        if copies + kept + waited > 0 {
             tracing::info!(
                 "title buffer copies out of memory shaders write, done when their submission landed (VICTORY_LATE_COPY=0: at \
-                 the submission, after a wait for the flights): {:.1} per frame, {:.0} bytes per frame",
+                 the submission, after a wait for the flights): {:.1} per frame, {:.0} bytes per frame; {:.2} looks per frame \
+                 found such a copy with a later step of its submission touching its destination (made at the submission), \
+                 {:.2} steps per frame of later submissions read where one was still to land (they waited for the landing)",
                 copies as f64 / frames,
-                bytes as f64 / frames
+                bytes as f64 / frames,
+                kept as f64 / frames,
+                waited as f64 / frames
             );
         }
     }
@@ -4176,21 +4563,139 @@ fn late_line(frames: f64) {
         }
     }
     if late_exact() {
-        let [pages, runs, bytes, joined, joined_bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, joined, joined_bytes, whole, whole_bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; and {joined:.0} runs joined over blocks no compare ever flagged, {:.2} MB \
-             (VICTORY_MERGE_PAGES={})",
+             (VICTORY_MERGE_PAGES={}); and {whole:.0} flagged blocks the title rewrote in many places, one run each, {:.2} MB \
+             (VICTORY_MERGE_BLOCK_RUNS)",
             bytes / (1 << 20) as f64,
             joined_bytes / (1 << 20) as f64,
-            if crate::shadow::merge_pages() { 1 } else { 0 }
+            if crate::shadow::merge_pages() { 1 } else { 0 },
+            whole_bytes / (1 << 20) as f64
         );
     }
 }
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{Touch, continues, join_ranges, late_among, touches};
+
+    /// A copy out of memory a flight's shaders write is left to the
+    /// landing only if nothing recorded behind it touches its destination:
+    /// a refresh or a fill of it would take the bytes from before the
+    /// copy, a later copy into it would be overwritten at the landing.
+    #[test]
+    fn a_copy_is_left_to_the_landing_only_if_nothing_behind_it_touches_its_destination() {
+        // Copies out of 0x9000.. read what a flight writes.
+        let goes = |_dst: usize, src: usize, _len: usize| (0x9000..0xa000).contains(&src);
+        let late = (0x5000, 0x9000, 0x100);
+        let copy = Touch::Copy(late.0, late.1, late.2);
+        // Alone, and with steps that touch other memory or come before it.
+        assert_eq!(late_among(&[copy], goes), [late]);
+        let before = [Touch::Range(0x5000, 0x5100), Touch::Copy(0x7000, 0x5000, 0x100), copy, Touch::Range(0x5100, 0x6000), Touch::Nothing];
+        assert_eq!(late_among(&before, goes), [late]);
+        // A plain copy first, then the one out of shader-written memory
+        // into the first one's destination, then a refresh of that
+        // destination: the refresh would read the first copy's bytes.
+        let chain = [Touch::Copy(0x5000, 0x1000, 0x100), copy, Touch::Range(0x5080, 0x5090)];
+        assert!(late_among(&chain, goes).is_empty());
+        // A fill or a copy that reads it, a copy or a shader's range over
+        // it, a step of the title's that may do anything.
+        for behind in [
+            Touch::Range(0x50ff, 0x5200),
+            Touch::Copy(0x7000, 0x5000, 0x10),
+            Touch::Copy(0x4ff0, 0x1000, 0x20),
+            Touch::Any,
+        ] {
+            assert!(late_among(&[copy, behind], goes).is_empty(), "{behind:?}");
+        }
+        // Next to it is not it.
+        assert_eq!(late_among(&[copy, Touch::Range(0x4f00, 0x5000), Touch::Copy(0x5100, 0x1000, 0x10)], goes), [late]);
+        // Two in a row: the second reads the first's destination, so the
+        // first is made at the submission and the second at the landing.
+        let second = (0x6000, 0x9800, 0x40);
+        let two = [Touch::Copy(0x9800, 0x9000, 0x40), Touch::Copy(second.0, second.1, second.2)];
+        assert_eq!(late_among(&two, goes), [second]);
+        // Ranges that are nonsense do not panic.
+        assert!(late_among(&[Touch::Copy(usize::MAX, 0x9000, usize::MAX), Touch::Range(usize::MAX, 0)], goes).len() <= 1);
+    }
+
+    /// The four orders of a title buffer copy and a shader's write that
+    /// Marvisak/VIctory pull request 2810 tests, here against what flights
+    /// in the air write, within one submission. `goes` is the rule of
+    /// `copy_goes_late`: a copy out of memory flights write may be left to
+    /// its landing, one into such memory never. A copy that is not left is
+    /// made at the submission, behind the wait for those flights (the test
+    /// below).
+    #[test]
+    fn the_four_orders_of_a_copy_and_a_shaders_write_within_a_submission() {
+        let flights = (0x9000usize, 0xa000usize);
+        let hit = |at: usize, len: usize| at < flights.1 && flights.0 < at + len;
+        let goes = |dst: usize, src: usize, len: usize| hit(src, len) && !hit(dst, len);
+        let pending = (0x5000, 0x9100, 0x80);
+        let copy = Touch::Copy(pending.0, pending.1, pending.2);
+        // 1. A copy over a written source: left to its landing, where the
+        // flights' bytes are.
+        assert_eq!(late_among(&[copy], goes), [pending]);
+        // 2. A copy over a written destination: made at the submission,
+        // once the flights' bytes are there to be written over.
+        assert!(late_among(&[Touch::Copy(0x9100, 0x5000, 0x80)], goes).is_empty());
+        assert!(late_among(&[Touch::Copy(0x9100, 0x9800, 0x80)], goes).is_empty());
+        // 3. A later copy or refresh of a pending destination: the copy is
+        // not left pending, so what comes behind it finds its bytes.
+        for later in [Touch::Copy(0x6000, 0x5040, 0x10), Touch::Copy(0x5040, 0x6000, 0x10), Touch::Range(0x507f, 0x5100)] {
+            assert!(late_among(&[copy, later], goes).is_empty(), "{later:?}");
+        }
+        // 4. The card write that wins over a pending copy: a range given
+        // to shaders behind the copy is such a step too. The copy is made
+        // at the submission and the shaders' bytes land over it with the
+        // copy-back, as the lists have it.
+        assert!(late_among(&[copy, Touch::Range(0x4000, 0x5001)], goes).is_empty());
+        // The same steps before the copy leave it to its landing.
+        assert_eq!(late_among(&[Touch::Range(0x4000, 0x5001), Touch::Copy(0x6000, 0x5040, 0x10), copy], goes), [pending]);
+    }
+
+    /// The same orders across submissions: what a later submission records
+    /// against the flights in the air, the memory their shaders may write
+    /// and the destinations of the copies they left to their landing
+    /// (which count as written until then). Nothing is run here: only what
+    /// the lists record is looked at.
+    #[cfg(windows)]
+    #[test]
+    fn a_submission_waits_for_the_flights_its_copies_and_fills_need() {
+        use super::{HostList, WHY_READ, blocked_by};
+        let Some(host) = super::host() else { return };
+        let (shaders, landing) = ((0x10_0000usize, 0x11_0000usize), (0x30_0000usize, 0x30_0100usize));
+        let written = [shaders, landing];
+        let blocked = |record: &dyn Fn(&HostList)| {
+            let list = host.new_list().unwrap();
+            record(&list);
+            let why = blocked_by(&written, &[landing], &[&list], false);
+            list.close();
+            why
+        };
+        let at = |address: usize| address as *mut u8;
+        // 2. A copy into what the flights' shaders may write waits for
+        // them: made before, their bytes would land over it.
+        assert_eq!(blocked(&|list| list.defer_copy(at(0x10_0100), at(0x50_0000), 0x40)), Some(WHY_READ));
+        // 3. A copy or a fill that reads where a flight's copy is still to
+        // land waits for the landing, and so does a copy into it. The fill
+        // itself is never left for later: its destination is the list's
+        // own upload memory, which the list reads while it runs.
+        assert_eq!(blocked(&|list| list.defer_copy(at(0x50_0000), at(0x30_0080), 0x40)), Some(WHY_READ));
+        assert_eq!(blocked(&|list| list.defer_fill(at(0x50_0000), at(0x30_00ff), 0x40)), Some(WHY_READ));
+        assert_eq!(blocked(&|list| list.defer_copy(at(0x30_0080), at(0x50_0000), 0x40)), Some(WHY_READ));
+        // Next to them, and elsewhere: nothing to wait for.
+        assert_eq!(
+            blocked(&|list| {
+                list.defer_copy(at(0x50_0000), at(0x60_0000), 0x40);
+                list.defer_copy(at(0x11_0000), at(0x0f_ffc0), 0x40);
+                list.defer_fill(at(0x70_0000), at(0x30_0100), 0x40);
+            }),
+            None
+        );
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -5921,6 +6426,7 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
+                copy_order::landed(landed);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -6412,6 +6918,16 @@ impl Host {
                     }
                 }
                 hand_back(&back);
+                copy_order::landed(
+                    items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Late::Run(flight) => Some(flight.number),
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0),
+                );
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -6489,7 +7005,7 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, &late_copied(line), runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -6571,15 +7087,7 @@ impl Host {
         if late {
             let written = line().written.clone();
             if !written.is_empty() {
-                for list in runs {
-                    for step in &list.deferred().copies {
-                        if let &Step::Copy(dst, src, len) = step
-                            && copy_goes_late(&written, dst, src, len)
-                        {
-                            batch.late.push((dst, src, len));
-                        }
-                    }
-                }
+                batch.late = late_copies(&written, runs);
             }
         }
         // The lists run so far: a list run again records a prelude of its
@@ -6757,6 +7265,7 @@ impl Host {
         }
         let back = declared_writes(runs);
         hand_back(&back);
+        copy_order::landed(this_submission);
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -8331,8 +8840,15 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
+            // The clock is read for the steps that are timed, the copies
+            // and the fills (and, with diagnostics, the title's own work),
+            // not for every step: a frame of the first room has 12,800
+            // copies and fills and 21,700 refreshes besides the declared
+            // writes and the textures, and the clock was 1.7 ms of the
+            // submitting thread's 69 ms a frame (the profile of 2026-11-26;
+            // Marvisak/VIctory pull request 3096 does the same in its own
+            // preparing).
+            let (started, copied) = match step {
                 &Step::Copy(dst, src, len) => {
                     // Left to the submission's landing (`copy_goes_late`).
                     if let Some(at) = batch.late.iter().position(|c| *c == (dst, src, len)) {
@@ -8340,6 +8856,7 @@ impl HostList {
                         batch.went_late.push((dst, src, len));
                         continue;
                     }
+                    let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8347,24 +8864,32 @@ impl HostList {
                     }
                     batch.title_written();
                     #[cfg(feature = "diagnostics")]
-                    fill_check::copy_runs(dst, src, len);
+                    {
+                        fill_check::copy_runs(dst, src, len);
+                        crate::copystat::buffers::cpu_read(src, len);
+                    }
+                    // Made now, whatever the submission's shaders are to
+                    // write before it in its lists' order: counted.
+                    copy_order::made(&batch.declared, STARTED.load(Ordering::Relaxed), dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     // And the texture pass, by a number taken now that the
                     // bytes are there: an upload that read before is stale.
                     crate::descriptor::host::title_copied(dst, len);
-                    len
+                    (started, len)
                 }
                 &Step::Fill(dst, src, len) => {
+                    let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
+                        crate::copystat::buffers::cpu_read(src, len);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    (started, len)
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8376,6 +8901,8 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
@@ -8399,6 +8926,7 @@ impl HostList {
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
                     batch.flush_one(shadow);
+                    copy_order::declare(&mut batch.declared, *address, *len);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
                     shadow.writing(*address, *len);
@@ -8462,6 +8990,10 @@ struct Batch {
     /// the lists' steps have come to.
     late: Vec<(usize, usize, usize)>,
     went_late: Vec<(usize, usize, usize)>,
+    /// The title memory the submission's shaders are declared to write by
+    /// the steps run so far (address, end): for the count of copies made
+    /// behind such a step ([`copy_order`]).
+    declared: Vec<(usize, usize)>,
 }
 
 impl Batch {
@@ -8500,7 +9032,10 @@ impl Batch {
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
+        {
+            crate::copystat::range(from, to - from, us, 0);
+            crate::copystat::buffers::updated(shadow.asked_taken(), to.saturating_sub(from), copied);
+        }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
@@ -9180,6 +9715,7 @@ impl Meter {
                     if join_copies() { "on" } else { "off" }
                 );
             }
+            copy_order::line(frames);
         }
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;

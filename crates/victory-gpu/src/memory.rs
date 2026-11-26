@@ -449,7 +449,7 @@ pub(crate) fn ready(
             break;
         }
         let (start, len) = shadow.span();
-        shadow.refresh(list, start, len);
+        shadow.refresh_as(list, start, len, crate::shadow::ASKED_BY_ADDRESS);
     }
     // With `VICTORY_NAMED_WRITES=1`, but for every few frames: only the
     // copies a dispatch names are declared written (`card_fine::named_writes`

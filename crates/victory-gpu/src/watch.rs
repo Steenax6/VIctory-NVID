@@ -72,10 +72,105 @@ pub(crate) struct Written {
 /// [`Written::mask`] of a page written anywhere, or not known where.
 pub(crate) const FULL: u16 = u16::MAX;
 
+/// A page nothing was noted of: askings are numbered from 1.
+const UNNOTED: Written = Written { at: 0, before: 0, mask: 0 };
+/// Pages in a chunk of [`Pages`] (64 MiB of address space), and the pages
+/// it holds in chunks: the title's addresses (40 bits).
+const CHUNK_PAGES: usize = 1 << 10;
+const NEAR_PAGES: usize = (1 << 40) / PAGE;
+
+/// What the journal knows of each 64 KiB page ([`Written`]), by page
+/// number: a table in chunks, made where a page is first noted, for the
+/// title's addresses, and a map for whatever lies above them.
+///
+/// It was a map for all of it. A refresh asks for the entries of its whole
+/// range (2,784 pages for the title's 174 MB buffer, fifteen times a
+/// frame), and walking the map's nodes for them was 4 ms a frame of the
+/// submitting thread (profile of 2026-11-26: `entries` 3.97 ms); a chunk is
+/// walked as an array.
+struct Pages {
+    chunks: Vec<Option<Box<[Written]>>>,
+    far: BTreeMap<usize, Written>,
+}
+
+impl Pages {
+    const fn new() -> Pages {
+        Pages { chunks: Vec::new(), far: BTreeMap::new() }
+    }
+
+    /// What is noted of `page`, if anything is.
+    fn get_mut(&mut self, page: usize) -> Option<&mut Written> {
+        if page >= NEAR_PAGES {
+            return self.far.get_mut(&page);
+        }
+        self.chunks
+            .get_mut(page / CHUNK_PAGES)?
+            .as_mut()?
+            .get_mut(page % CHUNK_PAGES)
+            .filter(|w| w.at != 0)
+    }
+
+    /// Notes `w` (an asking's number is never 0) of `page`.
+    fn insert(&mut self, page: usize, w: Written) {
+        if page >= NEAR_PAGES {
+            self.far.insert(page, w);
+            return;
+        }
+        let chunk = page / CHUNK_PAGES;
+        if self.chunks.len() <= chunk {
+            self.chunks.resize_with(chunk + 1, || None);
+        }
+        let entries = self.chunks[chunk].get_or_insert_with(|| vec![UNNOTED; CHUNK_PAGES].into_boxed_slice());
+        if let Some(entry) = entries.get_mut(page % CHUNK_PAGES) {
+            *entry = w;
+        }
+    }
+
+    /// Forgets what is noted of `page` (tests).
+    #[cfg(test)]
+    fn remove(&mut self, page: usize) {
+        if let Some(w) = self.get_mut(page) {
+            *w = UNNOTED;
+        }
+        self.far.remove(&page);
+    }
+
+    /// Calls `f` with every noted page of `[first, last)` and what is
+    /// noted of it, in page order.
+    fn each(&self, first: usize, last: usize, mut f: impl FnMut(usize, &Written)) {
+        if first >= last {
+            return;
+        }
+        let near = last.min(NEAR_PAGES);
+        let mut page = first;
+        while page < near {
+            let chunk = page / CHUNK_PAGES;
+            if chunk >= self.chunks.len() {
+                break;
+            }
+            let end = ((chunk + 1) * CHUNK_PAGES).min(near);
+            if let Some(entries) = &self.chunks[chunk] {
+                let from = page % CHUNK_PAGES;
+                for (i, w) in entries.iter().enumerate().take(from + (end - page)).skip(from) {
+                    if w.at != 0 {
+                        f(chunk * CHUNK_PAGES + i, w);
+                    }
+                }
+            }
+            page = end;
+        }
+        if last > NEAR_PAGES {
+            for (&page, w) in self.far.range(first.max(NEAR_PAGES)..last) {
+                f(page, w);
+            }
+        }
+    }
+}
+
 /// Notes in `written` that asking `now` found `page` written in the kernel
 /// pages `mask`.
-fn note(written: &mut BTreeMap<usize, Written>, page: usize, now: u64, mask: u16) {
-    match written.get_mut(&page) {
+fn note(written: &mut Pages, page: usize, now: u64, mask: u16) {
+    match written.get_mut(page) {
         None => {
             written.insert(page, Written { at: now, before: 0, mask });
         }
@@ -93,7 +188,7 @@ struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
     /// Page number → the asking that last found it written (and where).
-    written: BTreeMap<usize, Written>,
+    written: Pages,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -112,7 +207,7 @@ struct Journal {
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Pages::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -137,7 +232,9 @@ fn note_found(j: &mut Journal, count: usize, now: u64) {
 
 /// The journal's entries for pages `[first, last)`.
 fn entries(j: &Journal, first: usize, last: usize) -> Vec<(usize, Written)> {
-    j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+    let mut out = Vec::new();
+    j.written.each(first, last, |page, w| out.push((page, *w)));
+    out
 }
 
 /// Whether ranges whose first block the guards hold are left out of the
@@ -406,7 +503,11 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, w)| (p, w.at)).collect()))
+        .then(|| {
+            let mut out = Vec::new();
+            j.written.each(first, last, |page, w| out.push((page, w.at)));
+            (j.ahead_asked, out)
+        })
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -471,7 +572,12 @@ pub(crate) fn writes_fine(start: usize, end: usize, guarded: bool) -> Option<(u6
         let epoch = once().then_some(Epoch { submission: j.once_id, standing: j.kept });
         let written = guard_fine(first * PAGE, last * PAGE, epoch);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        {
+            crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+            if written.is_some() {
+                crate::copystat::buffers::view(first * PAGE, last.saturating_sub(first).saturating_mul(PAGE));
+            }
+        }
         written?
     } else {
         Vec::new()
@@ -1945,7 +2051,19 @@ pub fn writing(at: usize, len: usize) {
 /// (`cause`).
 pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    {
+        let mut g = guards();
+        // Every block is opened under the guards' lock, so what the count
+        // of opened blocks grows by here is this write's.
+        #[cfg(feature = "diagnostics")]
+        let before = GUARD_CALLS[6].load(std::sync::atomic::Ordering::Relaxed);
+        open(&mut g, at, at.saturating_add(len));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::buffers::opened(
+            cause as usize,
+            GUARD_CALLS[6].load(std::sync::atomic::Ordering::Relaxed).saturating_sub(before),
+        );
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len, cause);
 }
@@ -1969,7 +2087,9 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     let last = end.div_ceil(BLOCK).min(first.saturating_add(1 << 16));
     let noted = asked != 0 && {
         let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-        j.written.range(first..last).any(|(_, w)| w.at > asked)
+        let mut after = false;
+        j.written.each(first, last, |_, w| after |= w.at > asked);
+        after
     };
     let (mut written, mut open) = (0, 0);
     {
@@ -2768,9 +2888,8 @@ mod tests {
     /// where another test's was, whose writes it still holds.
     fn forget(start: usize, end: usize) {
         let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-        let pages: Vec<usize> = j.written.range(start / PAGE..end.div_ceil(PAGE)).map(|(&p, _)| p).collect();
-        for page in pages {
-            j.written.remove(&page);
+        for page in start / PAGE..end.div_ceil(PAGE) {
+            j.written.remove(page);
         }
     }
 
@@ -2848,14 +2967,64 @@ mod tests {
     /// longer says where.
     #[test]
     fn notes_join_and_never_go_back() {
-        let mut written = BTreeMap::new();
+        let mut written = Pages::new();
         note(&mut written, 9, 4, 1);
         note(&mut written, 9, 4, 2);
-        assert_eq!(written[&9], Written { at: 4, before: 0, mask: 3 });
+        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 4, before: 0, mask: 3 }));
         note(&mut written, 9, 6, 8);
-        assert_eq!(written[&9], Written { at: 6, before: 4, mask: 8 });
+        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 6, before: 4, mask: 8 }));
         note(&mut written, 9, 5, 1);
-        assert_eq!(written[&9], Written { at: 6, before: 4, mask: FULL });
+        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 6, before: 4, mask: FULL }));
+    }
+
+    /// The table answers as the map did: the noted pages of a range, in
+    /// order, across its chunks and above the addresses it has chunks for.
+    #[test]
+    fn the_pages_noted_in_a_range_come_in_order_wherever_they_lie() {
+        let mut written = Pages::new();
+        let mut map = BTreeMap::new();
+        let w = |at| Written { at, before: 0, mask: 1 };
+        let pages = [
+            0,
+            5,
+            CHUNK_PAGES - 1,
+            CHUNK_PAGES,
+            7 * CHUNK_PAGES + 3,
+            NEAR_PAGES - 1,
+            NEAR_PAGES,
+            NEAR_PAGES + 12,
+            usize::MAX / PAGE,
+        ];
+        for (i, &page) in pages.iter().enumerate() {
+            written.insert(page, w(i as u64 + 1));
+            map.insert(page, w(i as u64 + 1));
+        }
+        assert!(written.get_mut(1).is_none() && written.get_mut(NEAR_PAGES + 1).is_none());
+        let ranges = [
+            (0, 1),
+            (0, usize::MAX),
+            (1, 5),
+            (5, CHUNK_PAGES),
+            (CHUNK_PAGES - 1, CHUNK_PAGES + 1),
+            (CHUNK_PAGES + 1, 7 * CHUNK_PAGES + 3),
+            (6 * CHUNK_PAGES, NEAR_PAGES),
+            (NEAR_PAGES - 1, NEAR_PAGES + 13),
+            (NEAR_PAGES + 1, usize::MAX),
+            (9, 9),
+            (9, 3),
+        ];
+        for (first, last) in ranges {
+            let mut got = Vec::new();
+            written.each(first, last, |page, w| got.push((page, *w)));
+            let want: Vec<(usize, Written)> = if first < last { map.range(first..last).map(|(&p, &w)| (p, w)).collect() } else { Vec::new() };
+            assert_eq!(got, want, "{first:#x}..{last:#x}");
+        }
+        // A page forgotten is not noted; noting it again is.
+        written.remove(5);
+        written.remove(NEAR_PAGES);
+        assert!(written.get_mut(5).is_none() && written.get_mut(NEAR_PAGES).is_none());
+        note(&mut written, 5, 9, 2);
+        assert_eq!(written.get_mut(5).copied(), Some(Written { at: 9, before: 0, mask: 2 }));
     }
 
     /// A remapping forgets the unmapped runs it touches and no others.
