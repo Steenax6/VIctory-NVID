@@ -760,19 +760,45 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
+    // The word an access names, where its address is a constant moved in its own block with
+    // no EXEC write between (`v_mov_b32 v14, 0; ds_min_u32 v14, v12`).
+    let word = |block: &crate::ir::Block, at: usize| -> Option<u32> {
+        let i = &block.insts[at];
+        let Fields::Ds { addr: Some(Operand::Vector { reg, .. }), offset0, offset1, .. } = i.fields else {
+            return None;
+        };
+        let v = i.read(Reg::V(reg))?;
+        let mov = block.insts[..at].iter().rposition(|m| m.writes.iter().any(|w| w.1 == v))?;
+        let m = &block.insts[mov];
+        if m.name() != "v_mov_b32" || block.insts[mov..at].iter().any(|x| x.write(Reg::S(EXEC)).is_some()) {
+            return None;
+        }
+        let Fields::Valu(vm) = &m.fields else { return None };
+        let base = match vm.src.first()? {
+            Operand::Const(c @ 128..=192) => u32::from(*c) - 128,
+            Operand::Literal(x) => *x,
+            _ => return None,
+        };
+        Some(base.wrapping_add(u32::from(offset1) << 8 | u32::from(offset0)) / 4)
+    };
     for r in (0..n).filter(|&r| reads[r] && writes[r]) {
-        // (atomics of one commuting kind that return nothing, alone in the region: the two
-        // halves leave the same word in either order)
-        let mut ops = (0..n)
-            .filter(|&b| !all[b] && find(&mut region, b) == r)
-            .flat_map(|b| p.blocks[b].insts.iter().filter_map(lds_op))
-            .collect::<Vec<_>>()
-            .into_iter();
-        let commuting = ops.next().is_some_and(|op| {
+        // (atomics that return nothing, one commuting kind on each word they name, or on every
+        // word where an address is not known: the two halves leave the same words in either
+        // order)
+        let mut kinds: Vec<(Option<u32>, &str)> = Vec::new();
+        for b in (0..n).filter(|&b| !all[b] && find(&mut region, b) == r) {
+            let block = &p.blocks[b];
+            for (at, i) in block.insts.iter().enumerate() {
+                if let Some(op) = lds_op(i) {
+                    kinds.push((word(block, at), op));
+                }
+            }
+        }
+        let commuting = kinds.iter().all(|&(at, op)| {
             matches!(
                 op,
                 "ds_add_u32" | "ds_sub_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32" | "ds_min_i32" | "ds_max_i32" | "ds_min_u32" | "ds_max_u32"
-            ) && ops.all(|next| next == op)
+            ) && kinds.iter().all(|&(other, op2)| op2 == op || at.is_some() && other.is_some() && at != other)
         });
         if !commuting {
             return None;
@@ -11099,20 +11125,21 @@ mod tests {
     /// minimum and then an add do not commute, nor does an add that returns the old value with
     /// anything: the region is refused. Two atomics of one commuting kind that return nothing
     /// leave the same word in any order (realblastex/flamingo 89e5d6c3d, after
-    /// avatarmanz/VIctory-7900XTX #204).
+    /// avatarmanz/VIctory-7900XTX #204), and so do two kinds on two words their constant
+    /// addresses name (the tree culls' `ds_or_b32` at 4 and `ds_min_u32` at 0).
     #[test]
     fn lds_atomics_in_a_lane_branch_meet_only_where_they_commute() {
-        let meets = |first: u32, second: u32| {
+        let meets_at = |first: u32, second: u32, offset: u32| {
             let words: [u32; 13] = [
-                0x7E12_0280, // v_mov_b32 v9, 0 (address and data)
                 0x7E04_0281, // v_mov_b32 v2, 1
                 0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
                 0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
-                0xBF88_0004, // s_cbranch_execz past both accesses
+                0xBF88_0005, // s_cbranch_execz past both accesses
+                0x7E12_0280, // v_mov_b32 v9, 0 (address and data)
                 0x36 << 26 | first << 18,
                 9 << 8 | 9, // ds_<first> v9, v9
-                0x36 << 26 | second << 18,
-                2 << 8 | 9,  // ds_<second> v9, v2
+                0x36 << 26 | second << 18 | offset,
+                2 << 8 | 9,  // ds_<second> v9, v2 offset:<offset>
                 0xBEFE_040C, // s_mov_b64 exec, s[12:13]
                 0x36 << 26 | 0x36 << 18,
                 5 << 24 | 9, // ds_read_b32 v5, v9
@@ -11124,6 +11151,7 @@ mod tests {
             let all = super::all_lane_blocks(&st).unwrap();
             super::lds_meetings(&p, &st, &all).is_some()
         };
+        let meets = |first: u32, second: u32| meets_at(first, second, 0);
         const ADD: u32 = 0x00;
         const MIN_U32: u32 = 0x07;
         const WRITE_B32: u32 = 0x0D;
@@ -11134,6 +11162,9 @@ mod tests {
         assert!(meets(ADD, ADD), "two ds_add_u32");
         assert!(meets(MIN_U32, MIN_U32), "two ds_min_u32");
         assert!(meets(WRITE_B32, WRITE_B32), "two ds_write_b32");
+        assert!(meets_at(MIN_U32, ADD, 4), "ds_min_u32 at 0 then ds_add_u32 at 4");
+        assert!(!meets_at(MIN_U32, ADD, 2), "ds_min_u32 at 0 then ds_add_u32 at 2: one word");
+        assert!(!meets_at(ADD_RTN, ADD, 4), "ds_add_rtn_u32 at 0 then ds_add_u32 at 4");
     }
 
     /// A program's constant table starts after its instructions, unless a
