@@ -1106,6 +1106,11 @@ impl TextureQueue {
     fn kinds(&self, frame: u64) -> ([u64; crate::census::KINDS], Vec<u32>) {
         let mut kinds = [0u64; crate::census::KINDS];
         let mut away = Vec::new();
+        // The index by due frame against this walk: counted.
+        let missed = self.slots.iter().filter(|&(&index, w)| !self.by_due.contains(&(w.due, index))).count();
+        if missed != 0 {
+            crate::census::INDEX_MISSES.fetch_add(missed as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         for (&index, w) in &self.slots {
             let kind = if w.due > frame && self.held.contains_key(&index) {
                 2
@@ -1153,6 +1158,14 @@ impl TextureQueue {
     /// ago (`now`: milliseconds), with the slots in the queue as they are:
     /// the count walks every slot, and a pass asks for it each time.
     fn census_lately(&mut self, frame: u64, now: u64) -> [u64; 5] {
+        // The index holds each slot once, or it is made anew (and said:
+        // `crate::census::INDEX_MISSES`): a slot it lacks is handed to no
+        // pass.
+        if self.by_due.len() != self.slots.len() {
+            let apart = self.by_due.len().abs_diff(self.slots.len()) as u64;
+            crate::census::INDEX_MISSES.fetch_add(apart.max(1), std::sync::atomic::Ordering::Relaxed);
+            self.by_due = self.slots.iter().map(|(&index, w)| (w.due, index)).collect();
+        }
         if now >= self.counted.1.saturating_add(250) || now < self.counted.1 {
             self.counted = (self.census(frame), now);
         }
@@ -6492,6 +6505,15 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         q.hold(1, stale, 700);
         assert_eq!(q.slots[&1].due, 600);
         assert!(q.by_due.contains(&(600, 1)));
+        // An index that lost a slot is found out and made anew.
+        let misses = crate::census::INDEX_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+        let lost = *q.by_due.iter().next().unwrap();
+        q.by_due.remove(&lost);
+        assert!(!q.due(u64::MAX, usize::MAX).iter().any(|d| d.0 == lost.1));
+        let _ = q.kinds(700);
+        q.census_lately(700, 9_000);
+        assert!(q.due(u64::MAX, usize::MAX).iter().any(|d| d.0 == lost.1), "the slot is handed out again");
+        assert!(crate::census::INDEX_MISSES.load(std::sync::atomic::Ordering::Relaxed) >= misses + 2);
         // The census is counted now and then, with the slots as they are.
         let all = q.census(700);
         assert_eq!(q.census_lately(700, 10_000), all);

@@ -216,7 +216,9 @@ since the upload's read (a numbered write that made the slot stale, a tell
 that lay in the texture's span and was taken for another texture's, a store
 the guards saw, blocks nothing guards, nothing). "told to the texture pass"
 counts the tells by who told, "the texture pass per frame" is the pass's
-time by part, "the texture queue by what its slots wait for" the queue.
+time by part, "the texture queue by what its slots wait for" the queue
+(and how many slots its index by due frame did not hold when it was
+compared with a walk over all of them: 0, or a pass was handed too few).
 
 A texture goes up level by level. Its memory is told apart at its levels
 (the block of the smallest ones, then each level), and of each part the

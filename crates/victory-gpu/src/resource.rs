@@ -3366,9 +3366,12 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 /// The placed textures by address ([`PLACED_TEXTURES`]), for the count of
 /// `crate::census`: textures in all; addresses with textures of several
 /// descriptions; the most at one address; and such addresses with several
-/// host copies alive now. One walk of the table under its lock (some
-/// 65,000 entries after two minutes: a fraction of a millisecond), asked
-/// once a second; the host copies are asked after it.
+/// host copies alive now. One walk of the table under its lock, asked
+/// every five seconds; the host copies are asked after it, by a look at
+/// whether each texture has one. (They were asked through [`copy_state`],
+/// which works out a texture's footprint when it has none: 40,000 of
+/// those every second, on a thread that records the frame, were most of
+/// what the pass's line calls the queue's order, 1.8 ms a frame.)
 #[cfg(windows)]
 pub(crate) fn placed_descriptions() -> [u64; 4] {
     let mut several: Vec<Vec<usize>> = Vec::new();
@@ -3394,9 +3397,8 @@ pub(crate) fn placed_descriptions() -> [u64; 4] {
             several.push(run);
         }
     }
-    let alive = |textures: &Vec<usize>| {
-        textures.iter().filter(|&&t| copy_state(t as This).is_some_and(|state| state.0 == 2)).count() > 1
-    };
+    let has_copy = |t: &&usize| resource(**t as This).host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let alive = |textures: &Vec<usize>| textures.iter().filter(has_copy).count() > 1;
     [all, several.len() as u64, most, several.iter().filter(|t| alive(t)).count() as u64]
 }
 

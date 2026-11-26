@@ -420,14 +420,22 @@ pub(crate) static QUEUE: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KIND
 /// addresses with several host copies alive.
 pub(crate) static DESCRIPTIONS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-/// Whether a pass counts the queue and the placed textures now: once a
-/// second.
+/// Whether a pass counts the queue and the placed textures now: every
+/// five seconds, as often as the lines are written (the counts walk the
+/// queue and every placed texture, on a thread that records the frame).
 pub(crate) fn counting_due() -> bool {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let now = crate::host::now_ms();
     let next = NEXT.load(Relaxed);
-    now >= next && NEXT.compare_exchange(next, now + 1000, Relaxed, Relaxed).is_ok()
+    now >= next && NEXT.compare_exchange(next, now + 5000, Relaxed, Relaxed).is_ok()
 }
+
+/// Since the start: slots of the queue of textures picked by index that
+/// its index by due frame did not hold when the two were compared (at
+/// every count of the queue, and by their sizes at every pass). 0: a pass
+/// that asks the index for the due slots is handed every one. If not, the
+/// index is made anew from the slots.
+pub(crate) static INDEX_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// The texture memories the pass uploaded by how many times: up to 1, 2,
 /// 4, 8, 16, 32 times and more, each with the textures and their uploads.
@@ -655,7 +663,12 @@ pub(crate) fn lines(frames: f64) {
         for (name, count) in KIND_NAMES.iter().zip(&QUEUE) {
             let _ = write!(kinds, ", {name} {}", count.load(Relaxed));
         }
-        tracing::info!("the texture queue by what its slots wait for, at a pass of the last second: {}", kinds.trim_start_matches(", "));
+        tracing::info!(
+            "the texture queue by what its slots wait for, at a pass of the last five seconds: {}; {} slots its index by due \
+             frame did not hold when compared with a walk over all (0: none can be missed)",
+            kinds.trim_start_matches(", "),
+            INDEX_MISSES.load(Relaxed)
+        );
     }
 }
 
