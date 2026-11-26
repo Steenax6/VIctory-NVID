@@ -1163,11 +1163,24 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
+/// The most bytes a shader reads through a constant buffer view: 4,096
+/// vectors of 16 bytes (`D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT`), and the
+/// most a host constant buffer view may span.
+pub(crate) const CONSTANT_VIEW_MOST: u32 = 4096 * 16;
+
 /// Device method.
+///
+/// The title names constant views of more than [`CONSTANT_VIEW_MOST`]
+/// bytes (969,472 and 1,306,368 were seen, in slots it does not read). A
+/// host view of that size is an invalid call, for which NVIDIA removes the
+/// device; and a shader reads no more than the first 64 KiB of any constant
+/// view. The view is recorded at most that size, so that nothing made or
+/// copied for it (its host view, the list's copy of its bytes, the window
+/// of the buffer that holds them) reaches further.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
+        record(handle, View::Constant(address, size.min(CONSTANT_VIEW_MOST)));
     }
 }
 
@@ -1525,6 +1538,19 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// A constant view larger than a shader reads through one is recorded
+    /// at the 64 KiB it reads: no host view, copy or window reaches past it.
+    #[test]
+    fn constant_views_are_recorded_at_most_64_kib() {
+        let null = std::ptr::null();
+        let heap = [0u64; 3 * 4]; // three 32-byte slots
+        let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
+        for (i, (size, recorded)) in [(969_472, 65_536), (65_536, 65_536), (480, 480)].into_iter().enumerate() {
+            create_cbv(null, &[0x2000, 1, size, 0], at(i));
+            assert_eq!(view(at(i)), Some(View::Constant(0x1_0000_2000, recorded)), "{size}");
+        }
     }
 
     #[test]

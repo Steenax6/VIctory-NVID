@@ -1177,6 +1177,44 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// A sampler heap of our own, for a list that sets one of our root
+/// signatures while the title binds no sampler heap: every one says its
+/// sampler heap is indexed directly (`SAMPLER_HEAP_DIRECTLY_INDEXED`), and
+/// D3D12 requires such a heap to be bound before such a signature is set
+/// (the debug layer's id 1419); NVIDIA removes the device for it
+/// (Marvisak/VIctory #1754, a compute list that reads views and no
+/// samplers). Slot 0 holds a point sampler, so an indexed read of it gives
+/// something defined.
+pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
+    fallback(true)
+}
+
+/// A view heap of our own, for a list that sets one of our root signatures
+/// while the title binds no view heap: they index the view heap directly
+/// too (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`), with the same rule as
+/// [`fallback_samplers`] (Marvisak/VIctory #2894). Made as a title heap of
+/// no slots: every slot up to the one shaders clamp view indices to is a
+/// null view, so whatever a shader indexes reads zeros.
+pub(crate) fn fallback_views() -> Option<&'static HostHeap> {
+    fallback(false)
+}
+
+/// [`fallback_samplers`] and [`fallback_views`], each made on first use.
+fn fallback(sampler: bool) -> Option<&'static HostHeap> {
+    static HEAPS: [std::sync::OnceLock<Option<HostHeap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    HEAPS[usize::from(sampler)]
+        .get_or_init(|| {
+            if sampler {
+                let heap = HostHeap::new(true, 1)?;
+                heap.null_sampler(0);
+                Some(heap)
+            } else {
+                HostHeap::new(false, 0)
+            }
+        })
+        .as_ref()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -2245,13 +2283,17 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
+    /// memory (the list's own, which it holds); a null one for no bytes.
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+        let desc = match constant_view_bytes(size) {
+            Some(bytes) if gpu != 0 => D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: gpu,
+                SizeInBytes: bytes,
+            },
+            // A zero location and size: the null constant view.
+            _ => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -3318,6 +3360,15 @@ fn twin_uav(
     Some(desc)
 }
 
+/// The bytes of a host constant buffer view of a title's of `size`: whole
+/// 256s (the host's step), and at most the 64 KiB a shader reads (a larger
+/// view is an invalid call, for which NVIDIA removes the device). `None`
+/// for a view of no bytes, which reads zeros: a null view, not one of 256
+/// bytes of whatever lies at its address.
+fn constant_view_bytes(size: u32) -> Option<u32> {
+    (size != 0).then(|| size.min(crate::descriptor::CONSTANT_VIEW_MOST).next_multiple_of(256))
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3325,6 +3376,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            let bytes = constant_view_bytes(size)?;
+            if address == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -3336,7 +3391,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: bytes,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -4141,6 +4196,57 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Host constant views are whole 256s and at most 64 KiB (a larger one
+    /// removes the device on NVIDIA); one of no bytes is a null view. Made
+    /// on the device, an oversized one and one of nothing leave it alive.
+    #[test]
+    fn constant_views_are_at_most_64_kib_and_none_is_null() {
+        assert_eq!(constant_view_bytes(0), None);
+        assert_eq!(constant_view_bytes(16), Some(256));
+        assert_eq!(constant_view_bytes(480), Some(512));
+        assert_eq!(constant_view_bytes(65_536), Some(65_536));
+        assert_eq!(constant_view_bytes(969_472), Some(65_536));
+        assert_eq!(constant_view_bytes(u32::MAX), Some(65_536));
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some((buffer, _)) = host.upload_buffer(1 << 20) else {
+            return;
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        heap.constant_at(0, gpu, 969_472);
+        heap.constant_at(1, gpu, 0);
+        heap.constant_at(2, 0, 256);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Our sampler and view heaps, for lists whose title binds none, are
+    /// made once each; a list that binds both and runs leaves the device
+    /// alive.
+    #[test]
+    fn our_heaps_are_made_once_and_bind() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let samplers = fallback_samplers().expect("a sampler heap of ours");
+        let views = fallback_views().expect("a view heap of ours");
+        assert!(std::ptr::eq(samplers, fallback_samplers().unwrap()));
+        assert!(std::ptr::eq(views, fallback_views().unwrap()));
+        assert!(samplers.sampler && !views.sampler);
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list and shader-visible heaps of ours.
+        unsafe { list.list.SetDescriptorHeaps(&[Some(views.heap.clone()), Some(samplers.heap.clone())]) };
+        list.close();
+        host.execute(&[&list]);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

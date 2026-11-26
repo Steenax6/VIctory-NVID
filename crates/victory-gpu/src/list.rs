@@ -682,7 +682,15 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    // The barrier names the host resource by a borrowed pointer: the list
+    // holds it until it is reset, as it does the textures it moves, since
+    // the title may release its resource (and the sweep its host copy)
+    // before the list has run.
+    let held = |texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource| -> This {
+        list.keep(texture);
+        texture.as_raw().cast_const().cast()
+    };
+    let host = |r: This| crate::resource::host_resource(r).map(held);
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -723,7 +731,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 // (the host gives the depth texture none): the barrier is
                 // on the texture shaders write.
                 match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
+                    Some(twin) => held(twin),
                     None => host(b.first)?,
                 }
             },
@@ -1418,10 +1426,47 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. The host orders
+/// nothing between draws and dispatches of a list by itself: a sync waits
+/// for every shader write before it, as the title's barriers do (one
+/// unordered access barrier on all resources). Dispatches that read what
+/// the one before wrote, with a sync and no barrier between them (the
+/// ray-tracing structure builder has no other wait between its stages),
+/// ran overlapped before (avatarmanz/VIctory-7900XTX 0b5f191b8,
+/// Marvisak/VIctory #1228). `VICTORY_SYNC_BARRIER=0`: nothing, as before,
+/// to measure what the barriers cost on the card.
+extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
+    #[cfg(windows)]
+    if sync_barrier()
+        && let Some(list) = host_list(this)
+    {
+        // Whether and how the title syncs (the first calls).
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            tracing::info!(
+                flags = format_args!("{flags:#x}"),
+                control = format_args!("{control:#x}"),
+                address = format_args!("{address:#x}"),
+                size,
+                "a pipeline sync: waits for earlier shader writes"
+            );
+        }
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // SAFETY: the same layout; no resource named.
+        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: an open list.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+    let _ = (this, flags, control, address, size);
+}
+
+/// Whether a pipeline sync waits for earlier shader writes ([`sync`]; on
+/// by default, `VICTORY_SYNC_BARRIER=0`: not).
+#[cfg(windows)]
+fn sync_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_none_or(|v| v != "0"))
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.

@@ -579,6 +579,28 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Our view heap and our sampler heap among the heaps a list binds
+/// ([`heaps_wanted`]): values no title heap's address takes, apart from
+/// each other and from the 0 that says a host list has no heaps bound yet
+/// (a new list, or one after a cut: `State::replay`).
+const VIEWS_OURS: usize = usize::MAX;
+const SAMPLERS_OURS: usize = usize::MAX - 1;
+
+/// The heaps a host list must have bound before one of our root signatures
+/// is set, from the title's (`title`: view heap, sampler heap; `hosted`:
+/// whether each has a host heap). Every root signature we make indexes
+/// both kinds directly, and D3D12 requires a heap of each kind to be bound
+/// before such a signature is set (the debug layer's id 1419; NVIDIA
+/// removes the device for it, Marvisak/VIctory #1754 and #2894): ours
+/// stands in for a kind the title binds none of. Never 0, so a list with
+/// no heaps bound yet always binds them.
+fn heaps_wanted(title: [usize; 2], hosted: [bool; 2]) -> [usize; 2] {
+    [
+        if hosted[0] { title[0] } else { VIEWS_OURS },
+        if hosted[1] { title[1] } else { SAMPLERS_OURS },
+    ]
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -1037,18 +1059,30 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
+        let hosted = self
+            .heaps
+            .map(|h| h != 0 && crate::descriptor::heap(h as This).host().is_some());
+        let want = heaps_wanted(self.heaps, hosted);
+        if self.host_heaps != want {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = want
                 .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .filter_map(|&h| match h {
+                    VIEWS_OURS => crate::descriptor::host::fallback_views().or_else(|| {
+                        once!("no view heap of ours to bind");
+                        None
+                    }),
+                    SAMPLERS_OURS => crate::descriptor::host::fallback_samplers().or_else(|| {
+                        once!("no sampler heap of ours to bind");
+                        None
+                    }),
+                    h => crate::descriptor::heap(h as This).host(),
+                })
                 .map(|h| Some(h.heap.clone()))
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = want;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
@@ -1088,7 +1122,7 @@ impl State {
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
-                once!("a draw whose descriptor table found no free slots is dropped");
+                once!("a draw whose descriptor table found no host slots (none free, or past the host heap) is dropped");
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -2725,9 +2759,12 @@ impl State {
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // title's slots there have no host slot of their own. Such a table
+        // that cannot be made afresh drops the draw (`bind`): its title
+        // offset would have the card read past the host heap.
+        let mut past = Vec::new();
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if past.contains(&u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -2742,6 +2779,7 @@ impl State {
             };
             if index >= host.count() {
                 fresh.push(u.slot);
+                past.push(u.slot);
             }
         }
         fresh.sort_unstable();
@@ -2753,7 +2791,15 @@ impl State {
         }
         let mut made = Vec::new();
         for slot in fresh {
+            // A table not made afresh keeps the title's offset; one past the
+            // host heap must not.
+            let not_made = |made: &mut Vec<(u8, u32)>| {
+                if past.contains(&slot) {
+                    made.push((slot, u32::MAX));
+                }
+            };
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                not_made(&mut made);
                 continue;
             };
             let entries: Vec<&UsedResource> = used
@@ -2762,12 +2808,15 @@ impl State {
                 .filter(|u| u.slot == slot)
                 .collect();
             let Some(heap) = self.heap_of(table) else {
+                not_made(&mut made);
                 continue;
             };
             if heap.samplers() || (table - heap.start) % 32 != 0 {
+                not_made(&mut made);
                 continue;
             }
             let Some(host) = heap.host() else {
+                not_made(&mut made);
                 continue;
             };
             let mut selected: Vec<u32> = indexed
@@ -2798,6 +2847,7 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                not_made(&mut made);
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -2863,11 +2913,25 @@ impl State {
                             host.constant_at(index, shadow.gpu(address), size);
                             continue;
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                        // A view of nothing, or no room: a null constant
+                        // view (reads give zeros).
+                        let scratch = (address != 0 && size != 0)
+                            .then(|| list.scratch(u64::from(size)))
+                            .flatten();
+                        let Some((gpu, to)) = scratch else {
+                            host.constant_at(index, 0, 0);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
+                        // The host view is whole 256s, and the scratch holds
+                        // what an earlier list left there: past the title's
+                        // size the shader reads zeros, as through the
+                        // title's view, not that.
+                        let padded = size.next_multiple_of(256);
+                        // SAFETY: the scratch range is `padded` bytes long
+                        // (`HostList::scratch` gives whole 256s) and the
+                        // list's own until it has run.
+                        unsafe { to.add(size as usize).write_bytes(0, (padded - size) as usize) };
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
@@ -3757,5 +3821,29 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A list binds a heap of each kind before its root signature: the
+    /// title's where it has one, ours for a kind it binds none of, and never
+    /// the 0 a list with no heaps bound yet has (a new list, one after a cut),
+    /// so such a list always binds them (Marvisak/VIctory #2894, #2881).
+    #[test]
+    fn a_list_gets_our_heaps_for_kinds_the_title_binds_none_of() {
+        assert_eq!(heaps_wanted([0x10, 0x20], [true, true]), [0x10, 0x20]);
+        assert_eq!(heaps_wanted([0x10, 0], [true, false]), [0x10, SAMPLERS_OURS]);
+        assert_eq!(heaps_wanted([0, 0x20], [false, true]), [VIEWS_OURS, 0x20]);
+        assert_eq!(heaps_wanted([0, 0], [false, false]), [VIEWS_OURS, SAMPLERS_OURS]);
+        // A title heap without a host heap is as none.
+        assert_eq!(heaps_wanted([0x10, 0x20], [false, true]), [VIEWS_OURS, 0x20]);
+        for title in [[0, 0], [0x10, 0], [0, 0x20]] {
+            let hosted = title.map(|h| h != 0);
+            assert_ne!(heaps_wanted(title, hosted), [0; 2], "a list with nothing bound binds");
+        }
+        assert_ne!(VIEWS_OURS, SAMPLERS_OURS);
     }
 }

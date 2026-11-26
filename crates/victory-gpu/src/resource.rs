@@ -3678,6 +3678,50 @@ mod tests {
         }
     }
 
+    /// A submission that runs one list twice gives each run a prelude of
+    /// its own: the second run's transitions are recorded while the first
+    /// run's prelude still waits to be sent, and in the list's own prelude
+    /// they would have replaced the first's. Each run starts the texture in
+    /// the state the list starts with, and the list ends it in its own.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_run_twice_in_one_submission_has_a_prelude_per_run() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        const COPY_DEST: u32 = 0x400;
+        const SHADER_READ: u32 = 0x80;
+        const COPY_SOURCE: u32 = 0x800;
+        let mut image = null;
+        let rgba = texture(4, 4, 28, 1);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &rgba, COPY_DEST, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let list = host.new_list().unwrap();
+        // The list starts with the texture read by shaders and leaves it a
+        // copy source.
+        assert!(list.transition(image, SHADER_READ).is_none());
+        let (host_image, before) = list.transition(image, COPY_SOURCE).unwrap();
+        // SAFETY: an open list and a live texture.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                host_image,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES(before as i32),
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        list.close();
+        host.execute(&[&list, &list]);
+        assert_eq!(list.preludes_again(), 1, "the second run's prelude");
+        assert_eq!(host_copy(image).unwrap().state.load(std::sync::atomic::Ordering::Relaxed), COPY_SOURCE);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        list.reset();
+        assert_eq!(list.preludes_again(), 0, "let go with the reset");
+    }
+
     /// A 16-bit depth texture the title also asks unordered access for gets
     /// a colour twin, and the host copies one into the other, both ways: a
     /// pattern put into the twin is copied to the depth texture, the twin

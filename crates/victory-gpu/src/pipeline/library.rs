@@ -57,9 +57,65 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and the early list in `dir` from now on: the
+/// early list in `dir` itself, the library in a directory of its
+/// translation's there ([`library_dir`]).
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
+}
+
+/// The library's directory: `DIR/<translation>`, the first 16 hex digits of
+/// a hash of the translation's fingerprint
+/// (`victory_shader::emit::translation_fingerprint`, which the shader cache
+/// keys on too). The library's pipelines are named after the shaders they
+/// are made from, so a translator change makes every name in it useless,
+/// and the first run after one wrote the few pipelines it made over the
+/// old library (Marvisak/VIctory #2706: a 926 MB library, a warm-up of 7.5
+/// minutes, became 612 KB). Each translation keeps its own now, and the
+/// [`KEPT`] newest stay: switching between two builds no longer pays the
+/// warm-up each time. Worked out at the first use, after the device has
+/// told the translator its facts (wave size, view heap limit).
+fn library_dir() -> Option<&'static PathBuf> {
+    static KEYED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    KEYED
+        .get_or_init(|| {
+            let dir = DIR.get()?;
+            let print = blake3::hash(&victory_shader::emit::translation_fingerprint());
+            let name: String = print.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            Some(keyed(dir, &name))
+        })
+        .as_ref()
+}
+
+/// Translations that keep a library: the one in use and the one before.
+const KEPT: usize = 2;
+
+/// `dir/<name>`, with the libraries of other translations in `dir` pruned
+/// to the [`KEPT`] newest (by when they were last written). Only
+/// directories this wrote go: a name of 16 lowercase hex digits holding a
+/// library.
+fn keyed(dir: &std::path::Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let ours = |other: &std::path::Path| {
+        other.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.len() == 16 && n.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) && other.join(LIBRARY_FILE).is_file()
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return path;
+    };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|other| *other != path && ours(other))
+        .filter_map(|other| Some((other.join(LIBRARY_FILE).metadata().ok()?.modified().ok()?, other)))
+        .collect();
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, older) in others.into_iter().skip(KEPT - 1) {
+        tracing::info!(dir = %older.display(), "pipeline library of an older translation removed");
+        let _ = std::fs::remove_dir_all(&older);
+    }
+    path
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -442,7 +498,7 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let blob = library_dir().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -569,7 +625,9 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    // (The library first: its directory is worked out after the device.)
+    let Some(library) = library() else { return };
+    let (Some(early_dir), Some(dir)) = (DIR.get(), library_dir()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -627,7 +685,7 @@ pub(crate) fn save(now: bool) {
         });
     }
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&early_dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -735,6 +793,32 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    /// Each translation's library has a directory of its own; of the other
+    /// translations' only the newest stays, and what this did not write (a
+    /// directory of another name, one without a library) is left alone.
+    #[test]
+    fn a_library_per_translation_and_one_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = |name: &str, age: u64| {
+            let at = dir.path().join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            let file = std::fs::File::create(at.join(LIBRARY_FILE)).unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            file.set_modified(when).unwrap();
+        };
+        library("00000000000000aa", 300);
+        library("00000000000000bb", 100);
+        library("00000000000000cc", 200);
+        std::fs::create_dir_all(dir.path().join("backup")).unwrap();
+        std::fs::create_dir_all(dir.path().join("00000000000000dd")).unwrap(); // no library
+        let path = keyed(dir.path(), "0123456789abcdef");
+        assert_eq!(path, dir.path().join("0123456789abcdef"));
+        let left = |name: &str| dir.path().join(name).exists();
+        assert!(left("00000000000000bb"), "the newest other translation's stays");
+        assert!(!left("00000000000000aa") && !left("00000000000000cc"), "older ones go");
+        assert!(left("backup") && left("00000000000000dd"), "nothing this did not write goes");
     }
 
     /// A mapped file reads as the file's bytes, a file written through a

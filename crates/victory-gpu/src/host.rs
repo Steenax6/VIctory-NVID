@@ -898,6 +898,11 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// The preludes of the second and later runs of the list in one
+    /// submission (a submission may name a list more than once): each run
+    /// needs its own, recorded while the one before still waits to be sent.
+    /// Held until the list is reset, after its last run.
+    preludes_again: Mutex<Vec<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -2678,8 +2683,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// A fence signalled behind the flights before it, held until then.
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -2743,8 +2748,9 @@ const WHY_FENCE: usize = 10;
 /// microseconds settles waited for the card; value waits met by a flight's
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
-/// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+/// copy, a fill of upload memory, a texture); page remaps that waited for
+/// flights which may write the pages ([`land_before_remap`]).
+static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -3395,15 +3401,15 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
-/// air, if there are any, and is set when they are settled. Whether it
-/// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+/// air, if there are any, and is set when they are settled (the line holds
+/// the fence till then). The fence back if not: the caller sets it now.
+pub(crate) fn late_signal(fence: crate::fence::FenceRef, value: u64) -> Result<(), crate::fence::FenceRef> {
     if !late() {
-        return false;
+        return Err(fence);
     }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
-        return false;
+        return Err(fence);
     }
     line.line.push(Late::Signal(fence, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
@@ -3412,7 +3418,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     // the helper thread for it.
     LINE_MOVED.notify_one();
     RELAY_MOVED.notify_one();
-    true
+    Ok(())
 }
 
 /// A queue stands at `wait`, which memory does not meet now ([`late`]):
@@ -3468,6 +3474,36 @@ pub(crate) fn settle_now(why: usize) {
     };
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
     host.settle(&mut submitted, why);
+}
+
+/// Title memory `[address, address + len)` is about to show other physical
+/// pages: a queue's page-mapping copy, which the console runs behind the
+/// work sent before it. Flights in the air ([`late`]) whose shaders may
+/// write that memory land first, so that what they wrote goes to the pages
+/// it was written to; landed after the remap, it went to the pages mapped
+/// in their place (another resource's, which the title shows at other
+/// addresses too).
+pub(crate) fn land_before_remap(address: u64, len: u64) {
+    if !late() || len == 0 {
+        return;
+    }
+    let (from, to) = (address as usize, address.saturating_add(len) as usize);
+    let pending = {
+        let line = line();
+        line.settling || touches(&line.written, from, to)
+    };
+    if !pending {
+        return;
+    }
+    LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+    if relay() {
+        // Only until the flights that may write there have landed (the
+        // thread that lands them works `written` out anew from those still
+        // in the air).
+        relay_wait(WHY_SYNC, |line| !line.settling && !touches(&line.written, from, to));
+    } else {
+        settle_now(WHY_SYNC);
+    }
 }
 
 /// [`settle_now`] at a present, and for a fence the title blocks on.
@@ -3749,7 +3785,7 @@ fn late_line(frames: f64) {
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
-         settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
+         settled for: a synchronous submission or present {:.1} (pages remapped under flights' writes {:.1}), the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
          a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
          bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
@@ -3759,6 +3795,7 @@ fn late_line(frames: f64) {
         if s[1] > 0.0 { s[11] / s[1] } else { 0.0 },
         s[12] / 1000.0,
         s[WHY_SYNC],
+        s[18],
         s[WHY_CARD_DONE],
         s[WHY_VALUE],
         s[WHY_STALE],
@@ -3909,9 +3946,11 @@ fn join_copies() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
 }
 
-/// Since the last frame-rate line: title buffer copies recorded, and those
-/// that continue the one before ([`join_copies`]).
-static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Since the last frame-rate line: title buffer copies recorded, those
+/// that continue the one before ([`join_copies`]), those into bytes a copy
+/// of the same recording wrote before, and those out of bytes its shaders
+/// may write before them ([`HostList::defer_copy`]).
+static COPIES_JOINED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the last frame-rate line, what [`copy_mapped`] moved: bytes and
 /// calls into host copies of ours ([0], [1]), and into title memory ([2],
@@ -4240,6 +4279,7 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                preludes_again: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
@@ -5511,7 +5551,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => crate::fence::set(fence.this(), value),
             }
         }
         if last > 0 {
@@ -5987,7 +6027,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.this(), value),
                 }
             }
             if last > 0 {
@@ -6127,10 +6167,17 @@ impl Host {
                 }
             }
         }
+        // The lists run so far: a list run again records a prelude of its
+        // own (`HostList::prelude`).
+        let mut run_before: Vec<*const HostList> = Vec::new();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            let again = run_before.contains(&std::ptr::from_ref(*list));
+            if !again {
+                run_before.push(std::ptr::from_ref(*list));
+            }
+            if let Some(prelude) = list.prelude(again) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -6620,6 +6667,8 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Every run of the list has finished: the extra preludes are done.
+        self.preludes_again.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6643,6 +6692,12 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// The preludes held for second and later runs of the list (tests).
+    #[cfg(test)]
+    pub(crate) fn preludes_again(&self) -> usize {
+        self.preludes_again.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -6868,7 +6923,11 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// `again`: the submission runs the list a second time or more, after a
+    /// run whose prelude is recorded and not yet sent; this one is recorded
+    /// into a prelude of its own (the list's would be reset under the one
+    /// before, which would then run this one's transitions).
+    fn prelude(&self, again: bool) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -6937,17 +6996,30 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && hoisted.is_none() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let mut again_held = self.preludes_again.lock().unwrap_or_else(|e| e.into_inner());
+        let prelude = if again {
+            match host().and_then(|h| h.make_prelude()) {
+                Some(made) => {
+                    again_held.push(made);
+                    again_held.last()
+                }
+                None => None,
+            }
+        } else {
+            self.prelude
+                .get_or_init(|| host().and_then(|h| h.make_prelude()))
+                .as_ref()
+        };
+        let Some((allocator, list)) = prelude else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // What the last prelude's clamp noted, and where this one's goes.
-        let notes = hoisted.is_some().then(|| self.hoist_notes()).flatten();
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // What the last prelude's clamp noted, and where this one's goes;
+        // nothing for a second run, whose earlier prelude has not run yet.
+        let notes = (hoisted.is_some() && !again).then(|| self.hoist_notes()).flatten();
+        // SAFETY: the prelude is not executing: the list's own was last
+        // sent in a submission that has finished (every one is waited for,
+        // a list in the air is taken from the title's at its submission),
+        // a second run's is new; the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -7074,6 +7146,25 @@ impl HostList {
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
+        // Counted: copies the list's order would have made differ from
+        // copies at submission. Into bytes a copy recorded before wrote
+        // (with draws between, all of them read the last copy's bytes);
+        // out of bytes the recording's shaders may write before it (the
+        // copy takes the bytes from before they ran).
+        let (dst_end, src_end) = (dst as usize + len, src as usize + len);
+        let over = |a: usize, b: usize, from: usize, to: usize| a < to && from < b;
+        if deferred
+            .copies
+            .iter()
+            .rev()
+            .take(64)
+            .any(|s| matches!(*s, Step::Copy(d, _, n) if over(d, d + n, dst as usize, dst_end)))
+        {
+            COPIES_JOINED[2].fetch_add(1, Ordering::Relaxed);
+        }
+        if deferred.hoist.written.iter().any(|&(a, b)| over(a, b, src as usize, src_end)) {
+            COPIES_JOINED[3].fetch_add(1, Ordering::Relaxed);
+        }
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
         // step.
@@ -8329,11 +8420,14 @@ impl Meter {
             }
         }
         {
-            let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [copies, joined, again, written] =
+                [0, 1, 2, 3].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if copies > 0.0 {
                 tracing::info!(
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
-                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
+                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {}); done at submission out of their \
+                     list's order: {again:.1} into bytes a copy of the same list wrote before, {written:.1} out of bytes \
+                     the list's shaders may write before them",
                     if join_copies() { "on" } else { "off" }
                 );
             }
@@ -8454,7 +8548,7 @@ impl Meter {
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                 dropped {dropped:.0} without a host pipeline ({making} being made, {passed} of them no longer waited for) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
@@ -8475,6 +8569,7 @@ impl Meter {
                     crate::resource::PLANES[2].load(Ordering::Relaxed)
                 ),
                 making = crate::pipeline::making(),
+                passed = crate::pipeline::passed_over(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
