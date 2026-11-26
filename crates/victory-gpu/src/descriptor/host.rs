@@ -3892,6 +3892,25 @@ fn refused_view(unordered: bool, format: DXGI_FORMAT, first: u64, count: u32, st
     }
 }
 
+/// The float format of the same width as a 32-bit integer one (other formats as they are),
+/// for typed buffer views. Translated shaders declare every typed buffer load and store as
+/// 32-bit float (`victory_shader`'s `emit/lower.rs`); through a view in a 32-bit integer
+/// format the host converts between the float and the integer it rounds to, so an integer's
+/// bits stored as a float come out as 0 for most of them, where the console moves the bits.
+/// The float format moves them unchanged. The title's tiled cascade shadows set a flag bit of
+/// a per-tile word with a read-modify-write this way, which wiped the tile's other flags
+/// (characters' heads and skin lost, stepped shadow edges). After fxceless/victory-fork pull
+/// request #684 (`bit_exact_format`), as Xeltax/VIcky 33eba00 takes it.
+fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -3932,6 +3951,8 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
+    // (the same element size: the offsets below hold)
+    desc.Format = bit_exact_format(desc.Format);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -4044,6 +4065,8 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
+    // (the same element size: the first element above holds)
+    desc.Format = bit_exact_format(desc.Format);
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
@@ -5380,6 +5403,33 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typed buffer views of 32-bit integer formats are made in the float format of the same
+    /// width (the same element size); every other format is the title's.
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32_SINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(bit_exact_format(title), host);
+            assert_eq!(crate::resource::element(title.0 as u32), crate::resource::element(host.0 as u32));
+        }
+        for kept in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            assert_eq!(bit_exact_format(kept), kept);
+        }
+    }
 
     #[test]
     fn the_table_skip_window_is_two_frames_unless_set() {
