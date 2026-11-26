@@ -112,6 +112,20 @@ const _: () = assert!(size_of::<ResourceDesc>() == 56);
 const BUFFER: u32 = 1;
 const TEXTURE_3D: u32 = 4;
 
+/// The host dimension of a title resource: 1D textures (and 1D arrays) are
+/// 2D on the host, one texel high. The console reads a 1D texture with 2D
+/// image instructions too (its hardware goes by the descriptor and ignores
+/// the extra coordinate); D3D12 wants the shader's resource type to match
+/// the view's, and the view's the texture's, else the read is undefined (on
+/// an RTX 5090 every lane read 0.0; GPU-based validation id 940). So the
+/// textures are made 2D, the title's 1D views of them become 2D views
+/// (`descriptor::host`), and the translation declares every 1D image 2D.
+pub(crate) fn host_dimension(dimension: u32) -> u32 {
+    const TEXTURE_1D: u32 = 2;
+    const TEXTURE_2D: u32 = 3;
+    if dimension == TEXTURE_1D { TEXTURE_2D } else { dimension }
+}
+
 /// Bytes per element and the element's width in texels (4 for block
 /// compression), by DXGI format number. `None` for 1-bit and video
 /// formats. The console adds 116/117 (10-bit float color), 118-120 (16-bit
@@ -2608,6 +2622,11 @@ fn host_texture_as(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    // One texel high; a 1D array's size stays its slice count.
+    if host_dimension(d.dimension) != d.dimension {
+        d.dimension = host_dimension(d.dimension);
+        d.height = 1;
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
     // The host copy loses the unordered access: shaders write a colour

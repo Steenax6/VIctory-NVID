@@ -37,6 +37,21 @@ mod float64;
 
 type Why = &'static str;
 
+/// The DXIL resource kind an image of kind `kind` is declared as: a 1D
+/// texture (1) or 1D array (6) as the 2D texture (2) or 2D array (7) one
+/// texel high that the host makes of it (`victory-gpu`'s
+/// `resource::host_dimension`). The console reads a 1D texture with 2D
+/// image instructions too, its hardware going by the descriptor; D3D12
+/// wants the declared kind to match the view, which for the title's 1D
+/// textures is 2D on the host either way.
+fn host_kind(kind: u32) -> u32 {
+    match kind {
+        1 => 2,
+        6 => 7,
+        k => k,
+    }
+}
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -9482,6 +9497,20 @@ impl<'a> Lower<'a> {
             5 => (7, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
+        // 1D and 1D arrays are read as 2D ones one texel high, as the host
+        // makes their textures and views ([`host_kind`]): the addresses are
+        // read as 1D and get y = 0 (`flat_to_2d`), the slice moving to the
+        // third place. Level, bias, comparison, gradients and offsets keep
+        // the console's 1D order.
+        let flat = kind == 1 || kind == 6;
+        let flat_to_2d = |cs: &mut [V], zero: V| {
+            if kind == 6 {
+                cs[2] = cs[1];
+            }
+            if flat {
+                cs[1] = zero;
+            }
+        };
         // Address VGPRs in order.
         let mut regs = Vec::new();
         for a in addr {
@@ -9517,7 +9546,7 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let props = (host_kind(kind) | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -9552,6 +9581,7 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
+            flat_to_2d(&mut cs, self.s.m.i32(0));
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
@@ -9574,7 +9604,7 @@ impl<'a> Lower<'a> {
             } else {
                 original
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, component))?;
+            let h = self.handle(site, src, false, (host_kind(kind) | 0x1000, component))?;
             let mut args = vec![h];
             let (intrinsic, opcode) = if compare {
                 let comparand = if wide {
@@ -9635,6 +9665,7 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
+            flat_to_2d(&mut cs, self.s.m.i32(0));
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
@@ -9715,10 +9746,12 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                // A 1D array's layers, read from the 2D array's third place.
+                let from = if kind == 6 && ch == 1 { 2 } else { ch };
                 let x = if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
-                    self.s.m.extract(c, d, ch)
+                    self.s.m.extract(c, d, from)
                 };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
@@ -9801,6 +9834,10 @@ impl<'a> Lower<'a> {
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
                 }
             }
+            flat_to_2d(&mut cs, self.s.m.f32(0));
+            // The coordinates the host's level of detail comes from: a 1D
+            // one's y (0) too.
+            let host_spatial = spatial + usize::from(flat);
             if op == 81 {
                 // The clamped then the unclamped level of detail.
                 let Operand::Vector { reg, .. } = *data else {
@@ -9810,7 +9847,7 @@ impl<'a> Lower<'a> {
                 // The level comes from the coordinates the size divides: an array's layer
                 // is none of them (DXIL wants it undefined).
                 let mut at = [fu; 3];
-                at[..spatial].copy_from_slice(&cs[..spatial]);
+                at[..host_spatial].copy_from_slice(&cs[..host_spatial]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -9833,7 +9870,8 @@ impl<'a> Lower<'a> {
             };
             let zero = self.s.m.i32(0);
             let mut os = vec![iu; 3];
-            for o in os.iter_mut().take(offsets) {
+            // A 1D sample's y offset (its texture is 2D on the host) is 0.
+            for o in os.iter_mut().take(offsets + usize::from(flat)) {
                 *o = zero;
             }
             if offset_word && offsets > 0 {
@@ -9910,7 +9948,12 @@ impl<'a> Lower<'a> {
                     } else {
                         None
                     };
-                    let g = self.quad_gradients(&cs[..spatial], scale);
+                    let mut g = self.quad_gradients(&cs[..spatial], scale);
+                    if flat {
+                        // No change along the host texture's one-texel y.
+                        let z = self.s.m.f32(0);
+                        (g[1], g[4]) = (z, z);
+                    }
                     args.extend(&os);
                     args.extend(g);
                     args.push(clamp);
@@ -10021,6 +10064,11 @@ impl<'a> Lower<'a> {
                         g[k] = to_float(self, x);
                         let y = addr_packed(self, first + deriv_regs, k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if flat {
+                        // No change along the host texture's one-texel y.
+                        let z = self.s.m.f32(0);
+                        (g[1], g[4]) = (z, z);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -10171,6 +10219,7 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.i32(0)
             };
+            flat_to_2d(&mut cs, self.s.m.i32(0));
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);

@@ -568,7 +568,25 @@ impl RtvRecord {
         };
         // A target or depth view: of a target, in its stand-in format.
         words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
+        one_d_as_2d(&mut words, dimension == 3);
         Some(words)
+    }
+}
+
+/// The words of a render target (`depth`: depth) view of a 1D texture or
+/// 1D array as the 2D view of the host's copy, one texel high
+/// (`resource::host_dimension`). Render target views: 1D 2, 1D array 3,
+/// 2D 4, 2D array 5, the 2D forms with `PlaneSlice` (0) after the 1D
+/// fields. Depth views: 1D 1, 1D array 2, 2D 3, 2D array 4, the same
+/// fields.
+#[cfg(windows)]
+fn one_d_as_2d(words: &mut [u32; 6], depth: bool) {
+    match (depth, words[1]) {
+        (false, 2) => (words[1], words[3]) = (4, 0),
+        (false, 3) => (words[1], words[5]) = (5, 0),
+        (true, 1) => words[1] = 3,
+        (true, 2) => words[1] = 4,
+        _ => {}
     }
 }
 
@@ -1436,6 +1454,23 @@ mod tests {
     /// placement stays inside the value.
     #[repr(C)]
     struct Extended(HeapDesc, Placement);
+
+    /// Target and depth views of 1D textures and arrays become the 2D
+    /// views of the host's copies (plane 0); 2D views keep their words.
+    #[cfg(windows)]
+    #[test]
+    fn one_d_target_and_depth_views_become_2d_views() {
+        let as_2d = |mut words: [u32; 6], depth| {
+            one_d_as_2d(&mut words, depth);
+            words
+        };
+        assert_eq!(as_2d([28, 2, 3, 9, 0, 0], false), [28, 4, 3, 0, 0, 0]);
+        assert_eq!(as_2d([28, 3, 1, 2, 4, 9], false), [28, 5, 1, 2, 4, 0]);
+        assert_eq!(as_2d([28, 4, 3, 1, 0, 0], false), [28, 4, 3, 1, 0, 0]);
+        assert_eq!(as_2d([40, 1, 0, 2, 0, 0], true), [40, 3, 0, 2, 0, 0]);
+        assert_eq!(as_2d([40, 2, 0, 1, 2, 4], true), [40, 4, 0, 1, 2, 4]);
+        assert_eq!(as_2d([40, 3, 0, 1, 0, 0], true), [40, 3, 0, 1, 0, 0]);
+    }
 
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);

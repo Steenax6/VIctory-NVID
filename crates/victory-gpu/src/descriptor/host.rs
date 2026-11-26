@@ -2620,10 +2620,52 @@ macro_rules! once {
     }};
 }
 
-/// A view description from its words, with the format as the host has it.
+/// The words of a shader view of a 1D texture or 1D array as the 2D view
+/// of the host's copy (`resource::host_dimension`): same mips and slices,
+/// plane 0. The 2D forms have `PlaneSlice` before the clamp (word 6 of a
+/// 2D view, word 8 of a 2D array).
+fn srv_words_2d(words: &mut [u32; 10]) {
+    const TEXTURE1D: u32 = 2;
+    const TEXTURE1DARRAY: u32 = 3;
+    match words[1] {
+        TEXTURE1D => {
+            words[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+            words[7] = words[6];
+            words[6] = 0;
+        }
+        TEXTURE1DARRAY => {
+            words[1] = D3D12_SRV_DIMENSION_TEXTURE2DARRAY.0 as u32;
+            words[9] = words[8];
+            words[8] = 0;
+        }
+        _ => {}
+    }
+}
+
+/// [`srv_words_2d`] for unordered access views: the 2D forms add
+/// `PlaneSlice` at their end.
+fn uav_words_2d(words: &mut [u32; 10]) {
+    const TEXTURE1D: u32 = 2;
+    const TEXTURE1DARRAY: u32 = 3;
+    match words[1] {
+        TEXTURE1D => {
+            words[1] = D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32;
+            words[3] = 0;
+        }
+        TEXTURE1DARRAY => {
+            words[1] = D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0 as u32;
+            words[5] = 0;
+        }
+        _ => {}
+    }
+}
+
+/// A view description from its words, with the format as the host has it
+/// and a 1D view as the 2D view of the host's copy ([`srv_words_2d`]).
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
+    srv_words_2d(&mut words);
     // SAFETY: 40 bytes in the host's layout.
     unsafe {
         std::ptr::from_ref(&words)
@@ -2632,9 +2674,11 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
+/// [`srv_desc`] for unordered access views ([`uav_words_2d`]).
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
+    uav_words_2d(&mut words);
     // SAFETY: 40 bytes in the host's layout.
     unsafe {
         std::ptr::from_ref(&words)
@@ -3311,7 +3355,9 @@ pub(crate) static OTHER_CHANNELS: std::sync::atomic::AtomicU64 = std::sync::atom
 /// ([`other_channels`]). Each distinct case is logged once (at most 32),
 /// and so is each distinct alpha-only view of an alpha-only texture, which
 /// needs no change: they say how the title's A8 tables are read.
-fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+/// `title_dimension` is the title's view dimension (a 1D view is made 2D:
+/// `resource::host_dimension`).
+fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, title_dimension: u32) {
     const A8_UNORM: u32 = 65;
     // SAFETY: a live resource.
     let own = unsafe { texture.GetDesc() }.Format.0 as u32;
@@ -3324,7 +3370,7 @@ fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_
     }
     if other.is_some() || view == A8_UNORM || own == A8_UNORM {
         static SEEN: Mutex<Vec<(u32, u32, i32, u32)>> = Mutex::new(Vec::new());
-        let case = (view, own, desc.ViewDimension.0, desc.Shader4ComponentMapping);
+        let case = (view, own, title_dimension as i32, desc.Shader4ComponentMapping);
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if seen.len() < 32 && !seen.contains(&case) {
             seen.push(case);
@@ -3332,7 +3378,8 @@ fn read_through(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_
                 view_format = view,
                 texture_format = own,
                 host_format = desc.Format.0,
-                dimension = desc.ViewDimension.0,
+                dimension = title_dimension,
+                host_dimension = desc.ViewDimension.0,
                 mapping = desc.Shader4ComponentMapping,
                 through_other_channels = other.is_some(),
                 "a shader view of an alpha-only format, or read through other channels"
@@ -3592,9 +3639,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         }
                     }
                 }
+                let title_dimension = desc.map(|d| d[1]);
                 let mut desc = desc.as_ref().map(srv_desc);
-                if let Some(desc) = desc.as_mut() {
-                    read_through(texture, desc);
+                if let (Some(desc), Some(dimension)) = (desc.as_mut(), title_dimension) {
+                    read_through(texture, desc, dimension);
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -3808,33 +3856,38 @@ pub(crate) enum NullKind {
     Plain,
     /// A null unordered access view of a buffer.
     BufferUav,
-    /// [`null_uav_desc`] of this dimension (one it tells apart: 1D, 1D and
-    /// 2D arrays, 3D; 2D for every other).
+    /// [`null_uav_desc`] of this dimension (one it tells apart: 2D arrays,
+    /// 3D; 2D for every other).
     TextureUav(u32),
-    /// [`null_like`] of a description of this dimension (2 to 10).
+    /// [`null_like`] of a description of this dimension (4 to 10).
     Like(u32),
 }
 
 /// The dimensions [`NullKind::TextureUav`] holds, in its template order.
-const UAV_DIMENSIONS: [D3D12_UAV_DIMENSION; 5] = [
-    D3D12_UAV_DIMENSION_TEXTURE1D,
-    D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+/// The title's 1D and 1D-array views are the 2D and 2D-array ones, as the
+/// translation declares them (`resource::host_dimension`).
+const UAV_DIMENSIONS: [D3D12_UAV_DIMENSION; 3] = [
     D3D12_UAV_DIMENSION_TEXTURE2D,
     D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
     D3D12_UAV_DIMENSION_TEXTURE3D,
 ];
 
-/// The dimensions [`NullKind::Like`] holds.
-const LIKE_DIMENSIONS: std::ops::RangeInclusive<u32> = 2..=10;
+/// The dimensions [`NullKind::Like`] holds: 2D on, a 1D (array) taking
+/// the 2D (array) one.
+const LIKE_DIMENSIONS: std::ops::RangeInclusive<u32> = 4..=10;
 
 /// How many kinds of [`NullKind`] there are.
-const NULL_KINDS: usize = 4 + UAV_DIMENSIONS.len() + 9;
+const NULL_KINDS: usize = 4 + UAV_DIMENSIONS.len() + 7;
 
 impl NullKind {
     /// A null texture UAV of the title's view dimension, as
     /// [`null_uav_desc`] tells them apart.
     fn texture_uav(dimension: Option<u32>) -> NullKind {
-        let d = dimension.map(|d| D3D12_UAV_DIMENSION(d as i32));
+        let d = dimension.map(|d| match D3D12_UAV_DIMENSION(d as i32) {
+            D3D12_UAV_DIMENSION_TEXTURE1D => D3D12_UAV_DIMENSION_TEXTURE2D,
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            d => d,
+        });
         let told = d.filter(|d| UAV_DIMENSIONS.contains(d)).unwrap_or(D3D12_UAV_DIMENSION_TEXTURE2D);
         NullKind::TextureUav(told.0 as u32)
     }
@@ -3842,6 +3895,13 @@ impl NullKind {
     /// A null view like the description of dimension `dimension`
     /// ([`null_like`] makes [`null_view`] for the others).
     fn like(dimension: u32) -> NullKind {
+        const TEXTURE1D: u32 = 2;
+        const TEXTURE1DARRAY: u32 = 3;
+        let dimension = match dimension {
+            TEXTURE1D => D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            TEXTURE1DARRAY => D3D12_SRV_DIMENSION_TEXTURE2DARRAY.0 as u32,
+            d => d,
+        };
         if LIKE_DIMENSIONS.contains(&dimension) {
             NullKind::Like(dimension)
         } else {
@@ -3857,9 +3917,9 @@ impl NullKind {
             NullKind::Plain => 2,
             NullKind::BufferUav => 3,
             NullKind::TextureUav(d) => {
-                4 + UAV_DIMENSIONS.iter().position(|u| u.0 as u32 == d).unwrap_or(2)
+                4 + UAV_DIMENSIONS.iter().position(|u| u.0 as u32 == d).unwrap_or(0)
             }
-            NullKind::Like(d) => 4 + UAV_DIMENSIONS.len() + (d.clamp(2, 10) - 2) as usize,
+            NullKind::Like(d) => 4 + UAV_DIMENSIONS.len() + (d.clamp(4, 10) - 4) as usize,
         }
     }
 
@@ -4061,10 +4121,12 @@ fn striped() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_STRIPES").is_none_or(|v| v != "0"))
 }
 
-/// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
-/// 3D), 2D if it names none: a 2D null view where the shader writes a 3D
-/// texture is a mismatch GPU-based validation reports (the world's wind
-/// field, CS_CopyWindFieldBeforeUpdateWithSmooth, 2026-11-24).
+/// A null texture UAV of the title's view dimension (2D arrays, 3D), 2D if
+/// it names none: a 2D null view where the shader writes a 3D texture is a
+/// mismatch GPU-based validation reports (the world's wind field,
+/// CS_CopyWindFieldBeforeUpdateWithSmooth, 2026-11-24). 1D and 1D arrays
+/// are 2D and 2D arrays, as the translation declares them
+/// (`resource::host_dimension`).
 fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
@@ -4072,17 +4134,7 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
         ..Default::default()
     };
     match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
-        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => {
-            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
-        }
-        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
-            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
-            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
-                ArraySize: 1,
-                ..Default::default()
-            };
-        }
-        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY | D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
             desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
             desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
                 ArraySize: 1,
@@ -4132,7 +4184,18 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         return null_view(at);
     }
     let Some(host) = host() else { return };
-    // One mip, one slice or cube, plane 0: fields a null view still checks.
+    let desc = null_like_desc(words);
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device
+            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+    };
+}
+
+/// [`null_like`]'s description: one mip, one slice or cube, plane 0
+/// (fields a null view still checks); a 1D (array) as the 2D (array) view
+/// [`srv_desc`] makes of it.
+fn null_like_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut w = [0u32; 10];
     w[1] = words[1];
     match words[1] {
@@ -4144,11 +4207,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let mut desc = srv_desc(&w);
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    desc
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -4264,7 +4323,7 @@ void main(uint3 id : SV_DispatchThreadID) { o[id.x] = t.Load(int3(id.x, 0, 0)); 
                 .expect("the texels");
             texture.Unmap(0, None);
             let mut desc = srv_desc(&words);
-            read_through(&texture, &mut desc);
+            read_through(&texture, &mut desc, words[1]);
             assert!(fits(&texture, Some(&mut desc.Format), false), "a view the host makes");
             let heap: ID3D12DescriptorHeap = device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -4477,11 +4536,143 @@ mod tests {
         // SAFETY: the member the dimension names.
         assert_eq!(unsafe { d.Anonymous.Texture2DArray.ArraySize }, 1);
         let dimension = |d| null_uav_desc(d).ViewDimension;
-        assert_eq!(dimension(Some(2)), D3D12_UAV_DIMENSION_TEXTURE1D);
+        // 1D and 1D arrays as the host's 2D copies of them.
+        assert_eq!(dimension(Some(2)), D3D12_UAV_DIMENSION_TEXTURE2D);
+        assert_eq!(dimension(Some(3)), D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
         assert_eq!(dimension(Some(4)), D3D12_UAV_DIMENSION_TEXTURE2D);
         assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
         // Multisampled UAVs need a cap; they stay 2D.
         assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
+        // The null templates fold 1D into 2D as well.
+        assert_eq!(NullKind::texture_uav(Some(2)), NullKind::texture_uav(Some(4)));
+        assert_eq!(NullKind::texture_uav(Some(3)), NullKind::texture_uav(Some(5)));
+        assert_eq!(NullKind::like(2), NullKind::Like(4));
+        assert_eq!(NullKind::like(3), NullKind::Like(5));
+        assert_eq!(null_like_desc(&[0, 3, 0, 0, 0, 0, 0, 0, 0, 0]).ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+    }
+
+    /// The title's 1D shader views become 2D views of the same mips and
+    /// slices, the clamp moved past `PlaneSlice` (0); 2D and buffer views
+    /// are left as they are (Marvisak/VIctory PR #1727).
+    #[test]
+    fn one_d_shader_views_become_2d_views() {
+        let clamp = 0.5f32.to_bits();
+        // TEXTURE1D: mip 1, 3 levels, clamp.
+        let d = srv_desc(&[28, 2, 0x1688, 0, 1, 3, clamp, 0, 0, 0]);
+        assert_eq!(d.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+        // SAFETY: the member the dimension names.
+        let t = unsafe { d.Anonymous.Texture2D };
+        assert_eq!((t.MostDetailedMip, t.MipLevels, t.PlaneSlice), (1, 3, 0));
+        assert_eq!(t.ResourceMinLODClamp, 0.5);
+        assert_eq!(d.Shader4ComponentMapping, 0x1688);
+        // TEXTURE1DARRAY: mip 0, 1 level, slices 2..6, clamp.
+        let d = srv_desc(&[28, 3, 0x1688, 0, 0, 1, 2, 4, clamp, 0]);
+        assert_eq!(d.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: the member the dimension names.
+        let t = unsafe { d.Anonymous.Texture2DArray };
+        assert_eq!((t.MipLevels, t.FirstArraySlice, t.ArraySize, t.PlaneSlice), (1, 2, 4, 0));
+        assert_eq!(t.ResourceMinLODClamp, 0.5);
+        // A 2D view and a buffer view keep their words.
+        let d = srv_desc(&[28, 4, 0x1688, 0, 1, 3, 0, clamp, 0, 0]);
+        assert_eq!(d.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture2D.ResourceMinLODClamp }, 0.5);
+        let d = srv_desc(&[28, 1, 0x1688, 0, 7, 0, 9, 0, 0, 0]);
+        assert_eq!(d.ViewDimension, D3D12_SRV_DIMENSION_BUFFER);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { (d.Anonymous.Buffer.FirstElement, d.Anonymous.Buffer.NumElements) }, (7, 9));
+    }
+
+    /// The title's 1D unordered access views become 2D ones, plane 0.
+    #[test]
+    fn one_d_unordered_views_become_2d_views() {
+        let d = uav_desc(&[28, 2, 2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2D);
+        // SAFETY: the member the dimension names.
+        let t = unsafe { d.Anonymous.Texture2D };
+        assert_eq!((t.MipSlice, t.PlaneSlice), (2, 0));
+        let d = uav_desc(&[28, 3, 1, 3, 5, 0, 0, 0, 0, 0]);
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: the member the dimension names.
+        let t = unsafe { d.Anonymous.Texture2DArray };
+        assert_eq!((t.MipSlice, t.FirstArraySlice, t.ArraySize, t.PlaneSlice), (1, 3, 5, 0));
+    }
+
+    /// A 1D texture's host copy is a 2D texture one texel high, and the
+    /// views the title makes of it as 1D (shader and unordered, plain and
+    /// array) are accepted on it by the real device, as are the 1D null
+    /// views.
+    #[test]
+    fn one_d_texture_is_a_2d_host_texture_its_1d_views_fit() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        assert_eq!(crate::resource::host_dimension(2), 3);
+        assert_eq!(crate::resource::host_dimension(3), 3);
+        assert_eq!(crate::resource::host_dimension(4), 4);
+        let made = |slices: u16| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION(crate::resource::host_dimension(2) as i32),
+                Width: 128,
+                Height: 1,
+                DepthOrArraySize: slices,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: plain object creation into our out parameter.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+            }
+            .expect("a 128x1 texture");
+            texture.expect("a 128x1 texture")
+        };
+        let (one, array) = (made(1), made(4));
+        // SAFETY: plain heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 8,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })
+        }
+        .expect("a view heap");
+        // SAFETY: a live device.
+        let step = unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        // SAFETY: a live heap.
+        let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let at = |k: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + k * step as usize };
+        // The title's TEXTURE1D views (format 61, R8_UNORM, all levels),
+        // its TEXTURE1DARRAY views (slices 1..3), and the 1D null views.
+        let srv = srv_desc(&[61, 2, 0x1688, 0, 0, u32::MAX, 0, 0, 0, 0]);
+        let srv_array = srv_desc(&[61, 3, 0x1688, 0, 0, u32::MAX, 1, 2, 0, 0]);
+        let uav = uav_desc(&[61, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let uav_array = uav_desc(&[61, 3, 0, 1, 2, 0, 0, 0, 0, 0]);
+        // SAFETY: live textures and slots of our heap; null resources are
+        // allowed with a description.
+        unsafe {
+            host.device.CreateShaderResourceView(&one, Some(&srv), at(0));
+            host.device.CreateShaderResourceView(&array, Some(&srv_array), at(1));
+            host.device.CreateUnorderedAccessView(&one, None::<&ID3D12Resource>, Some(&uav), at(2));
+            host.device.CreateUnorderedAccessView(&array, None::<&ID3D12Resource>, Some(&uav_array), at(3));
+        }
+        make_null_kind(NullKind::texture_uav(Some(2)), at(4));
+        make_null_kind(NullKind::texture_uav(Some(3)), at(5));
+        make_null_kind(NullKind::like(2), at(6));
+        make_null_kind(NullKind::like(3), at(7));
+        // SAFETY: a live device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// What the texture code asks of the spans (levels on demand): where

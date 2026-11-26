@@ -5,7 +5,7 @@
 
 use super::{
     Attr, Bin, Fields, Inst, Lower, Operand, Reg, ResourceType, Role, Site, Source, UsedResource, V,
-    Val, Why,
+    Val, Why, host_kind,
 };
 
 impl<'a> Lower<'a> {
@@ -99,7 +99,8 @@ impl<'a> Lower<'a> {
                         5 => 7,
                         _ => return Err("an image dimension (cube or MSAA)"),
                     };
-                    ((kind | u, 0x409), Some(kind))
+                    // Declared 2D for a 1D (array), as `image` reads them.
+                    ((host_kind(kind) | u, 0x409), Some(kind))
                 }
                 Fields::Buffer { idxen, format, .. } => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -216,7 +217,8 @@ impl<'a> Lower<'a> {
                 let (height, depth) = match kind {
                     1 => (one, one),
                     2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
+                    // The 2D array's layers (its third place).
+                    6 => (one, field(self, 2)),
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
