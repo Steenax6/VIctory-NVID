@@ -61,6 +61,65 @@ pub fn is_spilled(native: &NativeProgram) -> bool {
     spilled(native).is_some()
 }
 
+/// The trap temporary (`ttmp15`) the entry code of [`thread_limited`] reads: the threads
+/// of the dispatch left from this group's first on ([`crate::io::Input::ThreadsLeft`]).
+/// The console's compute programs never read the trap temporaries.
+pub const THREADS_LEFT: u8 = 123;
+
+/// The entry code of [`thread_limited`] for a program of 64 or 32 lanes a wave:
+/// `v_cmp_gt_u32 vcc, ttmp15, v0` (this lane's thread in x is below the threads left), then
+/// `s_and_b64 exec, exec, vcc` (`s_and_b32 exec_lo, exec_lo, vcc_lo`).
+pub(crate) fn thread_limit_code(wave64: bool) -> [u32; 2] {
+    let and = if wave64 { 15 } else { 14 };
+    [
+        0x7C00_0000 | 0xC4 << 17 | u32::from(THREADS_LEFT),
+        0x8000_0000 | and << 23 | 126 << 16 | 106 << 8 | 126,
+    ]
+}
+
+/// `native` with the entry code that leaves in EXEC the lanes the console launches when
+/// a dispatch counts threads, if it is a compute program of the structure builder (one
+/// with a spilled user-data table, [`is_spilled`]); else unchanged.
+///
+/// `DispatchX` can count threads instead of groups (`USE_THREAD_DIMENSIONS`); the
+/// structure builder dispatches this way. The console then starts only the threads up to
+/// the count in the last group: its other lanes are off in EXEC from the start, and a
+/// wave with none is not started. The host runs that group whole. So the program gets
+/// [`thread_limit_code`] in front of its own: EXEC ANDed with "the lane's thread in x is
+/// below the threads left from its group's first", which lowering reads from the
+/// dispatch's thread count (user data of kind [`crate::emit::USER_DISPATCH_THREADS`],
+/// `u32::MAX` for a dispatch of whole groups) and the group id. The title's code runs
+/// unchanged behind it, so its lane counts, saved EXECs and scans that turn every lane on
+/// see the lanes the console's would, in every form the translator has (the paired form's
+/// upper lanes too). Only `x` is cut: the builder's groups are one row.
+///
+/// shortcut: a host wave none of whose lanes is launched still runs, with EXEC clear: its
+/// scalar code runs where the console's wave would not exist.
+///
+/// After DexNom/VIctory PR #35 (pr0vId3nce, `spill::thread_limited`: EXEC masked by
+/// instructions ahead of the program), here with the count read through a trap
+/// temporary rather than a load of the spilled table.
+pub fn thread_limited(mut native: NativeProgram) -> NativeProgram {
+    if !is_spilled(&native) {
+        return native;
+    }
+    let mut code: Vec<u8> = thread_limit_code(native.wave64)
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    code.extend_from_slice(&native.code);
+    native.code = code;
+    native
+}
+
+/// Whether `native` starts with [`thread_limited`]'s entry code.
+pub fn has_thread_limit(native: &NativeProgram) -> bool {
+    let words = thread_limit_code(native.wave64);
+    native.stage == HwStage::Cs
+        && native.code.len() >= 8
+        && native.code[..8].chunks(4).zip(words).all(|(c, w)| c == w.to_le_bytes())
+}
+
 /// Rewrites the loads of `native`'s spilled user-data table in `p`; returns
 /// how many loads it replaced. Nothing changes unless the program is a
 /// compute program whose layout has entries past its user SGPRs, the first

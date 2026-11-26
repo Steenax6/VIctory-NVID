@@ -8568,12 +8568,15 @@ impl Meter {
             );
         }
         {
-            let [counted, partial] = std::array::from_fn(|k| crate::draw::THREAD_DISPATCHES[k].swap(0, Ordering::Relaxed));
+            let [counted, cut, whole] =
+                std::array::from_fn(|k| crate::draw::THREAD_DISPATCHES[k].swap(0, Ordering::Relaxed));
             if counted > 0 {
                 tracing::info!(
-                    "dispatches that count threads: {:.1} a frame, {:.1} of them end in a partial group (run whole)",
+                    "dispatches that count threads: {:.1} a frame; ending in a partial group: {:.1} cut at the \
+                     count, {:.1} run whole",
                     counted as f64 / frames,
-                    partial as f64 / frames,
+                    cut as f64 / frames,
+                    whole as f64 / frames,
                 );
             }
         }

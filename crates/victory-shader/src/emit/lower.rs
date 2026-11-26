@@ -2453,6 +2453,26 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::ThreadsLeft => {
+                // The dispatch's threads in x less those of the groups before this one
+                // (`spill::thread_limited`): u32::MAX for a dispatch of whole groups leaves
+                // more than a group in every one; a group past the count has none.
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let width = match self.x.native.io {
+                    StageIo::Cs(cs) => cs.threads[0],
+                    _ => return Val::Missing("the threads left of a dispatch outside a compute program"),
+                };
+                let count = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS), 0, 0);
+                let e = self.s.entry;
+                let width = self.s.m.i32(width);
+                let before = self.s.m.bin(e, Bin::Mul, g, width);
+                let left = self.s.m.bin(e, Bin::Sub, count, before);
+                let some = self.s.m.cmp(e, pred::IUGT, count, before);
+                let zero = self.s.m.i32(0);
+                return Val::I32(self.s.m.select(e, some, left, zero));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()

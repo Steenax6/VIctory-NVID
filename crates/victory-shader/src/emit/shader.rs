@@ -77,6 +77,13 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// by a program that reads its group id ([`crate::io::Input::GroupId`] and
 /// the mesh stage's group), which adds it to `x`.
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// threads in `x` of a dispatch that counts threads (`DispatchX` with
+/// `USE_THREAD_DIMENSIONS`), `u32::MAX` for one of whole groups. Read only
+/// by a program with [`crate::spill::thread_limited`]'s entry code, whose
+/// lanes past the count are off in EXEC from the start, as the console
+/// launches them.
+pub const USER_DISPATCH_THREADS: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

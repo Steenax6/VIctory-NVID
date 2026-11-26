@@ -306,6 +306,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// The threads in x of the dispatch being bound, if it counts threads
+    /// (`victory_shader::emit::USER_DISPATCH_THREADS`).
+    threads_x: Option<u32>,
 }
 
 impl Drop for State {
@@ -551,9 +554,10 @@ pub(crate) fn group_pieces() -> u32 {
 }
 
 /// Since the last frame line: direct dispatches that count threads
-/// ([`crate::list::USE_THREAD_DIMENSIONS`]), and those of them whose last
-/// group is partial (run whole, see [`State::dispatch`]).
-pub(crate) static THREAD_DISPATCHES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// ([`crate::list::USE_THREAD_DIMENSIONS`]), those of them whose last
+/// group is partial and cut at the count, and those whose partial group
+/// runs whole (see [`State::dispatch`]).
+pub(crate) static THREAD_DISPATCHES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Since the last frame line: indirect dispatch executions recorded in
 /// pieces, the `ExecuteIndirect` calls they took, and direct dispatches
@@ -925,9 +929,16 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_THREADS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_DISPATCH_THREADS {
+            // Every thread of every group, but in a dispatch that counts
+            // threads ([`State::dispatch`]).
+            return self.threads_x.unwrap_or(u32::MAX);
         }
         if kind == USER_GROUP_BASE {
             // The first group of the dispatch being bound: 0 until a
@@ -2442,22 +2453,33 @@ impl State {
                 );
             });
         }
-        // shortcut: the console starts only the threads up to the count in
-        // a partial last group; the host runs that group whole, so its
-        // threads past the count run too (at most a group less one more
-        // than asked, not 64 times as many). Cutting them needs the
-        // count in the translated program (victory_shader), which has no
-        // place for it yet.
+        // The console starts only the threads up to the count in a partial
+        // last group. A program that reads the count (the structure
+        // builder's: `victory_shader::spill::thread_limited`) has its lanes
+        // past it off in EXEC from the start, as there.
+        // shortcut: any other program, and a group partial in y or z, runs
+        // that group whole, its threads past the count too (at most a group
+        // less one more than asked, not 64 times as many).
         if partial {
-            THREAD_DISPATCHES[1].fetch_add(1, Ordering::Relaxed);
-            once!(
-                pipeline = %p.name,
-                threads = ?dims,
-                ?group,
-                "a dispatch that counts threads ends in a partial group: the host runs that group whole (counted in the frame line)"
-            );
+            let reads_count = p.stages[0].translated().host.user_data.iter().any(|u| {
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS)
+            });
+            let cut = reads_count && (1..3).all(|i| dims[i].is_multiple_of(group[i].max(1)));
+            THREAD_DISPATCHES[if cut { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+            if !cut {
+                once!(
+                    pipeline = %p.name,
+                    threads = ?dims,
+                    ?group,
+                    "a dispatch that counts threads ends in a partial group its program cannot cut: the host runs that \
+                     group whole (counted in the frame line)"
+                );
+            }
         }
-        if !self.bind(list, p, true) {
+        self.threads_x = (flags & crate::list::USE_THREAD_DIMENSIONS != 0).then_some(dims[0]);
+        let bound = self.bind(list, p, true);
+        self.threads_x = None;
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
