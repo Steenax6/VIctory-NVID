@@ -3112,6 +3112,11 @@ impl Drop for Resource {
         // A running submission may still read the host copy (and a depth
         // texture's colour twin).
         if let Some((host, twin)) = made {
+            // Lists that hold it past this are counted at their submission.
+            crate::released::mark(&host.texture);
+            if let Some(twin) = &twin {
+                crate::released::mark(&twin.colour.texture);
+            }
             crate::host::retire(host);
             if let Some(twin) = twin {
                 crate::host::retire(twin);

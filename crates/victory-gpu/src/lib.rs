@@ -53,6 +53,8 @@ mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
+#[cfg(windows)]
+mod released;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;

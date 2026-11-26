@@ -6663,6 +6663,9 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         remember_lists(runs);
+        for run in runs {
+            run.count_released();
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
@@ -8457,6 +8460,35 @@ impl HostList {
         }
     }
 
+    /// At its submission: the host textures this list holds that the title
+    /// released before (`crate::released`), each once, counted as held by a
+    /// state of the list or by a keep alone.
+    fn count_released(&self) {
+        use windows::core::Interface;
+        let mut seen = std::collections::HashSet::new();
+        let held: std::collections::HashSet<usize> = {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, _, copy) in states.values() {
+                if seen.insert(copy.texture.as_raw() as usize)
+                    && let Some(frame) = crate::released::released(&copy.texture)
+                {
+                    crate::released::found(&copy.texture, frame, false);
+                }
+            }
+            states.values().map(|entry| entry.2.texture.as_raw() as usize).collect()
+        };
+        let kept: Vec<ID3D12Resource> = self.deferred().kept.iter().filter_map(|k| k.cast::<ID3D12Resource>().ok()).collect();
+        for texture in kept {
+            let at = texture.as_raw() as usize;
+            if held.contains(&at) || !seen.insert(at) {
+                continue;
+            }
+            if let Some(frame) = crate::released::released(&texture) {
+                crate::released::found(&texture, frame, true);
+            }
+        }
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -9337,6 +9369,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::placed_line();
+        crate::released::line();
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
