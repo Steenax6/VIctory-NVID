@@ -640,6 +640,27 @@ two frames, on five threads that share three locks a slot).
   The longest send of a frame is the list that makes the heap's buffers
   ready: one flush of about 4,600 copies, almost all with nothing to
   copy, 7 to 13 ms; spread over threads they cost more than on one.
+- A flush that leaves out, before it joins, asks or walks, every copy whose
+  counts of events are those it remembered (2026-11-26, the first step of
+  stage S1a in `architecture.md`; one look at the counts, without a lock:
+  copies in view memory before the flush's asking, copies the kernel's
+  write watch answers for after it, where the asking that stands held
+  their range). It left out some 2,900 copies a frame (340 in view
+  memory) of the 4,600 the submission that makes the heap's buffers ready
+  walks, and that send went from 9 to 14 ms to 6 to 14. Its check (the old
+  walk run for every copy; a copy the look would have left out whose CPU
+  side the walk changed, outside the ranges flights may be writing, with
+  nothing counted in the range remembered since the look) counted 108 to
+  142 such copies in each prologue run and 132 at the open world's entry:
+  most of them the heap's copy (174 MB in view memory), some hundred to
+  seven thousand bytes each, and twice a copy of 90 MB of private memory
+  with 4 to 6 MB. Not explained: a range remembered by its two ends in
+  view memory may hold memory that is no view, which no event and no
+  asking of the submission covers (the submission's asking leaves out a
+  range whose first block is a view); a landing may change the CPU side
+  next to a declared range (a flagged 4 KiB block reaches past it) while
+  the check compares. Taken out again; the gain is not worth a copy that
+  keeps old bytes.
 - `VICTORY_HOT_BLOCKS=1`, `VICTORY_NAMED_WRITES=1`: not yet tried in a run.
   (`VICTORY_MERGE_FORGET` is gone: it dropped the kernel's written bits a
   landing set, and with them the title's of before the landing;

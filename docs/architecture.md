@@ -114,10 +114,11 @@ is to be rebuilt. The switches named are in `switches.md`.
 | capture | the title's render thread | the lists' host sides are taken from the title's lists, cut at their waits for memory values and put on their queue's line (`Held`): two bursts a frame (83 lists when the present returns, 121 before the next present call), 28 parts | the queue's line |
 | prepare and send | `victory-submit` (one) | `release_held_now`, then `Host::submit` part by part: heap sync (descriptor records), write-watch asking, title bytes under flights' shader writes, the lists' steps in recorded order (fills, title buffer copies, declared writes; the refreshes of host copies are flushed before every step that writes title memory or gives a range to shaders), textures, preludes, the card's sync and compare lists, `ExecuteCommandLists`, `Signal` | `RELEASING` (one releaser); `Host::submitted` from the first step to the send |
 | flight | the card | our sync list (changed ranges of the copies' CPU sides to their card sides, hashes), the title's lists, our compare list (flags the 4 KiB blocks whose hash changed) | |
-| land | `victory-relay` (one) | for the flights the card has run, in the order sent: the flagged blocks fetched on the copy queue (`queue2.rs`), merged into title memory and the copy's CPU side (`Shadow::card_merge_relay`), the ranges opened to refreshes again; then, in order, copies left to the landing, read-backs, bottom-of-pipe writes, fence signals | `LINE` to take and to give back; a copy's side lock per merge |
+| land | `victory-relay` (one) | for the flights the card has run, in the order sent: the flagged blocks fetched on the copy queue (`queue2.rs`), merged into title memory and the copy's CPU side (`Shadow::card_merge_relay`) as jobs of 256 KiB of one copy on the wide threads and this one (`host/land_jobs.rs`), all done before the landing goes on; the ranges opened to refreshes again; then, in order, copies left to the landing, read-backs, bottom-of-pipe writes, fence signals | `LINE` to take and to give back; the side locks of the 64 KiB pieces a merge writes |
 | after | `victory-late-wait` | landed lists reset; the submitting thread woken for waits now met | |
 
-Beside them: `victory-wide-N` (four: finds and snapshots),
+Beside them: `victory-wide-N` (four: finds, snapshots, the landing's
+merge jobs and the slots of the pass over picked buffer views),
 `victory-picked` (the pass over picked buffer views), `victory-thin-N`
 (with `VICTORY_THIN=1`: translation of the recordings).
 
@@ -128,8 +129,10 @@ is in the line); `Host::submitted`; the journal and the guards
 the fault handler's on the title's threads, and the journal's is held
 across the kernel's asking and the guards' check, with one standing
 asking for the one submission being prepared); per copy the side lock
-(`Shadow::side`: held across a whole merge of a fetched run, and across
-each page of the title's bytes put in under flights), `copied`,
+(`Shadow::side_of`: for a copy in the card's memory one per 64 KiB
+piece, held across the merge of a fetched run over the pieces it writes
+and across each page of the title's bytes put in under flights; for the
+others the snapshot's), `copied`,
 `pending` with `flights`, `dirty` with `sent`; `LINE` with its condition
 variables, `CARD_WORK`, `QUEUE_ORDER`.
 
@@ -143,8 +146,7 @@ fences are told in order.
 Serial without one: all preparing on one thread under one lock, though
 its bulk is per copy and per part; the asking repeated for every part
 and flush, though the parts of a burst were submitted in the same
-millisecond; the landing's merges one after the other, though the runs
-are apart; the sync list sent as soon as it is recorded, which ties
+millisecond; the sync list sent as soon as it is recorded, which ties
 preparing a part to sending it.
 
 ### Measured
@@ -270,13 +272,45 @@ were measured).
 
 | Stage | What changes | Why it is exact | The check (0 in one run) | Touches |
 |---|---|---|---|---|
-| S1a less on the submitting thread | a flush leaves out, before it joins, asks or walks, every copy whose counts of events are those it remembered (one look without a lock each); the pass over picked buffer views no longer puts the slots it made itself on the changed list | the refresh by event's own rule, applied at the same moment (the flush), before the walk instead of inside it | `VICTORY_REFRESH_EVENTS=2`: refreshes left out that found bytes; `VICTORY_REFRESH_CHECK=1` not above the base (see "Open") | `host.rs` `Batch::flush`; `shadow.rs` `Shadow::update_free` and what it remembers; `draw.rs` `picked_pass`; `descriptor/host.rs` `mirror_picked` |
+| S1a less on the submitting thread (the pass's part built, the flush's taken out again: see "Built") | a flush leaves out, before it joins, asks or walks, every copy whose counts of events are those it remembered (one look without a lock each); the pass over picked buffer views no longer puts the slots it made itself on the changed list | the refresh by event's own rule, applied at the same moment (the flush), before the walk instead of inside it | `VICTORY_REFRESH_EVENTS=2`: refreshes left out that found bytes; `VICTORY_REFRESH_CHECK=1` not above the base (see "Open") | `host.rs` `Batch::flush`; `shadow.rs` `Shadow::update_free` and what it remembers; `draw.rs` `picked_pass`; `descriptor/host.rs` `mirror_picked` |
 | S1b lanes ahead, per burst (not before S3) | the heap sync starts when the burst is queued and is waited for at the send; helper threads bring the copies the burst's parts refresh up to date ahead, and the refresh in the part's turn stays as it is; the lock of R2 | the records are read after the title's submit and before any list of the burst goes; nothing rests on the refresh ahead, since the one in order still runs and asks (R1); R2 keeps bytes out of ranges shaders write | bytes written into a pending range outside `merge_under_writes`, counted under R2's lock; the old heap pass run at the send in a check mode: records it still finds that were written before the burst's submit; `VICTORY_REFRESH_CHECK=1` | `host.rs` `Host::submit`, `Batch`; `shadow.rs` `Shadow::update`, `Shadow::writing`; `descriptor.rs` `sync_heaps`; `queue.rs` (the burst's stamp) |
-| S2 landing on several threads | the side lock per 64 KiB piece; merges as jobs per copy and megabyte on the pool, as the way (`VICTORY_WIDE_MERGE` goes); a run that changed whole is not read from title memory first where nothing of it waits to go up; telling stays in order | the runs are apart in title memory and in the CPU side; one copy's flights stay in order (R4); `merge_under_writes` takes the same piece's lock | the merge-race count (`VICTORY_MERGE_RACE`); `VICTORY_LAND_BESIDE=2` (writes not at the title's address); new: at the tell, a sample of landed stretches whose title bytes are not the CPU side's | `shadow.rs` `Shadow::side`, `card_merge_relay_fast`, `card_merge_relay_whole`, `relay_merge`, `merge_under_writes_into`; `host.rs` `Host::relay_card_back`; `card_fine.rs` |
+| S2 landing on several threads (built: see "Built") | the side lock per 64 KiB piece; merges as jobs per copy and megabyte on the pool, as the way (`VICTORY_WIDE_MERGE` goes); a run that changed whole is not read from title memory first where nothing of it waits to go up; telling stays in order | the runs are apart in title memory and in the CPU side; one copy's flights stay in order (R4); `merge_under_writes` takes the same piece's lock | the merge-race count (`VICTORY_MERGE_RACE`); `VICTORY_LAND_BESIDE=2` (writes not at the title's address); new: at the tell, a sample of landed stretches whose title bytes are not the CPU side's | `shadow.rs` `Shadow::side`, `card_merge_relay_fast`, `card_merge_relay_whole`, `relay_merge`, `merge_under_writes_into`; `host.rs` `Host::relay_card_back`; `card_fine.rs` |
 | S3 write tracking without global holds | first an event for every hold of the guards' lock of 0.2 ms and more, by holder; then: `known_view` and `watchable` answered without the lock, changes of protection and walks over other regions outside it, the fault handler on its region's lock only; the journal by chunk and the standing asking the burst's (asked once a burst; the layer's own writes tell the journal as now); a landing takes its own marks in view memory as it takes the kernel's bits in private memory (the other 23 MB a frame the refreshes read back) | every count of an event is still raised under the lock under which an asking sees it; locks are taken in the order of addresses; the parts of a burst read what was written before the same submit, and a write of the title's after it is found by the next burst's asking (R1); the taking tells every other copy through the journal and passes a page by only where it holds the copy's bytes | `VICTORY_REFRESH_EVENTS=2`; the taking's check as `VICTORY_LAND_TAKEN=2`, for view memory; `VICTORY_REFRESH_CHECK=1` not above the base, by kind; a test of faults against checks in two regions at once | `watch.rs` (`guards`, `guard_fine`, `known_view`, `watchable`, `on_write`, `open_tail`, `mark_with_views`, `title_memory_remapped`, `journal`, `ask_once`, `writes_fine_look`, `take_landed`); `beside.rs`; `inplace.rs` `pages_of`; one call in `shadow.rs` `landed` |
 | S4 a part's bulk as jobs | fills, the title's bytes under flights page by page, texture stagings and preludes on the pool, joined where the one thread flushes now | the same order of effects at every flush | those of S1b and S2; the fills' check (`fill_ahead`) | `host.rs` `HostList::run_deferred`, `Batch`, `stale_under_flights` |
 | S5 parts in a pipeline | the plan of part k+1 while the jobs of part k run; sends in order; `Host::submitted` no longer over bulk work; the line of all queues as one sequencer (avatarmanz/VIctory-7900XTX `queue/behind.rs` is the shape) | R1 to R6 | jobs of parts up to k not done at the send of k; a refresh not done under a write of ours over its pages; a copy's flights landed out of order | `host.rs`, `queue.rs`, `shadow.rs` |
 | S6a transfer heaps on title memory | for buffers in private memory that shaders write and the title's processor side does not (the census names them): a heap opened on the title's pages (`OpenExistingHeapFromAddress1`, `inplace.rs`) is the end of our copies only, card to title memory and title memory to card; shaders keep the copy in the card's memory. A block whose written bit the kernel holds, or with bytes still to go up, lands the old way | the bytes are in title memory before the flight is told, as now; a block the title wrote since goes through the merge byte by byte | in a check mode the same blocks fetched a second time into memory of ours: bytes that differ | `inplace.rs`, `shadow.rs`, `host.rs` `Host::relay_card_back`, `Host::card_before` |
+
+Built (2026-11-26, Package B; single runs on a machine other work ran
+on, twelve frames of a timeline each against run i_thinap1: indications):
+
+- S1a, the pass over picked buffer views no longer puts the slots it
+  makes itself on its own list (`HostHeap::mirror_passed`): 40,000 slots
+  looked at a frame instead of 54,000; no submission waited for the pass,
+  before or after. The flush that leaves out copies by their counts was
+  built, measured and taken out again: it left out 2,900 of the 4,600
+  copies of the seven-list submission and that send went from 9 to 14 ms
+  to 6 to 14, but its check counted copies it would have left with old
+  bytes in every run (see "Tried and not kept" in `switches.md`). That
+  send stays the longest of the frame.
+- S2, the side lock per 64 KiB piece (`Shadow::side_of`) and the merge as
+  jobs of one copy on the wide threads (`host/land_jobs.rs`), the only
+  way; a run that changed almost whole, in eight stretches of changed
+  bytes or fewer, written without reading title memory first. With jobs
+  of a megabyte (run l_a2): the landing's merge 28.3 against 33.8 ms a
+  frame, the landing thread in landings 35.6 against 42.6, waits for
+  side locks 0.2 against 1.5 ms a frame over all threads. A landing of
+  some 20 jobs merges in 5 to 9 ms of wall time where its jobs sum 25 to
+  42; what is left is the guards' lock: the threads that run jobs waited
+  12.1 ms a frame for it (5.0 before), the landing thread 3.7, and one
+  job that waits there holds the landing. Jobs of 256 KiB and the run
+  written by its bytes (not by dwords: a byte the card left as it was in
+  a dword it changed is the title's) are not timed apart.
+- Checks, prologue (runs l_c1 to l_c5) and the open world's entry (l_w1,
+  the final merge): the merge race 0 bytes put back, `VICTORY_LAND_BESIDE=2`
+  0 writes not at the title's address, `VICTORY_LAND_TAKEN=2` 0 finds,
+  `VICTORY_SEEN_CHECK=1` 0 and 0, the sample at the telling
+  (`VICTORY_LAND_SAMPLE=1`) 0 of 63,395 stretches in the prologue and 0 of
+  48,726 in the world.
 
 Expected, with what speaks for it: S1a 7 to 14 ms of the submitting
 thread (the longest send); S2 the landing from 28 to 34 ms to about 10
