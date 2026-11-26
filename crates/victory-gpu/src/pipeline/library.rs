@@ -441,12 +441,9 @@ impl Drop for Call {
 }
 
 /// For the report when the host device is removed: the library calls
-/// running at that moment, whether this run replaced the mapped file and
-/// let its pages go, and how many pages of the mapping read as zeros now.
-/// A library holds no page of zeros (the 259 MB one of run 83 has no run of
-/// 2,048 zero bytes): each such page is one whose contents were lost (see
-/// the module's notes), and a pipeline stored there is what the driver was
-/// handed.
+/// running at that moment, and whether this run replaced the mapped file
+/// and let its pages go. Nothing here waits: the look at the file's pages,
+/// which may read them from the disk, is [`removal_pages`], said last.
 pub(crate) fn removal_note() -> String {
     use std::fmt::Write;
     let now = crate::host::now_us();
@@ -489,13 +486,33 @@ pub(crate) fn removal_note() -> String {
     if TRIMMED_BYTES.load(Ordering::Relaxed) > 0 {
         let _ = write!(text, "; its pages were last let go {:.1} s ago", ago(TRIMMED_AT.load(Ordering::Relaxed)));
     }
-    // Within two seconds: pages not in memory come from the disk.
+    text
+}
+
+/// For the same report, said after everything else: how many pages of the
+/// mapped library file read as zeros now. A library holds no page of zeros
+/// (the 259 MB one of run 83 has no run of 2,048 zero bytes): each such
+/// page is one whose contents were lost (see the module's notes), and a
+/// pipeline stored there is what the driver was handed.
+///
+/// Pages not in memory come from the disk: the look is given two seconds
+/// (asked every 256 pages), and until 2026-11-26 it was part of the
+/// report's first line, so a second thread that found the removal
+/// meanwhile ended the run before a word of the report was said (two
+/// losses at the open world's entry with no context in the log).
+pub(crate) fn removal_pages() -> String {
+    use std::fmt::Write;
+    let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
+    if at == 0 {
+        return "the pipeline library's file is not mapped".to_owned();
+    }
+    let mut text = String::from("the pipeline library's file");
     let started = std::time::Instant::now();
     // SAFETY: the view lives as long as the library, which is never dropped.
     let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
     let (mut zero, mut looked, mut first) = (0u64, 0u64, None);
     for (n, page) in bytes.chunks(4096).enumerate() {
-        if n % 4096 == 0 && started.elapsed() > std::time::Duration::from_secs(2) {
+        if n % 256 == 0 && started.elapsed() > std::time::Duration::from_secs(2) {
             break;
         }
         looked += 1;
@@ -506,7 +523,12 @@ pub(crate) fn removal_note() -> String {
             }
         }
     }
-    let _ = write!(text, "; {zero} of the {looked} pages looked at read as zeros now");
+    let _ = write!(
+        text,
+        ": {zero} of the {looked} pages looked at read as zeros now (of {} pages, in {:.0} ms)",
+        len.div_ceil(4096),
+        started.elapsed().as_secs_f64() * 1e3
+    );
     if let Some(first) = first {
         let _ = write!(text, " (the first is page {first}): the library's contents were lost there");
     }
