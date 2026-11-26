@@ -579,6 +579,28 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Our view heap and our sampler heap among the heaps a list binds
+/// ([`heaps_wanted`]): values no title heap's address takes, apart from
+/// each other and from the 0 that says a host list has no heaps bound yet
+/// (a new list, or one after a cut: `State::replay`).
+const VIEWS_OURS: usize = usize::MAX;
+const SAMPLERS_OURS: usize = usize::MAX - 1;
+
+/// The heaps a host list must have bound before one of our root signatures
+/// is set, from the title's (`title`: view heap, sampler heap; `hosted`:
+/// whether each has a host heap). Every root signature we make indexes
+/// both kinds directly, and D3D12 requires a heap of each kind to be bound
+/// before such a signature is set (the debug layer's id 1419; NVIDIA
+/// removes the device for it, Marvisak/VIctory #1754 and #2894): ours
+/// stands in for a kind the title binds none of. Never 0, so a list with
+/// no heaps bound yet always binds them.
+fn heaps_wanted(title: [usize; 2], hosted: [bool; 2]) -> [usize; 2] {
+    [
+        if hosted[0] { title[0] } else { VIEWS_OURS },
+        if hosted[1] { title[1] } else { SAMPLERS_OURS },
+    ]
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -1037,29 +1059,30 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
+        let hosted = self
+            .heaps
+            .map(|h| h != 0 && crate::descriptor::heap(h as This).host().is_some());
+        let want = heaps_wanted(self.heaps, hosted);
+        if self.host_heaps != want {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = want
                 .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .filter_map(|&h| match h {
+                    VIEWS_OURS => crate::descriptor::host::fallback_views().or_else(|| {
+                        once!("no view heap of ours to bind");
+                        None
+                    }),
+                    SAMPLERS_OURS => crate::descriptor::host::fallback_samplers().or_else(|| {
+                        once!("no sampler heap of ours to bind");
+                        None
+                    }),
+                    h => crate::descriptor::heap(h as This).host(),
+                })
                 .map(|h| Some(h.heap.clone()))
                 .collect();
-            // Our root signatures index the sampler heap directly, and one
-            // must be bound before such a signature is set (NVIDIA removes
-            // the device otherwise): ours where the title binds none.
-            let samplers = self.heaps[1] != 0
-                && crate::descriptor::heap(self.heaps[1] as This).host().is_some();
-            if !samplers {
-                match crate::descriptor::host::fallback_samplers() {
-                    Some(h) => heaps.push(Some(h.heap.clone())),
-                    None => once!("no sampler heap of ours to bind"),
-                }
-            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = want;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
@@ -3798,5 +3821,29 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A list binds a heap of each kind before its root signature: the
+    /// title's where it has one, ours for a kind it binds none of, and never
+    /// the 0 a list with no heaps bound yet has (a new list, one after a cut),
+    /// so such a list always binds them (Marvisak/VIctory #2894, #2881).
+    #[test]
+    fn a_list_gets_our_heaps_for_kinds_the_title_binds_none_of() {
+        assert_eq!(heaps_wanted([0x10, 0x20], [true, true]), [0x10, 0x20]);
+        assert_eq!(heaps_wanted([0x10, 0], [true, false]), [0x10, SAMPLERS_OURS]);
+        assert_eq!(heaps_wanted([0, 0x20], [false, true]), [VIEWS_OURS, 0x20]);
+        assert_eq!(heaps_wanted([0, 0], [false, false]), [VIEWS_OURS, SAMPLERS_OURS]);
+        // A title heap without a host heap is as none.
+        assert_eq!(heaps_wanted([0x10, 0x20], [false, true]), [VIEWS_OURS, 0x20]);
+        for title in [[0, 0], [0x10, 0], [0, 0x20]] {
+            let hosted = title.map(|h| h != 0);
+            assert_ne!(heaps_wanted(title, hosted), [0; 2], "a list with nothing bound binds");
+        }
+        assert_ne!(VIEWS_OURS, SAMPLERS_OURS);
     }
 }

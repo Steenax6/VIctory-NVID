@@ -1186,13 +1186,33 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// samplers). Slot 0 holds a point sampler, so an indexed read of it gives
 /// something defined.
 pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
-    static HEAP: std::sync::OnceLock<Option<HostHeap>> = std::sync::OnceLock::new();
-    HEAP.get_or_init(|| {
-        let heap = HostHeap::new(true, 1)?;
-        heap.null_sampler(0);
-        Some(heap)
-    })
-    .as_ref()
+    fallback(true)
+}
+
+/// A view heap of our own, for a list that sets one of our root signatures
+/// while the title binds no view heap: they index the view heap directly
+/// too (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`), with the same rule as
+/// [`fallback_samplers`] (Marvisak/VIctory #2894). Made as a title heap of
+/// no slots: every slot up to the one shaders clamp view indices to is a
+/// null view, so whatever a shader indexes reads zeros.
+pub(crate) fn fallback_views() -> Option<&'static HostHeap> {
+    fallback(false)
+}
+
+/// [`fallback_samplers`] and [`fallback_views`], each made on first use.
+fn fallback(sampler: bool) -> Option<&'static HostHeap> {
+    static HEAPS: [std::sync::OnceLock<Option<HostHeap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    HEAPS[usize::from(sampler)]
+        .get_or_init(|| {
+            if sampler {
+                let heap = HostHeap::new(true, 1)?;
+                heap.null_sampler(0);
+                Some(heap)
+            } else {
+                HostHeap::new(false, 0)
+            }
+        })
+        .as_ref()
 }
 
 impl HostHeap {
@@ -4209,16 +4229,24 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
-    /// Our sampler heap, for lists whose title binds none, is made once: a
-    /// shader-visible sampler heap with its point sampler.
+    /// Our sampler and view heaps, for lists whose title binds none, are
+    /// made once each; a list that binds both and runs leaves the device
+    /// alive.
     #[test]
-    fn our_sampler_heap_is_made_once() {
+    fn our_heaps_are_made_once_and_bind() {
         let Some(host) = host() else {
             return; // no host GPU
         };
-        let first = fallback_samplers().expect("a sampler heap of ours");
-        assert!(std::ptr::eq(first, fallback_samplers().unwrap()));
-        assert!(first.sampler);
+        let samplers = fallback_samplers().expect("a sampler heap of ours");
+        let views = fallback_views().expect("a view heap of ours");
+        assert!(std::ptr::eq(samplers, fallback_samplers().unwrap()));
+        assert!(std::ptr::eq(views, fallback_views().unwrap()));
+        assert!(samplers.sampler && !views.sampler);
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list and shader-visible heaps of ours.
+        unsafe { list.list.SetDescriptorHeaps(&[Some(views.heap.clone()), Some(samplers.heap.clone())]) };
+        list.close();
+        host.execute(&[&list]);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
