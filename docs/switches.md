@@ -245,8 +245,9 @@ checked at every submission that samples it. The check reads its memory
 when the guards saw a write or the runtime told of a mapping; at its first
 three checks; on its turn every eighth frame, once in that frame (the hash
 for what the guards do not see); and at every check while it is taken for
-one written behind its guards, which ends after 240 checks that found it
-unchanged. A texture with pages missing is read again 30 frames after a
+one written behind its guards, which ends after 64 checks that found it
+unchanged. A texture with pages missing, and one made level by level of
+which the game does not hold every level, is read again 30 frames after a
 read at the earliest unless a write is seen or a mapping told. "textures
 read through tables, MB of title memory their checks read per frame" has
 those megabytes by why the check read.

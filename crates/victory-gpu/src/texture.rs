@@ -482,8 +482,10 @@ fn check_why(c: Check) -> usize {
 /// it is hashed on its turn again, and taken for one anew when a change is
 /// found that no guard saw. A texture caught once while it was filled was
 /// hashed at every check for the rest of the run; the frames of a video
-/// change every few checks and stay.
-const BEHIND_CHECKS: u16 = 240;
+/// change every few checks and stay. (240 at first: after a scene loaded,
+/// 119 textures so marked were 51 MB a frame of reads that took 25 seconds
+/// to go, 3 MB a frame once they had.)
+const BEHIND_CHECKS: u16 = 64;
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -2426,12 +2428,25 @@ impl Staging {
         }
         if unseen && changed && !last.behind_guard && behind_guards(flight, remapped) {
             last.behind_guard = true;
-            BEHIND_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(
-                memory = ?self.memory,
-                bytes = size,
-                "a texture changed with no write its guard saw (written through another view): hashed at every check from now on"
-            );
+            let n = BEHIND_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The first of them, and one in a hundred after, with what the
+            // check knew: which textures these are is not known from the
+            // counts.
+            if n < 24 || n.is_multiple_of(100) {
+                tracing::info!(
+                    memory = ?self.memory,
+                    bytes = size,
+                    levels = self.mips,
+                    level_by_level = self.on_demand,
+                    placed = self.placed,
+                    pages_missing = last.partial.is_some(),
+                    check = last.checks,
+                    read = ["a write seen", "mapped anew", "a first check", "behind its guards", "its turn"][why_read.unwrap_or(4).min(4)],
+                    so_far = n + 1,
+                    "a texture changed with no write its guard saw and no read of the title's or mapping to explain it: taken \
+                     for one written through another view, hashed at every check until it stays unchanged"
+                );
+            }
         }
         // Taken for one written behind its guards, and unchanged check
         // after check: no longer.
@@ -2814,7 +2829,14 @@ impl Staging {
             self.note_shown_from(if incomplete { self.first_level_there(alone) } else { 0 });
             // For the checks: read again in 30 frames at the earliest
             // unless a write is seen or a mapping told ([`check_reads`]).
-            last.partial = incomplete.then(crate::frame::current);
+            // So also a texture made level by level of which the title
+            // does not hold every level: its span has pages missing or
+            // another texture's, and while it was read whole it was read
+            // that seldom. (Without the wait such a texture, the largest
+            // kind there is, was read at each of its first checks while
+            // it streamed in, and marked as written behind its guards.)
+            let unheld = on_demand.is_some_and(|levels| (0..n).any(|k| self.place.levels_of_part[k] & levels == 0));
+            last.partial = (incomplete || unheld).then(crate::frame::current);
         }
         let by_level = &c::BY_LEVEL;
         by_level[c::L_LEFT].fetch_add(left, Relaxed);
