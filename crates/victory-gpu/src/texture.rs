@@ -387,6 +387,9 @@ struct Last {
     /// refreshes found a part's bytes changed (`hash` is that count).
     parts: [u64; crate::census::PARTS],
     changes: u64,
+    /// A read the title had submitted was still to write some of the
+    /// texture's memory at the last check (`crate::writes::pending_over`).
+    pending: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -2280,9 +2283,18 @@ impl Staging {
             }
             unseen = unwritten;
         }
+        // A read the title has submitted into this memory writes it with
+        // no guard seeing it until its bytes are all there (then they are
+        // told, and the guarded blocks under them opened).
+        let pending = crate::writes::pending_over(start as u64, start.saturating_add(size) as u64);
+        let flight = [std::mem::replace(&mut last.pending, pending), pending];
         let hash_before = last.hash;
         let read = self.refresh_hashed(last, size, remapped);
-        if unseen && hash_before.is_some() && last.hash != hash_before && !last.behind_guard {
+        let changed = hash_before.is_some() && last.hash != hash_before;
+        if unseen && changed && !last.behind_guard && !behind_guards(flight, remapped) {
+            BEHIND_KNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if unseen && changed && !last.behind_guard && behind_guards(flight, remapped) {
             last.behind_guard = true;
             BEHIND_GUARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
@@ -3017,6 +3029,28 @@ pub(crate) fn levels_shown_from(resource: This) -> Option<u32> {
 /// check since (`Last::behind_guard`), since the start.
 static BEHIND_GUARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Checks that found a texture changed with no write its guard saw while
+/// what changed it was known ([`behind_guards`]), since the start.
+static BEHIND_KNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a change of a texture's bytes that its guard saw no write for
+/// is the work of a writer the guards do not see, so that the texture is
+/// hashed at every check from then on. Not if a read the title submitted
+/// was still to write its memory at this check or the one before
+/// (`flight`): DirectStorage fills the pages with no guard seeing it and
+/// tells when it is done. Not if the runtime mapped or unmapped memory
+/// under it since the last check (`remapped`): other pages show there.
+///
+/// Both were taken for such a writer. A texture read while its pages were
+/// being filled was then hashed at every check for good: 139 textures
+/// after a prologue run in which the reading by level had the textures
+/// read more often while they streamed in, where 23 had been; in the room
+/// after it they were 62 of the 63 MB read a frame, 5.5 ms where 2.2 had
+/// been.
+fn behind_guards(flight: [bool; 2], remapped: bool) -> bool {
+    !flight[0] && !flight[1] && !remapped
+}
+
 /// The line on textures shown from a smaller level while their large
 /// levels' pages are not there ([`SHOWN_FROM`]) and on textures written
 /// behind their guards ([`BEHIND_GUARD`]), every few seconds; nothing while
@@ -3025,11 +3059,13 @@ pub(crate) fn filled_line() {
     use std::sync::atomic::Ordering::Relaxed;
     let clamped = SHOWN_FROM.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashMap::len);
     let behind = BEHIND_GUARD.load(Relaxed);
-    if clamped as u64 + behind > 0 {
+    let known = BEHIND_KNOWN.load(Relaxed);
+    if clamped as u64 + behind + known > 0 {
         tracing::info!(
             "textures streaming in, shown from their first level whose pages are all there (their views clamped), now: \
              {clamped}; since the start: {behind} textures found written through another view, behind their guards, \
-             hashed at every check since"
+             hashed at every check since; {known} checks found a texture changed with no write seen while a read of the \
+             title's was writing it or its memory had been mapped anew (not taken for that)"
         );
     }
 }
@@ -3942,6 +3978,13 @@ mod digest_tests {
         assert_eq!(part_is(true, 0, 1, [0, 0], never), PartIs::Left);
         assert_eq!(part_is(true, 1 << 31, u64::MAX, [31, 0], || true), PartIs::Read);
         assert_eq!(part_is(true, 1 << 31, u64::MAX, [32, u64::MAX], || true), PartIs::Read);
+        // A change no guard saw is a writer's the guards do not see,
+        // unless a read of the title's was writing the memory at one of
+        // the two checks, or the memory was mapped anew between them.
+        use super::behind_guards;
+        assert!(behind_guards([false, false], false));
+        assert!(!behind_guards([true, false], false) && !behind_guards([false, true], false));
+        assert!(!behind_guards([false, false], true) && !behind_guards([true, true], true));
         // A part holds a level from a given one on, or none: the part of
         // level 1 alone holds none from level 2 on (a host copy made
         // without its first two levels has nothing of it).
