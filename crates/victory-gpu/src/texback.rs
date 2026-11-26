@@ -18,9 +18,9 @@
 //! written texture's size and format.
 //!
 //! The copy needs the console layout to be addressable: a texture in a
-//! pipe/bank XOR swizzle mode cannot be tiled until `victory-formats` has
-//! the address patterns of those modes; such textures are counted and left
-//! alone (the log names the first).
+//! swizzle mode `victory-formats` has no address pattern for cannot be
+//! tiled; such textures are counted and left alone (the log names the
+//! first). The pipe/bank XOR modes have theirs.
 //!
 //! shortcut: by kind, not by texture: textures of those kinds the title
 //! never reads are copied back too (about a megabyte per such list). The
