@@ -98,8 +98,23 @@ pub(crate) fn now_ms() -> u64 {
 /// frames begun so far (high half, `crate::frame::current`) and tenths of a
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
+///
+/// The tenths are the system's tick count (memory the kernel shares with
+/// every process: a load), not the performance counter behind [`now_ms`]:
+/// every use of a texture by a draw notes a moment, some hundred thousand
+/// a frame, and the counter and its division were 12 ms a frame of the
+/// recording threads (the profile of 2026-11-26). A tick is 16 ms at most,
+/// the unit here is 100; moments are only ever held against moments.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    (crate::frame::current() << 32) | (tenths() & 0xffff_ffff)
+}
+
+/// Tenths of a second since the first call, by the system's tick count.
+fn tenths() -> u64 {
+    static FIRST: OnceLock<u64> = OnceLock::new();
+    // SAFETY: a plain query.
+    let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    now.saturating_sub(*FIRST.get_or_init(|| now)) / 100
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
