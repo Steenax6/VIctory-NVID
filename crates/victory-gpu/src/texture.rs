@@ -123,7 +123,8 @@ pub(crate) struct Staging {
     sent: Arc<Sent>,
     /// The texture is one of a view the title placed in memory
     /// (`crate::resource::texture_at`), not a texture object of its own:
-    /// the title may hold only its less detailed levels ([`part_is`]).
+    /// the title may hold only its less detailed levels, and an upload of
+    /// the texture pass leaves the others alone ([`part_is`]).
     placed: bool,
     /// For an upload the texture pass recorded from this staging buffer:
     /// its reason and one (`crate::census`; 0: not the pass's), and
@@ -209,12 +210,16 @@ enum PartIs {
 /// detailed one is the title's only if it ends before the next texture
 /// starts: the title holds a texture from the first level it views it
 /// from, and what lies past that level's bytes is then another texture's.
-/// Only a texture the title placed (`placed`) is so cut short; one of its
-/// texture objects is all its own. `there`: whether any of the part's
-/// pages is there, asked only of a part that is the title's.
-fn part_is(placed: bool, of_part: u32, end: u64, [first, limit]: [u64; 2], there: impl FnOnce() -> bool) -> PartIs {
+/// Only an upload of the texture pass, of a texture the title placed, is
+/// so cut short (`cut`): the views the judgement goes by are those in the
+/// slots shaders pick by index, which that pass serves. One of the title's
+/// texture objects is all its own, and so is any texture as a draw reads
+/// it through a table: such a view is in none of those slots, and may
+/// start at a more detailed level than they say. `there`: whether any of
+/// the part's pages is there, asked only of a part that is the title's.
+fn part_is(cut: bool, of_part: u32, end: u64, [first, limit]: [u64; 2], there: impl FnOnce() -> bool) -> PartIs {
     let viewed = reaches(of_part, first);
-    if placed && !viewed && end > limit {
+    if cut && !viewed && end > limit {
         PartIs::Left
     } else if there() {
         PartIs::Read
@@ -1852,9 +1857,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at
     // this list's submission, and uploaded by this list.
-    // (So for a texture the title placed, read by level: a level that is
-    // the title's now and was not is read whatever the guards say.)
-    if (staging.on_demand || (staging.placed && staging.place.parts.len() > 1)) && staging.judgement() != staging.judged() {
+    // (Only for those: no other texture that keeps its staging buffer is
+    // judged by the views. The pass's uploads are, and make theirs anew.)
+    if staging.on_demand && staging.judgement() != staging.judged() {
         staging.forget();
         staging.dirty.store(true, Relaxed);
     }
@@ -2441,7 +2446,7 @@ impl Staging {
         // Which levels are the title's is judged here, once, for what the
         // staging buffer holds from now on. Levels on demand: the step that
         // gives levels their memory goes by this answer.
-        let judged = if self.on_demand || self.placed { self.judgement() } else { [0, u64::MAX] };
+        let judged = if self.on_demand { self.judgement() } else { [0, u64::MAX] };
         self.judged[0].store(judged[0], Relaxed);
         self.judged[1].store(judged[1], Relaxed);
         let held = if self.on_demand { self.held_levels(judged) } else { u32::MAX };
@@ -2569,7 +2574,17 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let parts = &self.place.parts;
         let n = parts.len().min(c::PARTS);
-        let judged = if self.on_demand || self.placed { self.judgement() } else { [0, u64::MAX] };
+        // What is the title's of it is judged by the views in slots that
+        // shaders pick by index: for a texture made level by level, as
+        // before, and for an upload of the pass that serves those slots,
+        // of a texture the title placed. A texture a draw reads through a
+        // table is read whole: the table's view is in none of those slots,
+        // and where an older view of the same memory still stood in one,
+        // from a less detailed level, the levels the table's view shows
+        // were left alone and never went up.
+        let why = self.picked.load(Relaxed);
+        let cut = self.placed && why != 0;
+        let judged = if self.on_demand || cut { self.judgement() } else { [0, u64::MAX] };
         self.judged[0].store(judged[0], Relaxed);
         self.judged[1].store(judged[1], Relaxed);
         let on_demand = self.on_demand.then(|| self.held_levels(judged));
@@ -2592,7 +2607,7 @@ impl Staging {
                 None => {
                     let at = self.memory.wrapping_add(from);
                     let mut whole = true;
-                    let state = part_is(self.placed, of_part, to as u64, judged, || {
+                    let state = part_is(cut, of_part, to as u64, judged, || {
                         whole = !in_place || committed(at, to - from);
                         whole || some_there(at, to - from)
                     });
@@ -2642,7 +2657,6 @@ impl Staging {
             PAGES_MISSING[0].fetch_add(1, Relaxed);
         }
         let size = self.layout.size as usize;
-        let why = self.picked.load(Relaxed);
         let count = why != 0 && !self.counted.swap(true, Relaxed);
         let mut digests = [0u64; c::PARTS];
         let mut census = [c::Part { bytes: 0, digest: 0, zero: false }; c::PARTS];
@@ -3069,6 +3083,26 @@ pub(crate) fn picked(resource: This, why: u8, first: u32) -> Option<Picked> {
         memory: (s.memory as u64, s.layout.size),
         own: s.own_bytes(first),
     })
+}
+
+/// For tests: the levels a refresh of title texture `resource` reads and
+/// stages (a bit a level), as an upload of the texture pass (`picked`) or as
+/// a draw's read through a table; `None` without a host.
+#[cfg(test)]
+pub(crate) fn levels_staged(resource: This, picked: bool) -> Option<u32> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let texture = crate::resource::host_resource(resource)?;
+    unstage(resource);
+    let staging = staging(resource, texture)?;
+    if picked {
+        staging.picked.store(u32::from(crate::census::VIEW) + 1, Relaxed);
+    }
+    staging.refresh();
+    let held = staging.detiled.load(Relaxed);
+    let staged = |k: &usize| staging.staged[*k].load(Relaxed) != 0;
+    let levels = (0..staging.place.parts.len()).filter(staged).fold(0, |all, k| all | staging.place.levels_of_part[k] & held);
+    unstage(resource);
+    Some(levels)
 }
 
 /// Since the start: reads of texture memory into a staging buffer that a
@@ -3897,7 +3931,8 @@ mod digest_tests {
         assert_eq!(part_is(true, 0b0001, 0x40_0000, [3, u64::MAX], || true), PartIs::Read);
         // No view says from where (level 0): all of it, wherever others start.
         assert_eq!(part_is(true, 0b0001, 0x40_0000, [0, 0x1000], || true), PartIs::Read);
-        // A texture object of the title's is all its own.
+        // A texture object of the title's is all its own, and so is any
+        // texture as a draw reads it through a table.
         assert_eq!(part_is(false, 0b0001, 0x40_0000, judged, || true), PartIs::Read);
         assert_eq!(part_is(false, 0b0001, 0x40_0000, judged, || false), PartIs::Zeros);
         // A first level past every level there is, a part of no level, an

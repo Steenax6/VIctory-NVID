@@ -6586,6 +6586,64 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.texture_slot_found(1, at, size), F_HIDDEN + Cause::Copy as usize);
     }
 
+    /// Only an upload of the texture pass leaves alone the levels of a
+    /// placed texture that the views say are another texture's: levels more
+    /// detailed than any view in a slot picked by index shows, where
+    /// another texture's view starts before their end. A draw's read of
+    /// the same texture through a table reads all of it: the table's view
+    /// is in none of those slots. (It was cut short like the pass's, and a
+    /// texture read through tables from its first level went up without
+    /// the levels an older view of that memory did not show.)
+    #[test]
+    fn only_the_pass_leaves_levels_that_the_views_say_are_another_textures() {
+        use windows_sys::Win32::System::Memory::*;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        const RUN: usize = 0x1_0000;
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 6 * RUN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let at = base as u64;
+        // A linear 256x256 texture of nine levels (0x57f00 bytes, the
+        // small levels first), viewed from level 3 in a slot picked by
+        // index; and another texture's view that starts inside level 1.
+        let words = [3, 0, 0, 0, 256, 0, 256, 0x9_0001, 28, 1, 0, 1, 0, 0];
+        let small = [3, 0, 0, 0, 16, 0, 16, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let offsets = {
+            // SAFETY: 56 bytes in the description's layout.
+            let desc = unsafe { words.as_ptr().cast::<crate::resource::ResourceDesc>().read_unaligned() };
+            let layout = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+            [layout.mips[0].offset, layout.mips[1].offset, layout.mips[2].offset]
+        };
+        assert!(offsets[2] < offsets[1] && offsets[1] < offsets[0] && offsets[1] > 0x2000);
+        let view = |at: u64, words: [u32; 14], first: u32| {
+            let mut desc = [0u32; 16];
+            desc[4] = first;
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, words, desc)
+        };
+        assert!(heap.note_buffer(1, Some(&view(at, words, 3)), false).is_empty());
+        assert!(heap.note_buffer(2, Some(&view(at + offsets[1] + 0x40, small, 0)), false).is_empty());
+        assert_eq!(first_viewed(at), Some(3));
+        assert_eq!(next_start(at, at + 0x5_7f00), Some(at + offsets[1] + 0x40));
+        if let Some(resource) = crate::resource::texture_at(at, &words) {
+            // The pass: levels 3 and up are viewed; level 2 ends where
+            // level 1 starts, before the other texture; levels 1 and 0
+            // reach past its start and are left.
+            if let Some(levels) = crate::texture::levels_staged(resource, true) {
+                assert_eq!(levels, 0x1fc, "the pass's upload");
+                // A table's read: all of it.
+                assert_eq!(crate::texture::levels_staged(resource, false), Some(0x1ff), "a read through a table");
+                // Viewed from level 0, the pass reads all of it as well.
+                heap.note_buffer(1, Some(&view(at, words, 0)), false);
+                assert_eq!(crate::texture::levels_staged(resource, true), Some(0x1ff), "viewed from its first level");
+            }
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
     /// A tell is for the slots whose view holds its bytes: one that lies
     /// in a texture's bytes behind an older view of other memory is taken
     /// for the texture, and one past the levels a view holds is not taken
