@@ -811,9 +811,13 @@ fn resolve(request: &Request) -> Option<PageRuns> {
     }
     let (offset, len) = destination_span(request);
     let pages = page_list(request, offset, len);
-    let runs = super::xmem::resolve_pages(&pages, offset, len);
-    if runs.is_none() {
-        UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+    let mut runs = super::xmem::resolve_pages(&pages, offset, len);
+    match &mut runs {
+        // The GPU side leaves the textures there for after the write.
+        Some(runs) => runs.will_write(),
+        None => {
+            UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+        }
     }
     runs
 }
@@ -1197,8 +1201,8 @@ fn into_destination(
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the
-        // read was under way took what was there before. Counted; acted on
-        // only with `VICTORY_PAGE_WRITES=all`.
+        // read was under way took what was there before: the GPU side
+        // numbers the write, and an upload that read before it is stale.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
         return filled;
     }
