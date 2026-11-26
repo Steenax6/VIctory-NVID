@@ -458,6 +458,13 @@ pub(crate) fn take_frame() -> Vec<String> {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
+
+/// The same count as it stands, not taken, and the draws run on the host
+/// so far: for the report of a removed device (`crate::host`), which asks
+/// whether the lists on the card ran with passes of the title's missing.
+pub(crate) fn dropped_now() -> (u64, u64) {
+    (DROPPED.load(Ordering::Relaxed), DRAWN.load(Ordering::Relaxed))
+}
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
