@@ -1168,6 +1168,37 @@ fn paired_lanes_permute_shift_and_write_lanes_of_both_halves() {
     eprintln!("ran on the hardware device: permutes, row masks, swizzles and lane writes as on the console");
 }
 
+/// A DPP row shift whose row mask leaves rows 0 and 3 alone, in a console wave run as two host
+/// waves of 32: rows are counted in console lanes, so the upper host wave's lanes 0-15 are row
+/// 2 (written) and its lanes 16-31 row 3 (left alone). By host lane the upper wave took rows 0
+/// and 1 and did the opposite (Marvisak/VIctory pull request #3115 found it).
+#[test]
+fn a_dpp_row_mask_counts_console_rows_in_two_host_waves() {
+    let mut w = vop3(0x169, 1, v(0), k(3)).to_vec(); // v_mul_lo_u32 v1, v0, 3
+    w.extend([
+        vop2(0x25, 1, k(1), 1), // v_add_nc_u32 v1, 1, v1
+        vop1(0x01, 4, LIT),     // v_mov_b32 v4, 1000
+        1000,
+        vop1(0x01, 4, 0xFA), // v_mov_b32 v4, v1 row_shr:1 row_mask:0x6 bank_mask:0xf
+        0x6 << 28 | 0xF << 24 | 0x111 << 8 | 1,
+    ]);
+    w.extend(stores([4, 4, 4, 4]));
+    let native = native_with(&w, true, 64, 0);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let x = |n: u32| 3 * n + 1;
+    let want: Vec<u32> = (0..64)
+        .flat_map(|n| [if matches!(n >> 4, 1 | 2) && n & 15 != 0 { x(n - 1) } else { 1000 }; 4])
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+    same_as_console(&got, &want);
+    eprintln!("ran on the hardware device: row masks by console row in two host waves");
+}
+
 /// [`program`]'s wave OR inside a per-lane branch, in the paired form: the OR of both halves'
 /// lanes, whichever take the branch; nothing stored when none does.
 #[test]

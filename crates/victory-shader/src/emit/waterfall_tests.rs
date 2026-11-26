@@ -95,11 +95,9 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     shader
 }
 
-/// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
-/// hardware GPU and on WARP (each skipped without a device) and returns,
-/// per one that ran, the UAV's 32 dwords.
-fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
-    let samplers = [D3D12_SAMPLER_DESC {
+/// A point sampler clamping on every axis.
+fn point_clamp() -> D3D12_SAMPLER_DESC {
+    D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -107,7 +105,23 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         MaxAnisotropy: 1,
         MaxLOD: f32::MAX,
         ..Default::default()
-    }];
+    }
+}
+
+/// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
+/// hardware GPU and on WARP (each skipped without a device) and returns,
+/// per one that ran, the UAV's 32 dwords.
+fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+    run_with(shader, views, point_clamp())
+}
+
+/// [`run`] with `sampler` in the sampler table.
+fn run_with(
+    shader: &HostShader,
+    views: &[View],
+    sampler: D3D12_SAMPLER_DESC,
+) -> Vec<(&'static str, Vec<u32>)> {
+    let samplers = [sampler];
     let mut out = Vec::new();
     // One GPU test at a time, with the VALU tests: in parallel on the
     // hardware adapter and WARP the test process sometimes died of an
@@ -279,6 +293,41 @@ fn one_texel_high_textures_read_their_texels_through_1d_and_2d_samples() {
                 (0..32).map(|l| [0.0, 100.0][l & 1] + l.min(15) as f32).collect();
             assert_eq!(red, want, "{label}, {text}");
         }
+    }
+}
+
+/// A 1D sample (`dim:SQ_RSRC_IMG_1D`, x only) of the 1x1 textures of
+/// [`sampled`] through a linear sampler with a border on V: read at the
+/// middle of the one row, every lane gets its texture's red alone. At y = 0
+/// the filter takes half of it from the transparent black border above the
+/// row (AlanQiang0418/VIctory b73d735).
+#[test]
+fn a_1d_sample_reads_the_middle_of_the_one_row() {
+    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
+    const SAMPLE_2D: u32 = 0xF09C_0F08;
+    let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+    let at = words.iter().position(|&w| w == SAMPLE_2D).expect("the sample");
+    // DIM, bits 5:3 of the first dword: 1 (2D) to 0 (1D).
+    words[at] = SAMPLE_2D & !(7 << 3);
+    let shader = build(&words, false);
+    let first = [[1.0f32, 0.0, 0.0, 1.0]];
+    let second = [[2.0f32, 0.0, 0.0, 1.0]];
+    let views = [
+        View::Texture(1, 1, &first),
+        View::Texture(1, 1, &second),
+        View::RawUav(32),
+    ];
+    let sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+        ..point_clamp()
+    };
+    let results = run_with(&shader, &views, sampler);
+    assert!(!results.is_empty());
+    for (label, got) in results {
+        let red: Vec<f32> = got.into_iter().map(f32::from_bits).collect();
+        let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+        assert_eq!(red, want, "{label}");
     }
 }
 

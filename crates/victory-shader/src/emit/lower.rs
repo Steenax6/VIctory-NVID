@@ -706,7 +706,8 @@ pub(super) fn first_lane_reads_alike(p: &Program, st: &Structured, plain: &[Valu
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them), an atomic being both: refused, unless the
+/// region's accesses are all atomics of one commuting kind that return nothing.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
@@ -737,25 +738,71 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // per region: LDS reads, LDS writes
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    let lds_op = |i: &Inst| {
+        let name = i.name();
+        (matches!(i.fields, Fields::Ds { .. }) && !name.starts_with("ds_swizzle") && !name.contains("permute"))
+            .then_some(name)
+    };
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
         }
         let r = find(&mut region, b);
-        for i in &block.insts {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
+        for name in block.insts.iter().filter_map(lds_op) {
             if name.starts_with("ds_read") {
                 reads[r] = true;
             } else {
                 writes[r] = true;
+                // An atomic reads the word it changes: two different ones on one word do not
+                // commute (a minimum, then an add), and one that returns the old value reads
+                // what the other half may or may not have written yet.
+                reads[r] |= !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
+    // The word an access names, where its address is a constant moved in its own block with
+    // no EXEC write between (`v_mov_b32 v14, 0; ds_min_u32 v14, v12`).
+    let word = |block: &crate::ir::Block, at: usize| -> Option<u32> {
+        let i = &block.insts[at];
+        let Fields::Ds { addr: Some(Operand::Vector { reg, .. }), offset0, offset1, .. } = i.fields else {
+            return None;
+        };
+        let v = i.read(Reg::V(reg))?;
+        let mov = block.insts[..at].iter().rposition(|m| m.writes.iter().any(|w| w.1 == v))?;
+        let m = &block.insts[mov];
+        if m.name() != "v_mov_b32" || block.insts[mov..at].iter().any(|x| x.write(Reg::S(EXEC)).is_some()) {
+            return None;
+        }
+        let Fields::Valu(vm) = &m.fields else { return None };
+        let base = match vm.src.first()? {
+            Operand::Const(c @ 128..=192) => u32::from(*c) - 128,
+            Operand::Literal(x) => *x,
+            _ => return None,
+        };
+        Some(base.wrapping_add(u32::from(offset1) << 8 | u32::from(offset0)) / 4)
+    };
+    for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+        // (atomics that return nothing, one commuting kind on each word they name, or on every
+        // word where an address is not known: the two halves leave the same words in either
+        // order)
+        let mut kinds: Vec<(Option<u32>, &str)> = Vec::new();
+        for b in (0..n).filter(|&b| !all[b] && find(&mut region, b) == r) {
+            let block = &p.blocks[b];
+            for (at, i) in block.insts.iter().enumerate() {
+                if let Some(op) = lds_op(i) {
+                    kinds.push((word(block, at), op));
+                }
+            }
+        }
+        let commuting = kinds.iter().all(|&(at, op)| {
+            matches!(
+                op,
+                "ds_add_u32" | "ds_sub_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32" | "ds_min_i32" | "ds_max_i32" | "ds_min_u32" | "ds_max_u32"
+            ) && kinds.iter().all(|&(other, op2)| op2 == op || at.is_some() && other.is_some() && at != other)
+        });
+        if !commuting {
+            return None;
+        }
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
@@ -791,7 +838,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
         }
         for a in st.bools.support(g) {
             match a {
-                Atom::Opaque(_) | Atom::Constant(_) => return true,
+                Atom::Opaque(..) | Atom::Constant(_) => return true,
                 Atom::Phi(id) if joins.insert(id) => {
                     if let Some(edges) = st.phi_masks.get(&id) {
                         work.extend(edges.iter().copied());
@@ -3927,11 +3974,8 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
+            Atom::Opaque(v, h) if self.console_lanes => {
+                let hi = if self.x.native.wave64 { Some(self.get(h)?) } else { None };
                 let lo = self.get(v)?;
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
@@ -3946,7 +3990,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
@@ -4284,38 +4328,6 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
-    }
-
-    /// The value of the high dword of the wave64 register pair whose low
-    /// dword holds `lo` (none in wave32).
-    fn pair_high(&self, lo: Value) -> Option<Value> {
-        if !self.x.native.wave64 {
-            return None;
-        }
-        let p = self.x.p;
-        let pick = |reg: Reg| match reg {
-            Reg::S(c) => Some(Reg::S(c + 1)),
-            _ => None,
-        };
-        if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
-            let h = pick(reg)?;
-            return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
-        }
-        if let Some(&(b, i)) = self.phi_at.get(&lo) {
-            let h = pick(p.blocks[b].phis[i].reg)?;
-            return p.blocks[b]
-                .phis
-                .iter()
-                .find(|q| q.reg == h)
-                .map(|q| q.value);
-        }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -5118,7 +5130,7 @@ impl<'a> Lower<'a> {
             "min_u32" => Some(Rmw::UMin),
             "max_u32" => Some(Rmw::UMax),
             "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" | "max_f32" | "min_f32" => None,
+            "cmpst_b32" | "max_f32" | "min_f32" | "inc_u32" | "dec_u32" | "rsub_u32" | "mskor_b32" => None,
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
@@ -5145,6 +5157,50 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // The operations DXIL has no atomic for, as compare-exchange loops (RDNA2 ISA 12.13):
+        // an increment to 0 once the old value reaches data0, a decrement to data0 from 0 or
+        // from above it, data0 less the old value, and the old value with data0's bits cleared
+        // and data1's set.
+        if matches!(op.as_str(), "inc_u32" | "dec_u32" | "rsub_u32" | "mskor_b32") {
+            let set = if op == "mskor_b32" { Some(v1.ok_or("an LDS masked OR")?) } else { None };
+            let at = self.begin_guarded(guard);
+            let r = self.lds_rmw_loop(p, |l, old| {
+                let c = l.cur;
+                let (zero, one) = (l.s.m.i32(0), l.s.m.i32(1));
+                match (op.as_str(), set) {
+                    ("inc_u32", _) => {
+                        let wrap = l.s.m.cmp(c, pred::IUGE, old, v0);
+                        let next = l.s.m.bin(c, Bin::Add, old, one);
+                        l.s.m.select(c, wrap, zero, next)
+                    }
+                    ("dec_u32", _) => {
+                        let empty = l.s.m.cmp(c, pred::EQ, old, zero);
+                        let above = l.s.m.cmp(c, pred::IUGT, old, v0);
+                        let wrap = l.s.m.bin(c, Bin::Or, empty, above);
+                        let next = l.s.m.bin(c, Bin::Sub, old, one);
+                        l.s.m.select(c, wrap, v0, next)
+                    }
+                    ("mskor_b32", Some(set)) => {
+                        let ones = l.s.m.i32(u32::MAX);
+                        let clear = l.s.m.bin(c, Bin::Xor, v0, ones);
+                        let keep = l.s.m.bin(c, Bin::And, old, clear);
+                        l.s.m.bin(c, Bin::Or, keep, set)
+                    }
+                    _ => l.s.m.bin(c, Bin::Sub, v0, old),
+                }
+            });
+            let r = self.end_guarded(at, &[(r, outside)])[0];
+            if let Some(reg) = dst_reg {
+                self.write(inst, Reg::V(reg), r, None);
+            }
+            return Ok(());
+        }
+        // A subtraction of a constant is an add of its negation: `atomicrmw sub` removes the
+        // WARP device (Marvisak/VIctory pull request #3142), an add of a constant does not.
+        let (rmw, v0) = match (rmw, self.s.m.int_value(v0)) {
+            (Some(Rmw::Sub), Some(k)) => (Some(Rmw::Add), self.s.m.i32((k as u32).wrapping_neg())),
+            _ => (rmw, v0),
+        };
         let at = self.begin_guarded(guard);
         // A subtraction of a value that is no constant, as `ds_add` of its negation (HLSL's
         // `InterlockedAdd(shared, -x)`) or as `ds_sub`, is a compare-exchange loop: NVIDIA's
@@ -7352,8 +7408,23 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            // (in the paired form rows 2 and 3 are the upper lanes')
-            let row_lane = if self.twin.is_some() { self.console_lane() } else { lane };
+            // Rows by console lane: rows 2 and 3 are lanes 32-63, which a console wave run as
+            // two host waves has in its upper host wave's lanes 0-31 (and the paired form in
+            // the upper lane of each thread).
+            let halves = self.x.native.wave64
+                && self.s.threads.is_some()
+                && self.s.mesh.is_none()
+                && self.s.wave_size != Some(64)
+                && host_max_wave() == 32;
+            let row_lane = if self.exchange.is_some() || self.twin.is_some() {
+                self.console_lane()
+            } else if halves {
+                let t = self.console_thread();
+                let k63 = k(self, 63);
+                self.s.m.bin(self.s.entry, Bin::And, t, k63)
+            } else {
+                lane
+            };
             let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
@@ -11047,6 +11118,53 @@ mod tests {
         for runs in [[8, 4, 1], [4, 4, 1], [8, 8, 1], [16, 2, 1], [16, 16, 1], [4, 4, 4], [2, 2, 16], [64, 1, 1], [256, 1, 1]] {
             assert!(!super::may_tile(runs), "{runs:?}");
         }
+    }
+
+    /// In a lane branch of a console wave64 program, two LDS atomics on one word: run as two
+    /// host waves, the halves meet only around the branch (`super::lds_meetings`). An atomic
+    /// minimum and then an add do not commute, nor does an add that returns the old value with
+    /// anything: the region is refused. Two atomics of one commuting kind that return nothing
+    /// leave the same word in any order (realblastex/flamingo 89e5d6c3d, after
+    /// avatarmanz/VIctory-7900XTX #204), and so do two kinds on two words their constant
+    /// addresses name (the tree culls' `ds_or_b32` at 4 and `ds_min_u32` at 0).
+    #[test]
+    fn lds_atomics_in_a_lane_branch_meet_only_where_they_commute() {
+        let meets_at = |first: u32, second: u32, offset: u32| {
+            let words: [u32; 13] = [
+                0x7E04_0281, // v_mov_b32 v2, 1
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0005, // s_cbranch_execz past both accesses
+                0x7E12_0280, // v_mov_b32 v9, 0 (address and data)
+                0x36 << 26 | first << 18,
+                9 << 8 | 9, // ds_<first> v9, v9
+                0x36 << 26 | second << 18 | offset,
+                2 << 8 | 9,  // ds_<second> v9, v2 offset:<offset>
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                0x36 << 26 | 0x36 << 18,
+                5 << 24 | 9, // ds_read_b32 v5, v9
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let p = ir::build(&code, true, 16).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            super::lds_meetings(&p, &st, &all).is_some()
+        };
+        let meets = |first: u32, second: u32| meets_at(first, second, 0);
+        const ADD: u32 = 0x00;
+        const MIN_U32: u32 = 0x07;
+        const WRITE_B32: u32 = 0x0D;
+        const ADD_RTN: u32 = 0x20;
+        assert!(!meets(MIN_U32, ADD), "ds_min_u32 then ds_add_u32");
+        assert!(!meets(ADD_RTN, ADD_RTN), "two ds_add_rtn_u32");
+        assert!(!meets(ADD, WRITE_B32), "ds_add_u32 then ds_write_b32");
+        assert!(meets(ADD, ADD), "two ds_add_u32");
+        assert!(meets(MIN_U32, MIN_U32), "two ds_min_u32");
+        assert!(meets(WRITE_B32, WRITE_B32), "two ds_write_b32");
+        assert!(meets_at(MIN_U32, ADD, 4), "ds_min_u32 at 0 then ds_add_u32 at 4");
+        assert!(!meets_at(MIN_U32, ADD, 2), "ds_min_u32 at 0 then ds_add_u32 at 2: one word");
+        assert!(!meets_at(ADD_RTN, ADD, 4), "ds_add_rtn_u32 at 0 then ds_add_u32 at 4");
     }
 
     /// A program's constant table starts after its instructions, unless a
