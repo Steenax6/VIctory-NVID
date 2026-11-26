@@ -433,6 +433,15 @@ pub(crate) fn counting_due() -> bool {
     now >= next && NEXT.compare_exchange(next, now + 5000, Relaxed, Relaxed).is_ok()
 }
 
+/// Bytes of title memory that the checks of guarded textures read (the
+/// textures draws read through tables, at their submissions), since the
+/// last line, by why the check read: the guards saw a write; the memory was
+/// mapped anew; one of the texture's first checks; a texture taken for one
+/// written behind its guards (every check); the net's turn (the hash for
+/// what the guards do not see, every eighth frame). `crate::texture`
+/// `check_reads`.
+pub(crate) static CHECK_READS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 /// Since the start: slots of the queue of textures picked by index that
 /// its index by due frame did not hold when the two were compared (at
 /// every count of the queue, and by their sizes at every pass). 0: a pass
@@ -540,6 +549,17 @@ pub(crate) fn lines(frames: f64) {
         d[1],
         d[2],
         d[3]
+    );
+    let r: [f64; 5] = std::array::from_fn(|k| CHECK_READS[k].swap(0, Relaxed) as f64 / f64::from(1u32 << 20) / frames.max(1.0));
+    tracing::info!(
+        "textures read through tables, MB of title memory their checks read per frame since the last such line, by why: \
+         a write the guards saw {:.1}, memory mapped anew {:.1}, first checks {:.1}, textures taken for written behind their \
+         guards {:.1}, the net's turn {:.1}",
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4]
     );
     let l: [u64; 14] = std::array::from_fn(|k| BY_LEVEL[k].load(Relaxed));
     tracing::info!(

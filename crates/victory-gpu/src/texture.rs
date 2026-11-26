@@ -405,7 +405,77 @@ struct Last {
     /// A read the title had submitted was still to write some of the
     /// texture's memory at the last check (`crate::writes::pending_over`).
     pending: bool,
+    /// The frame of the last read through the guards, and one (0: none):
+    /// the net's hash is taken once a frame ([`check_reads`]).
+    hashed: u64,
+    /// For a texture taken for one written behind its guards: checks in a
+    /// row that found it unchanged.
+    same: u16,
 }
+
+/// What a check of a guarded texture knows before it reads
+/// ([`check_reads`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct Check {
+    /// The guards saw no write since the last check.
+    unwritten: bool,
+    /// Its memory was mapped anew since the last check.
+    remapped: bool,
+    /// Pages of it were missing at a read less than 30 frames ago.
+    partly_lately: bool,
+    /// One of its first checks.
+    young: bool,
+    /// It is taken for one written behind its guards.
+    behind: bool,
+    /// The net's turn for it this frame (every eighth).
+    turn: bool,
+    /// It was read through the guards this frame already.
+    hashed_now: bool,
+}
+
+/// Whether a check of a guarded texture reads its memory. A write the
+/// guards saw and a mapping told are read at once. Else: a texture with
+/// pages missing is left for 30 frames after a read (nothing tells of its
+/// bytes but those two, and it is read at most so often, as it was while
+/// such a texture was read whole); its first checks and a texture written
+/// behind its guards are read every time; and the net, the hash for what
+/// the guards do not see, is taken on the texture's turn, once in that
+/// frame however many of the frame's submissions sample the texture (it
+/// was taken at each of them).
+fn check_reads(c: Check) -> bool {
+    if !c.unwritten || c.remapped {
+        return true;
+    }
+    if c.partly_lately {
+        return false;
+    }
+    c.young || c.behind || (c.turn && !c.hashed_now)
+}
+
+/// Why a check read ([`check_reads`]), as a place of
+/// `crate::census::CHECK_READS`: a write seen, a mapping, a first check, a
+/// texture behind its guards, the net's turn.
+fn check_why(c: Check) -> usize {
+    if !c.unwritten {
+        0
+    } else if c.remapped {
+        1
+    } else if c.young {
+        2
+    } else if c.behind {
+        3
+    } else {
+        4
+    }
+}
+
+/// Checks in a row that find a texture unchanged after which it is no
+/// longer taken for one written behind its guards (`Last::behind_guard`):
+/// it is hashed on its turn again, and taken for one anew when a change is
+/// found that no guard saw. A texture caught once while it was filled was
+/// hashed at every check for the rest of the run; the frames of a video
+/// change every few checks and stay.
+const BEHIND_CHECKS: u16 = 240;
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -2304,13 +2374,14 @@ impl Staging {
         // with 0 of 318 frames out of order after it, and #602, #489).
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mut unseen = false;
+        let mut why_read = None;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
+            let frame = crate::frame::current();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             // A texture's first checks hash it whatever the turn, so one
             // written behind its guard is found at its second use, not up
             // to a second later (its memory moves from run to run, so it
@@ -2318,9 +2389,20 @@ impl Staging {
             const FIRST_CHECKS: u8 = 3;
             let young = last.checks < FIRST_CHECKS;
             last.checks = last.checks.saturating_add(1);
-            if unwritten && !turn && !young && !last.behind_guard && !remapped {
+            let check = Check {
+                unwritten,
+                remapped,
+                partly_lately: last.partial.is_some_and(|at| frame < at.saturating_add(30)),
+                young,
+                behind: last.behind_guard,
+                turn: frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY),
+                hashed_now: last.hashed == frame.wrapping_add(1),
+            };
+            if !check_reads(check) {
                 return 0;
             }
+            last.hashed = frame.wrapping_add(1);
+            why_read = Some(check_why(check));
             unseen = unwritten;
         }
         // A read the title has submitted into this memory writes it with
@@ -2342,6 +2424,19 @@ impl Staging {
                 bytes = size,
                 "a texture changed with no write its guard saw (written through another view): hashed at every check from now on"
             );
+        }
+        // Taken for one written behind its guards, and unchanged check
+        // after check: no longer.
+        if last.behind_guard {
+            last.same = if changed { 0 } else { last.same.saturating_add(1) };
+            if last.same >= BEHIND_CHECKS {
+                (last.behind_guard, last.same) = (false, 0);
+                BEHIND_GONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // What the checks read, by why (`crate::census::CHECK_READS`).
+        if let Some(why) = why_read {
+            crate::census::CHECK_READS[why].fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
         }
         read
     }
@@ -2709,6 +2804,9 @@ impl Staging {
             let incomplete = (0..n).any(|k| through[k] || is[k] == PartIs::Zeros);
             let alone = (0..n).filter(|&k| is[k] == PartIs::Left).fold(0, |all, k| all | self.place.levels_of_part[k]);
             self.note_shown_from(if incomplete { self.first_level_there(alone) } else { 0 });
+            // For the checks: read again in 30 frames at the earliest
+            // unless a write is seen or a mapping told ([`check_reads`]).
+            last.partial = incomplete.then(crate::frame::current);
         }
         let by_level = &c::BY_LEVEL;
         by_level[c::L_LEFT].fetch_add(left, Relaxed);
@@ -3121,6 +3219,10 @@ static BEHIND_GUARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// what changed it was known ([`behind_guards`]), since the start.
 static BEHIND_KNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Textures no longer taken for ones written behind their guards, after
+/// [`BEHIND_CHECKS`] checks that found them unchanged, since the start.
+static BEHIND_GONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether a change of a texture's bytes that its guard saw no write for
 /// is the work of a writer the guards do not see, so that the texture is
 /// hashed at every check from then on. Not if a read the title submitted
@@ -3148,12 +3250,14 @@ pub(crate) fn filled_line() {
     let clamped = SHOWN_FROM.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashMap::len);
     let behind = BEHIND_GUARD.load(Relaxed);
     let known = BEHIND_KNOWN.load(Relaxed);
+    let gone = BEHIND_GONE.load(Relaxed);
     if clamped as u64 + behind + known > 0 {
         tracing::info!(
             "textures streaming in, shown from their first level whose pages are all there (their views clamped), now: \
              {clamped}; since the start: {behind} textures found written through another view, behind their guards, \
-             hashed at every check since; {known} checks found a texture changed with no write seen while a read of the \
-             title's was writing it or its memory had been mapped anew (not taken for that)"
+             hashed at every check since, {gone} of them no longer (unchanged for {BEHIND_CHECKS} checks: on their turn \
+             again); {known} checks found a texture changed with no write seen while a read of the title's was writing \
+             it or its memory had been mapped anew (not taken for that)"
         );
     }
 }
@@ -4157,6 +4261,22 @@ mod digest_tests {
         assert_eq!(first_shown(None, Some(2)), 2);
         assert_eq!(first_shown(Some(4), None), 4);
         assert_eq!(first_shown(None, None), 0);
+        // When a check of a guarded texture reads.
+        use super::{Check, check_reads, check_why};
+        let quiet = Check { unwritten: true, ..Check::default() };
+        assert!(!check_reads(quiet), "nothing written, not its turn");
+        assert!(check_reads(Check { unwritten: false, ..quiet }) && check_why(Check { unwritten: false, ..quiet }) == 0);
+        assert!(check_reads(Check { remapped: true, ..quiet }) && check_why(Check { remapped: true, ..quiet }) == 1);
+        assert!(check_reads(Check { young: true, ..quiet }) && check_why(Check { young: true, ..quiet }) == 2);
+        assert!(check_reads(Check { behind: true, ..quiet }) && check_why(Check { behind: true, ..quiet }) == 3);
+        assert!(check_reads(Check { turn: true, ..quiet }) && check_why(Check { turn: true, ..quiet }) == 4);
+        // The net once a frame; a texture behind its guards every time.
+        assert!(!check_reads(Check { turn: true, hashed_now: true, ..quiet }));
+        assert!(check_reads(Check { behind: true, hashed_now: true, ..quiet }));
+        // Pages missing at a read lately: only a write or a mapping.
+        let partly = Check { partly_lately: true, ..quiet };
+        assert!(!check_reads(Check { turn: true, young: true, behind: true, ..partly }));
+        assert!(check_reads(Check { unwritten: false, ..partly }) && check_reads(Check { remapped: true, ..partly }));
         // A change no guard saw is a writer's the guards do not see,
         // unless a read of the title's was writing the memory at one of
         // the two checks, or the memory was mapped anew between them.

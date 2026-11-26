@@ -240,6 +240,17 @@ brought (0: none may be; the first eight are said in a warning with the
 texture's memory).
 The megabytes in "texture uploads by reason" are those read.
 
+A texture draws read through tables keeps its staging buffer and is
+checked at every submission that samples it. The check reads its memory
+when the guards saw a write or the runtime told of a mapping; at its first
+three checks; on its turn every eighth frame, once in that frame (the hash
+for what the guards do not see); and at every check while it is taken for
+one written behind its guards, which ends after 240 checks that found it
+unchanged. A texture with pages missing is read again 30 frames after a
+read at the earliest unless a write is seen or a mapping told. "textures
+read through tables, MB of title memory their checks read per frame" has
+those megabytes by why the check read.
+
 Whether a write would have been known without the read is counted too, to
 decide if the reads of unchanged textures can go: "what the journal, the
 guards and the write watch knew of the parts of textures an upload of the
