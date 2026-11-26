@@ -1278,3 +1278,146 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+// ---- exchanges of two host waves, one group barrier each (`VICTORY_EXCHANGE_PARITY`) ----
+
+/// `native` lowered for a host of 32-lane waves with the exchanges' two pairs of dwords taken
+/// in turn (`parity`) or one pair and a second barrier, validated by `dxil.dll` when present;
+/// with the group barriers the lowering added.
+fn lowered_with_parity(native: &NativeProgram, parity: bool) -> (HostShader, u32) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let was = lower::TEST_EXCHANGE_PARITY.replace(Some(parity));
+    lower::TEST_SYNCS.set(0);
+    let shader = lowered(native, &p, &HashSet::new());
+    let syncs = lower::TEST_SYNCS.get();
+    lower::TEST_EXCHANGE_PARITY.set(was);
+    let shader = shader.expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    (shader, syncs)
+}
+
+/// Lanes 40, 5, 63 and 33 of v2 = 7 t read one after another (`v_readlane_b32`, each an
+/// exchange of the two host waves), their sum stored by every thread.
+fn four_lane_reads(threads: u32, lds: u32) -> NativeProgram {
+    let mut w = vec![];
+    w.extend(vop3(0x169, 2, v(0), k(7))); // v_mul_lo_u32 v2, v0, 7
+    for (s, lane) in [(14, 40), (15, 5), (16, 63), (17, 33)] {
+        w.extend(vop3(0x360, s, v(2), k(lane))); // v_readlane_b32 s<s>, v2, <lane>
+    }
+    w.extend([
+        sop2(0x00, 14, 14, 15), // s_add_u32 s14, s14, s15
+        sop2(0x00, 14, 14, 16), // s_add_u32 s14, s14, s16
+        sop2(0x00, 14, 14, 17), // s_add_u32 s14, s14, s17
+        vop1(0x01, 9, 14),      // v_mov_b32 v9, s14
+    ]);
+    w.extend(stores([9, 9, 9, 9]));
+    native_with(&w, true, threads, lds)
+}
+
+/// Each exchange of two host waves costs one group barrier, not two (besides the entry's,
+/// where the host waves take their console threads: `wave_base`).
+#[test]
+fn an_exchange_of_the_halves_costs_one_group_barrier() {
+    // (the largest group, with LDS up to the last granule that leaves room for the pairs)
+    for (threads, lds) in [(64, 0), (128, 0), (256, 0), (1024, 31 * 1024 + 512)] {
+        let native = four_lane_reads(threads, lds);
+        assert_eq!(lowered_with_parity(&native, false).1, 1 + 8, "{threads} threads, one pair");
+        assert_eq!(lowered_with_parity(&native, true).1, 1 + 4, "{threads} threads, two pairs");
+    }
+    // a group of 32 threads has no other half to exchange with
+    let native = four_lane_reads(32, 0);
+    assert_eq!(lowered_with_parity(&native, true).1, 1);
+}
+
+/// Lane reads of a straight run on the card, in both forms.
+#[test]
+fn lane_reads_one_after_another_are_the_consoles_with_one_barrier_each() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for threads in [64u32, 256] {
+        let native = four_lane_reads(threads, 0);
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|t| {
+                let base = t & !63;
+                let sum = [40, 5, 63, 33].iter().map(|l| 7 * (base + l)).sum::<u32>();
+                [sum; 4]
+            })
+            .collect();
+        for parity in [false, true] {
+            let (shader, _) = lowered_with_parity(&native, parity);
+            let Some(got) = run_paired(&shader, [0; 4], 4 * threads) else { return };
+            same_as_console(&got, &want);
+        }
+    }
+    eprintln!("ran on the hardware device: lane reads of both halves, with one and two barriers");
+}
+
+/// A group of two console waves (128 threads). v2 = 7 t; a loop the wave runs s0 times (at
+/// least once; its branch is on a scalar) adds 1 to v2 and lane 40's v2 to v4, one exchange a
+/// round, so the pair an exchange takes after the loop depends on the count; a branch on s1
+/// (the group's) around a read of lane 63 added to v4; past the join lane 5's v2. Each thread
+/// stores v2, v4 and lane 5's value.
+fn exchanges_in_a_loop_and_a_branch() -> NativeProgram {
+    let mut w = vec![];
+    w.extend(vop3(0x169, 2, v(0), k(7))); // v_mul_lo_u32 v2, v0, 7
+    w.extend([
+        vop1(0x01, 4, k(0)),    // v_mov_b32 v4, 0
+        sop1(0x03, 20, k(0)),   // s_mov_b32 s20, 0
+        vop2(0x25, 2, k(1), 2), // loop: v_add_nc_u32 v2, 1, v2
+    ]);
+    w.extend(vop3(0x360, 14, v(2), k(40))); // v_readlane_b32 s14, v2, 40
+    w.extend([
+        vop2(0x25, 4, 14, 4),     // v_add_nc_u32 v4, s14, v4
+        sop2(0x00, 20, 20, k(1)), // s_add_u32 s20, s20, 1
+        0xBF0A_0014,              // s_cmp_lt_u32 s20, s0
+        sopp(0x05, -7),           // s_cbranch_scc1 loop
+        0xBF06_8001,              // s_cmp_eq_u32 s1, 0
+        sopp(0x05, 3),            // s_cbranch_scc1 past the read of lane 63
+    ]);
+    w.extend(vop3(0x360, 15, v(2), k(63))); // v_readlane_b32 s15, v2, 63
+    w.push(vop2(0x25, 4, 15, 4)); // v_add_nc_u32 v4, s15, v4
+    w.extend(vop3(0x360, 16, v(2), k(5))); // v_readlane_b32 s16, v2, 5
+    w.push(vop1(0x01, 9, 16)); // v_mov_b32 v9, s16
+    w.extend(stores([2, 4, 9, 9]));
+    native_with(&w, true, 128, 0)
+}
+
+/// The console's results of [`exchanges_in_a_loop_and_a_branch`] for s0, s1.
+fn loop_and_branch_on_the_console(s0: u32, s1: u32) -> Vec<u32> {
+    let rounds = s0.max(1);
+    (0..128u32)
+        .flat_map(|t| {
+            let base = t & !63;
+            let lane = |l: u32| 7 * (base + l) + rounds;
+            let mut acc: u32 = (1..=rounds).map(|i| 7 * (base + 40) + i).sum();
+            if s1 != 0 {
+                acc += lane(63);
+            }
+            [7 * t + rounds, acc, lane(5), lane(5)]
+        })
+        .collect()
+}
+
+/// [`exchanges_in_a_loop_and_a_branch`] on the card, in both forms: with the pairs taken in
+/// turn, an odd count of rounds and the branch each move the pair the next exchange takes.
+#[test]
+fn exchanges_in_a_loop_and_around_a_branch_take_their_pairs_in_turn() {
+    let native = exchanges_in_a_loop_and_a_branch();
+    // one exchange in the loop, one in the branch, one past the join (and the entry's meeting)
+    let (_, two) = lowered_with_parity(&native, false);
+    let (_, one) = lowered_with_parity(&native, true);
+    assert_eq!((two, one), (1 + 6, 1 + 3));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for parity in [false, true] {
+        let (shader, _) = lowered_with_parity(&native, parity);
+        for s0 in [1u32, 2, 3, 6] {
+            for s1 in [0u32, 1] {
+                let Some(got) = run_paired(&shader, [s0, s1, 0, 0], 4 * 128) else { return };
+                same_as_console(&got, &loop_and_branch_on_the_console(s0, s1));
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: exchanges in a loop and a branch, both forms, two console waves");
+}

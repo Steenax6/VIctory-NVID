@@ -309,6 +309,11 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange`: each console wave has two pairs of dwords, taken in turn
+    /// ([`Self::exchange_slots`]), and an exchange needs one group barrier, not two.
+    parity: bool,
+    /// With `parity`: the thread's own variable saying which pair its next exchange takes.
+    turn: Option<V>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -882,6 +887,26 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether the two host waves of a console wave exchange through two pairs of dwords taken
+/// in turn, at one group barrier an exchange ([`Lower::exchange_halves`]); `VICTORY_EXCHANGE_PARITY=0`:
+/// one pair, rewritten only past a second barrier, as before.
+fn exchange_parity_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EXCHANGE_PARITY.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXCHANGE_PARITY").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`exchange_parity_on`], for its thread only.
+    pub(super) static TEST_EXCHANGE_PARITY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The group barriers the lowerings on this thread added ([`Lower::group_sync`]).
+    pub(super) static TEST_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -1181,6 +1206,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // with `exchange`: two pairs of exchange dwords a console wave (`Lower::parity`)
+        let mut parity = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // a program in host waves of the console's size whose group a host wave may tile
@@ -1285,9 +1312,13 @@ impl<'a> Lower<'a> {
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
-                                // numbers go through two exchange dwords past the program's LDS
+                                // numbers go through two exchange dwords past the program's LDS;
+                                // two pairs of them taken in turn where they fit in the host's
+                                // 32 KiB beside `wave_base`'s counter ([`Self::exchange_slots`])
+                                let waves = group.div_ceil(64);
+                                parity = exchange_parity_on() && group > 32 && s.lds_dwords + 4 * waves < 8192;
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += if parity { 4 } else { 2 } * waves;
                             }
                         }
                     }
@@ -1507,6 +1538,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            parity,
+            turn: None,
             halves,
             relabel,
             wave_base: None,
@@ -3925,9 +3958,53 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        #[cfg(test)]
+        TEST_SYNCS.set(TEST_SYNCS.get() + 1);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// The first of the two dwords an exchange in `at` writes and reads, `pair` being
+    /// [`Self::exchange_pair`]'s. With `parity` each console wave has two pairs, and a thread
+    /// takes them in turn, by a variable of its own that each exchange flips: every thread of
+    /// the group runs `at` (an exchange stands only where every lane runs).
+    ///
+    /// Why one barrier an exchange is then enough. The two host waves of a console wave run
+    /// the same exchanges in the same order (they meet at each; only lane branches, which
+    /// hold none, send their threads different ways), so their variables agree and both take
+    /// pair k mod 2 for their k-th exchange. A group barrier lets no thread past before every
+    /// thread of the group has reached as many barriers, whichever. A thread writes pair
+    /// k mod 2 again at exchange k + 2, past the barrier of exchange k + 1; the other half
+    /// reached that barrier only after its reads of exchange k, which follow its barrier of
+    /// exchange k with no barrier between. Other console waves have their own pairs.
+    fn exchange_slots(&mut self, at: usize, pair: V) -> V {
+        if !self.parity {
+            return pair;
+        }
+        let turn = match self.turn {
+            Some(t) => t,
+            None => {
+                let z = self.s.m.i32(0);
+                let t = self.s.m.private_global("exchange.turn", z);
+                self.turn = Some(t);
+                t
+            }
+        };
+        // 0 or 2: the offset of the pair this exchange takes
+        let now = self.s.m.load(at, turn);
+        let two = self.s.m.i32(2);
+        let next = self.s.m.bin(at, Bin::Xor, now, two);
+        self.s.m.store(at, turn, next);
+        self.s.m.bin(at, Bin::Add, pair, now)
+    }
+
+    /// After an exchange's reads in `at`: without `parity` the dwords are written again only
+    /// after every thread read them, a second group barrier.
+    fn exchange_done(&mut self, at: usize) {
+        if !self.parity {
+            self.group_sync(at);
+        }
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -3952,6 +4029,7 @@ impl<'a> Lower<'a> {
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
+        let pair = self.exchange_slots(at, pair);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -3966,13 +4044,13 @@ impl<'a> Lower<'a> {
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
-        // the slots are written again only after every thread read them
-        self.group_sync(at);
+        self.exchange_done(at);
         (lo, hi)
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// block): a group of several console waves has a pair for each (two with `parity`,
+    /// [`Self::exchange_slots`]).
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -3981,7 +4059,7 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
+        let one = self.s.m.i32(if self.parity { 2 } else { 1 });
         let twice = self.s.m.bin(e, Bin::Shl, wave, one);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
@@ -7956,6 +8034,8 @@ impl<'a> Lower<'a> {
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
+                    // (every thread takes its turn, before the lane's own store)
+                    let k = self.exchange_slots(self.cur, k);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -7965,7 +8045,7 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    self.exchange_done(c2);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
