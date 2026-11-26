@@ -490,6 +490,11 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        // A pass over a view heap's buffer views that runs beside the
+        // recording holds the heap by address (`crate::draw::Picked`).
+        if self.host.get().is_some_and(Option::is_some) && !self.samplers() {
+            crate::draw::picked_settled();
+        }
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
@@ -1133,6 +1138,39 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// How often a resource went that views recorded named ([`forget`]): a
+/// record that named one of them names nothing from then on. What
+/// remembers the view a record named (`crate::draw::Seen`) asks this
+/// before it trusts that.
+static FORGOTTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`FORGOTTEN`].
+#[cfg(windows)]
+pub(crate) fn forgotten() -> u64 {
+    FORGOTTEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The two words that name the view recorded at `handle`, as one number
+/// (the key a host slot is made from; never 0), if a view is recorded
+/// there. [`view_of`] gives the view.
+#[cfg(windows)]
+pub(crate) fn key_at(handle: u64) -> Option<u64> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let key = u64::from(generation) << 32 | u64::from(i);
+    (tag == VIEW_TAG && key != 0).then_some(key)
+}
+
+/// The view the record words `key` name ([`key_at`]), if its resource is
+/// alive: what [`view`] gives for the record.
+#[cfg(windows)]
+pub(crate) fn view_of(key: u64) -> Option<View> {
+    view_at(key as u32, (key >> 32) as u32)
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -1158,6 +1196,8 @@ pub(crate) fn forget(resource: usize) {
         // `forget` of that resource skips.
         views.free.push(i);
     }
+    // (Under the table's lock, after the change.)
+    FORGOTTEN.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
@@ -1692,6 +1732,32 @@ mod tests {
             create_cbv(null, &[0x2000, 1, size, 0], at(i));
             assert_eq!(view(at(i)), Some(View::Constant(0x1_0000_2000, recorded)), "{size}");
         }
+    }
+
+    /// A record's key names the view the record holds, and a slot without a
+    /// record has none ([`key_at`], [`view_of`]).
+    #[test]
+    #[cfg(windows)]
+    fn a_records_key_names_its_view() {
+        let null = std::ptr::null();
+        let mut heap = vec![0u64; 8 * 4]; // eight 32-byte slots
+        let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
+        create_cbv(null, &[0x2000, 1, 512, 0], at(0));
+        create_srv(null, null, std::ptr::null(), at(1));
+        for slot in [at(0), at(1)] {
+            let key = key_at(slot).expect("a record");
+            assert_ne!(key, 0);
+            assert_eq!(view_of(key), view(slot));
+            assert!(view(slot).is_some());
+        }
+        assert_ne!(key_at(at(0)), key_at(at(1)));
+        assert_eq!(key_at(at(2)), None, "never written");
+        assert_eq!(key_at(0), None);
+        // Words that do not begin with a record's tag.
+        // SAFETY: the third slot of `heap`.
+        unsafe { (at(2) as *mut [u32; 3]).write_unaligned([7, 1, 1]) };
+        assert_eq!(key_at(at(2)), None, "not a record");
+        heap[0] = 0;
     }
 
     #[test]

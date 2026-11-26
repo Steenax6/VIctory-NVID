@@ -2139,6 +2139,14 @@ impl HostHeap {
         self.made.get(index as usize).map(|m| m.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Whether slot `index` is made from the record words `key`
+    /// (`super::key_at`), asked without its lock: a slot another thread is
+    /// making or taking away this instant is seen as it was or as it will
+    /// be, the two orders the lock allows.
+    pub(crate) fn made_from(&self, index: u32, key: u64) -> bool {
+        key != 0 && self.made_key(index) == Some(key)
+    }
+
     /// Notes slot `index` made from `key` (under its lock).
     fn set_made(&self, index: u32, key: u64) {
         if let Some(m) = self.made.get(index as usize) {
@@ -2346,6 +2354,13 @@ impl HostHeap {
         }
         tabled_out() && stamp & !TABLED_READ != 0
             && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES
+    }
+
+    /// Diagnostics: whether title slot `index` is noted read through a
+    /// table in frame `frame` ([`HostHeap::texture_slot_tabled`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn tabled_read_in(&self, index: u32, frame: u64) -> bool {
+        self.tabled_stamp(index) == ((frame as u32).wrapping_add(1) & !TABLED_READ) | TABLED_READ
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -2817,6 +2832,21 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// [`HostHeap::make_at`] for the view of record `key` in a list that
+    /// keeps the buffer views it made (`kept`): a shader view of a buffer is
+    /// made once there and copied into the slot from then on; any other
+    /// view is made in the slot, as before.
+    pub(crate) fn make_at_kept(&self, index: u32, view: &View, key: u64, kept: &mut KeptViews) {
+        let Some((from, resource)) = kept.view(view, key) else {
+            self.make_at(index, view);
+            return;
+        };
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap and one of the list's own, of one type.
+        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(index), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        self.keep(index, Some(resource));
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -2846,7 +2876,7 @@ impl HostHeap {
                 // retire list's lock, which the recording threads stood in).
                 drop(old);
             } else {
-                crate::host::retire(old);
+                let_go(old);
             }
         }
     }
@@ -3108,6 +3138,13 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_key(index, handle, for_draw).0
+    }
+
+    /// [`HostHeap::mirror`], with the words of the record it found at
+    /// `handle` as one number (`super::key_at`; whatever was there if no
+    /// view is returned).
+    pub(crate) fn mirror_key(&self, index: u32, handle: u64, for_draw: bool) -> (Option<View>, u64) {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3120,7 +3157,7 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return (None, 0);
         }
         // The slot's own lock, unless the write of a placed texture's view
         // makes other slots' views stale ([`HostHeap::note_buffer`]): then
@@ -3130,6 +3167,26 @@ impl HostHeap {
         // for any placed texture's view that changed stopped all recording
         // threads behind each such write and the views being made before
         // it, some 10 ms a frame of theirs.)
+        // A slot made from the very record that is there has nothing done
+        // to it under its lock either: it is answered without the lock.
+        // Every draw asks this of every slot its tables name, and the lock
+        // is the one the pass over the heap and the title's writes of other
+        // slots take (7.8 ms a frame of the recording threads waiting for
+        // it, the profile of 2026-11-26). A slot another thread is making
+        // or taking away this instant is seen either as it was or as it will
+        // be, which are the two orders the lock allows.
+        {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag == VIEW_TAG
+                && key != 0
+                && self.made_key(index) == Some(key)
+                && let Some(view) = view_at(i, generation)
+            {
+                return (Some(view), key);
+            }
+        }
         let mut all = false;
         loop {
             let slot = if all { self.locks.all() } else { self.locks.slot(index) };
@@ -3139,7 +3196,7 @@ impl HostHeap {
             let key = u64::from(generation) << 32 | u64::from(i);
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
             match self.mirror_locked(index, handle, key, view, for_draw, slot.exclusive()) {
-                Ok(view) => return view,
+                Ok(view) => return (view, key),
                 Err(NeedsAll) => {
                     drop(slot);
                     all = true;
@@ -3307,6 +3364,221 @@ impl HostHeap {
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
+    }
+}
+
+/// The shader views of buffers one list's tables hold, each made once in a
+/// heap of the list's own (one only the CPU reads) and copied from there
+/// into every table slot that shows it ([`HostHeap::make_at_kept`]).
+///
+/// A draw's tables are made anew in dynamic slots (they hold the draw's
+/// constants), and with them every buffer view in them: the copy of the
+/// buffer looked up, the view worked out and checked, the host asked to make
+/// it, some 60,000 times a frame in the first room for a few hundred views
+/// that differ (22 ms a frame of the recording threads in `buffer_srv`, 15
+/// of them in the host's call; the profile of 2026-11-26). A view made of
+/// the same record again is the same descriptor as long as the record
+/// names the same view (`super::forgotten`) and the copies' tables answer
+/// as they did (`crate::shadow::changes`): what the list kept is thrown
+/// away when either moves ([`KeptViews::clear`], by `crate::draw::Seen`'s
+/// stamp). Only views that could be made are kept; one the host would
+/// refuse, or whose copy could not be made, is asked for every time, as
+/// before. Textures' views are not kept: they change with the levels a
+/// texture holds.
+#[derive(Default)]
+pub(crate) struct KeptViews {
+    /// The heap, its first slot and the bytes of a slot, once a view is
+    /// kept.
+    heap: Option<KeptHeap>,
+    /// By record key: the slot of `heap` and the host buffer viewed.
+    made: std::collections::HashMap<u64, (u32, ID3D12Resource), std::hash::BuildHasherDefault<super::slots::SlotHasher>>,
+    /// Views copied from here since the count was last handed on
+    /// ([`KEPT_VIEW_COUNTS`]).
+    copied: u64,
+}
+
+/// A heap of [`KeptViews`]: the heap, its first slot, the bytes of a slot.
+type KeptHeap = (ID3D12DescriptorHeap, usize, u32);
+
+/// The views a list keeps at most; the rest are made in place.
+const KEPT_VIEWS_MOST: u32 = 1024;
+
+/// Heaps of [`KeptViews`] no list has now: a list's draw state is made anew
+/// at every reset, and a heap for each would be made a few hundred times a
+/// frame.
+static KEPT_HEAPS: Mutex<Vec<KeptHeap>> = Mutex::new(Vec::new());
+
+/// Since the start: buffer views copied from a list's kept ones, and those
+/// `VICTORY_SEEN_CHECK=1` found another descriptor or another buffer when
+/// it made them again.
+pub(crate) static KEPT_VIEW_COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl KeptViews {
+    /// Nothing is kept any more (the heap stays).
+    pub(crate) fn clear(&mut self) {
+        self.made.clear();
+        if self.copied > 0 {
+            KEPT_VIEW_COUNTS[0].fetch_add(std::mem::take(&mut self.copied), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Slot `slot` of the list's heap.
+    fn at(start: usize, slot: u32, step: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + slot as usize * step as usize }
+    }
+
+    /// The kept view of record `key` (`view`), made now if it is a shader
+    /// view of a buffer not kept yet and there is room: where it is, and
+    /// the host buffer it views. `None` for any other view and for one that
+    /// cannot be made.
+    fn view(&mut self, view: &View, key: u64) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+        let buffer = match view {
+            View::Shader(resource, Some(_)) => crate::resource::buffer_bytes(*resource as crate::object::This).is_some(),
+            View::Placed(false, resource, _) => resource[0] == 1,
+            _ => false,
+        };
+        if !buffer {
+            return None;
+        }
+        if let Some((slot, resource)) = self.made.get(&key) {
+            let &(_, start, step) = self.heap.as_ref()?;
+            let from = Self::at(start, *slot, step);
+            self.copied += 1;
+            #[cfg(feature = "diagnostics")]
+            if kept_check() {
+                // Made again in the slot past the kept ones and compared:
+                // the same buffer, and the same bytes where the slots are
+                // memory this process can read.
+                let again = Self::at(start, KEPT_VIEWS_MOST, step);
+                let made = make(view, again).flatten();
+                let same_buffer = made.as_ref().is_some_and(|b| windows::core::Interface::as_raw(b) == windows::core::Interface::as_raw(resource));
+                let read = |at: D3D12_CPU_DESCRIPTOR_HANDLE| {
+                    crate::texture::committed(at.ptr as *const u8, step as usize)
+                        // SAFETY: committed memory of this process, `step` bytes of it.
+                        .then(|| unsafe { std::slice::from_raw_parts(at.ptr as *const u8, step as usize) })
+                };
+                let same_bytes = read(from) == read(again);
+                if !(same_buffer && same_bytes) && KEPT_VIEW_COUNTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    tracing::warn!(same_buffer, same_bytes, ?view, "a buffer view a list kept is not the one made of its record now");
+                }
+            }
+            return Some((from, resource.clone()));
+        }
+        let host = host()?;
+        if self.made.len() as u32 >= KEPT_VIEWS_MOST {
+            return None;
+        }
+        if self.heap.is_none() {
+            self.heap = KEPT_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).pop().or_else(|| {
+                let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    // (One more: where the check makes a view again.)
+                    NumDescriptors: KEPT_VIEWS_MOST + 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                };
+                // SAFETY: a plain heap of ours.
+                let heap: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&desc) }.ok()?;
+                // SAFETY: a live heap; a plain query.
+                let (start, step) = unsafe {
+                    (
+                        heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                        host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                    )
+                };
+                Some((heap, start, step))
+            });
+        }
+        let &(_, start, step) = self.heap.as_ref()?;
+        let slot = self.made.len() as u32;
+        let at = Self::at(start, slot, step);
+        // (One that cannot be made is not kept: asked for every time.)
+        let resource = make(view, at).flatten()?;
+        self.made.insert(key, (slot, resource.clone()));
+        Some((at, resource))
+    }
+}
+
+impl Drop for KeptViews {
+    fn drop(&mut self) {
+        self.clear();
+        if let Some(heap) = self.heap.take() {
+            KEPT_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push(heap);
+        }
+    }
+}
+
+/// Whether a buffer view a list kept is made again and compared each time
+/// it is copied (`VICTORY_SEEN_CHECK=1`, diagnostics builds; see
+/// `crate::draw::Seen`).
+#[cfg(feature = "diagnostics")]
+fn kept_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEEN_CHECK").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// The host resources slots let go of on this thread while a
+    /// [`Together`] is alive there.
+    static LET_GO: std::cell::RefCell<Option<Vec<ID3D12Resource>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While one is alive on a thread, the host resources that slots made on
+/// that thread let go of ([`HostHeap::keep`]) are retired together when it
+/// goes, not each by itself.
+///
+/// A draw makes its tables' slots anew (some eight a draw, 60,000 a frame in
+/// the first room), and each slot retires what it showed before: one
+/// allocation and one turn at the retire list's lock each, the lock all
+/// recording threads and the pass over the heap share (6.5 ms a frame of the
+/// recording threads waiting for it, the profile of 2026-11-26). Retired
+/// together they wait for at least the submissions each would have waited
+/// for (`crate::host::retire` counts the ones started by then), and never
+/// longer than the call the `Together` lives in.
+pub(crate) struct Together(bool);
+
+impl Together {
+    pub(crate) fn begin() -> Together {
+        // Whether this one is the first alive on its thread: one begun
+        // inside another leaves the retiring to that one.
+        let first = LET_GO
+            .try_with(|held| {
+                let mut held = held.borrow_mut();
+                held.is_none() && {
+                    *held = Some(Vec::new());
+                    true
+                }
+            })
+            .unwrap_or(false);
+        Together(first)
+    }
+}
+
+impl Drop for Together {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let old = LET_GO.try_with(|held| held.borrow_mut().take()).ok().flatten();
+        if let Some(old) = old
+            && !old.is_empty()
+        {
+            crate::host::retire(old);
+        }
+    }
+}
+
+/// A slot no longer shows `old`: retired, by itself or with the others of
+/// the [`Together`] alive on this thread.
+fn let_go(old: ID3D12Resource) {
+    let mut old = Some(old);
+    let _ = LET_GO.try_with(|held| {
+        if let Some(together) = held.borrow_mut().as_mut() {
+            together.extend(old.take());
+        }
+    });
+    if let Some(old) = old {
+        crate::host::retire(old);
     }
 }
 

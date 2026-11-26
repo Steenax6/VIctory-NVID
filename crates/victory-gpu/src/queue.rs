@@ -891,6 +891,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let _span = crate::timeline::span("exec>", "exec<", this as u64, u64::from(count));
+        // Before anything looks at the lists' steps: those of a pass a list
+        // started beside its recording (`crate::draw::Picked`).
+        crate::list::picked_in(lists);
         crate::resubmit::submitted(this, lists);
         if crate::list::thin::on() && !this.is_null() {
             submit_thin(this, lists);

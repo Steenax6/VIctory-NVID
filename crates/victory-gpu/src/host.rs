@@ -98,8 +98,23 @@ pub(crate) fn now_ms() -> u64 {
 /// frames begun so far (high half, `crate::frame::current`) and tenths of a
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
+///
+/// The tenths are the system's tick count (memory the kernel shares with
+/// every process: a load), not the performance counter behind [`now_ms`]:
+/// every use of a texture by a draw notes a moment, some hundred thousand
+/// a frame, and the counter and its division were 12 ms a frame of the
+/// recording threads (the profile of 2026-11-26). A tick is 16 ms at most,
+/// the unit here is 100; moments are only ever held against moments.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    (crate::frame::current() << 32) | (tenths() & 0xffff_ffff)
+}
+
+/// Tenths of a second since the first call, by the system's tick count.
+fn tenths() -> u64 {
+    static FIRST: OnceLock<u64> = OnceLock::new();
+    // SAFETY: a plain query.
+    let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    now.saturating_sub(*FIRST.get_or_init(|| now)) / 100
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -854,11 +869,15 @@ mod tests {
         let list = host.new_list().unwrap();
         assert!(list.first_use(8), "the first draw uploads it");
         assert!(!list.first_use(8), "later draws find it done");
+        let epoch = list.epoch();
         list.defer_copy(std::ptr::null_mut(), std::ptr::null(), 0);
         assert!(list.first_use(8), "after a copy: again");
         assert!(!list.first_use(8));
+        assert_ne!(list.epoch(), epoch, "and what remembers a view made ready is told");
+        let epoch = list.epoch();
         list.defer(|| {});
         assert!(list.first_use(8), "after work that writes title memory: again");
+        assert_ne!(list.epoch(), epoch);
         list.close();
     }
 
@@ -898,6 +917,59 @@ mod tests {
     }
 
     use super::*;
+
+    /// The refreshes of a pass a recording started beside it are put among
+    /// the list's steps where the pass was started, in front of what was
+    /// recorded after it, and only once ([`HostList::picked_in`]); the
+    /// declared writes taken out before them by a quarantine move the place
+    /// with them.
+    #[test]
+    fn a_pass_beside_the_recording_refreshes_where_it_was_started() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let memory = crate::resource::Memory::zeroed(1 << 16, 4096).expect("a test buffer");
+        let start = memory.address();
+        crate::shadow::register(start as usize, start, 1 << 16);
+        let copy = crate::shadow::find(start, 1 << 16).expect("a host copy");
+        let steps = |list: &HostList| -> Vec<(char, usize)> {
+            list.deferred()
+                .copies
+                .iter()
+                .map(|step| match step {
+                    Step::Refresh(_, address, _) => ('r', *address - start as usize),
+                    Step::GpuWrite(_, address, _) => ('w', *address - start as usize),
+                    Step::Fill(..) => ('f', 0),
+                    _ => ('?', 0),
+                })
+                .collect()
+        };
+        for quarantined in [false, true] {
+            list.defer_gpu_write(&copy, start as usize + 0x100, 16);
+            list.defer_refresh(&copy, start as usize + 0x200, 16);
+            list.defer_picked(crate::draw::Picked::done(vec![(copy.clone(), start + 0x1000, 64), (copy.clone(), start + 0x2000, 1 << 20)]));
+            list.defer_refresh(&copy, start as usize + 0x300, 16);
+            if quarantined {
+                list.quarantine();
+            }
+            list.defer_refresh(&copy, start as usize + 0x400, 16);
+            let before = steps(&list);
+            list.picked_in();
+            let mut expected = before.clone();
+            let at = if quarantined { 1 } else { 2 };
+            expected.splice(at..at, [('r', 0x1000), ('r', 0x2000)]);
+            assert_eq!(steps(&list), expected, "quarantined: {quarantined}");
+            // (Cut at the copy's end, as a refresh asked of the copy is.)
+            let cut = list.deferred().copies.iter().any(|step| matches!(step, Step::Refresh(_, address, len) if *address == start as usize + 0x2000 && *len == (1 << 16) - 0x2000));
+            assert!(cut);
+            list.picked_in();
+            assert_eq!(steps(&list), expected, "taken once");
+            list.close();
+            list.reset();
+        }
+        list.close();
+        drop(copy);
+        crate::shadow::unregister(start as usize, start);
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -943,7 +1015,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<Plain<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -974,6 +1046,11 @@ pub(crate) struct HostList {
     /// indirect arguments.
     hoist_buffers: OnceLock<Option<(ID3D12Resource, ID3D12Resource)>>,
     hoist_readable: std::sync::atomic::AtomicBool,
+    /// Counts the steps after which the recording asks anew for what it
+    /// asked before: a title copy or work of ours (they empty `refreshed`
+    /// and `textures`), and a read-back. What remembers that a view was
+    /// made ready in this recording (`crate::draw::Seen`) asks this.
+    epoch: std::sync::atomic::AtomicU64,
     /// Memory the CPU maps (and its address) where the prelude's clamp
     /// leaves the diagnostics of the records it clamped
     /// (`crate::indirect::record_hoisted`), read when the next prelude is
@@ -1015,10 +1092,17 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type States = Plain<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+
+/// A map of a recording's own, keyed by addresses and numbers of ours and
+/// hashed with a multiply (`crate::descriptor::slots::SlotHasher`): every
+/// texture and buffer range a draw reads is looked up in one, and the
+/// standard hash, made to stand keys an attacker picks, was 6 ms a frame of
+/// the recording threads (the profile of 2026-11-26). Nothing goes by the
+/// order of such a map.
+type Plain<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::descriptor::slots::SlotHasher>>;
+/// [`Plain`], as a set.
+type PlainSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<crate::descriptor::slots::SlotHasher>>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -2156,13 +2240,13 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: PlainSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: PlainSet<usize>,
     /// Per host texture of a view placed in a texture the host writes, the
     /// host texture last copied into it in this recording
     /// (`crate::texture::alias`).
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: Plain<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2194,6 +2278,12 @@ struct Deferred {
     /// structure builder, so nothing its shaders write is copied back into
     /// title memory ([`HostList::quarantine`]).
     quarantined: bool,
+    /// The pass over the view heap's picked buffer views this recording
+    /// started (`crate::draw::Picked`), with how many steps and how many
+    /// read-backs were recorded before it: the refreshes of what the pass
+    /// finds are put among `copies` there before the list is submitted
+    /// ([`HostList::picked_in`]).
+    picked: Option<(usize, usize, std::sync::Arc<crate::draw::Picked>)>,
 }
 
 impl Deferred {
@@ -2205,13 +2295,20 @@ impl Deferred {
     /// a run whether the title does it. Nothing to look at for the lists
     /// without read-backs.
     fn reads_read_back(&self, at: usize, len: usize) {
-        if self.backs.is_empty() {
+        self.reads_read_back_of(self.backs.len(), at, len);
+    }
+
+    /// [`Deferred::reads_read_back`] for a step that belongs behind the
+    /// first `backs` read-backs of the list only.
+    fn reads_read_back_of(&self, backs: usize, at: usize, len: usize) {
+        if backs == 0 {
             return;
         }
         let end = at.saturating_add(len);
         if self
             .backs
             .iter()
+            .take(backs)
             .filter_map(|&(_, to, shape)| read_back_span(to, shape))
             .any(|(from, to)| from < end && at < to)
         {
@@ -4482,6 +4579,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 hoist_buffers: OnceLock::new(),
                 hoist_readable: std::sync::atomic::AtomicBool::new(false),
+                epoch: std::sync::atomic::AtomicU64::new(0),
                 hoist_notes: OnceLock::new(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
@@ -7717,6 +7815,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         deferred.refreshed.clear();
         // A texture sampled before the copy may lie in what it writes: the
         // next draw that samples it records its upload again, which the
@@ -7754,6 +7853,38 @@ impl HostList {
         }
     }
 
+    /// The recording started the pass over the view heap's picked buffer
+    /// views here (`crate::draw::Picked`): the refreshes of the ranges the
+    /// pass finds are steps of this list from this place on, put in before
+    /// the list is submitted ([`HostList::picked_in`]).
+    pub(crate) fn defer_picked(&self, pass: std::sync::Arc<crate::draw::Picked>) {
+        let mut deferred = self.deferred();
+        deferred.picked = Some((deferred.copies.len(), deferred.backs.len(), pass));
+    }
+
+    /// Before the list is submitted: the refreshes of the pass the
+    /// recording started ([`HostList::defer_picked`]) become its steps, at
+    /// the place the pass was started, as [`HostList::defer_refresh`]
+    /// recorded them there when the pass ran in the recording. Waits for
+    /// the pass. (Not noted in `refreshed`: an ask for the same range of the
+    /// same copy later in the list is then a second step, which a
+    /// submission joins with the first.)
+    pub(crate) fn picked_in(&self) {
+        let Some((at, backs, pass)) = self.deferred().picked.take() else {
+            return;
+        };
+        let found = pass.found();
+        let mut deferred = self.deferred();
+        let mut steps = Vec::with_capacity(found.len());
+        for (shadow, address, len) in found {
+            let len = shadow.asked(address, len, crate::shadow::ASKED_BY_PICKED);
+            deferred.reads_read_back_of(backs, address as usize, len as usize);
+            steps.push(Step::Refresh(shadow, address as usize, len as usize));
+        }
+        let at = at.min(deferred.copies.len());
+        deferred.copies.splice(at..at, steps);
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -7782,6 +7913,14 @@ impl HostList {
         let mut deferred = self.deferred();
         if !deferred.quarantined {
             deferred.quarantined = true;
+            // (The steps a pass's refreshes go behind are fewer by the ones
+            // taken out before them: `defer_picked`.)
+            let before = deferred.picked.as_ref().map_or(0, |picked| {
+                deferred.copies.iter().take(picked.0).filter(|step| matches!(step, Step::GpuWrite(..))).count()
+            });
+            if let Some(picked) = &mut deferred.picked {
+                picked.0 -= before;
+            }
             deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
         }
     }
@@ -7792,6 +7931,56 @@ impl HostList {
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+        // (A step recorded from here on is looked at for reading what this
+        // writes, `Deferred::reads_read_back`: asked anew.)
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// See the field: it moves when the recording must ask anew for what it
+    /// asked before.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// The host copy of title texture `resource` (by address) and the state
+    /// this list leaves it in so far, if the list names it.
+    pub(crate) fn state_of(&self, resource: crate::object::This) -> Option<(usize, u32)> {
+        let copy = std::sync::Arc::as_ptr(&crate::resource::host_copy(resource)?) as usize;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.get(&copy).map(|entry| (copy, entry.1))
+    }
+
+    /// Whether this list leaves the host texture `copy` (by address, as
+    /// [`HostList::state_of`] gives it) in `state` so far: a move to that
+    /// state would record nothing ([`HostList::transition`]).
+    pub(crate) fn state_is(&self, copy: usize, state: u32) -> bool {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.get(&copy).is_some_and(|entry| entry.1 == state)
+    }
+
+    /// Diagnostics: what the recording holds, as counts (its steps but the
+    /// declared shader writes, the uploads asked for, the textures and
+    /// ranges noted, the objects kept, the textures named and the sum of the
+    /// states they are left in): for the check that a view the list is said
+    /// to have made ready is one that making ready again changes nothing for
+    /// (`crate::draw::Seen`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn recorded(&self) -> [u64; 8] {
+        let (states, ends) = {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            (states.len() as u64, states.values().map(|entry| u64::from(entry.1)).sum())
+        };
+        let d = self.deferred();
+        [
+            d.copies.iter().filter(|step| !matches!(step, Step::GpuWrite(..))).count() as u64,
+            (d.texture_uploads.len() + d.card_checks.len() + d.card_writes.len()) as u64,
+            d.textures.len() as u64,
+            d.refreshed.len() as u64,
+            (d.kept.len() + d.back_wanted.len() + d.texture_aliases.len()) as u64,
+            states,
+            ends,
+            self.twins.lock().unwrap_or_else(|e| e.into_inner()).len() as u64,
+        ]
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -8210,6 +8399,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         deferred.refreshed.clear();
         // As after a copy ([`HostList::defer_copy`]).
         deferred.textures.clear();
@@ -9080,14 +9270,20 @@ impl Meter {
             }
         }
         {
-            let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            let [texture_us, slots, waited_us, beside_us] =
+                [0, 1, 2, 3].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is what the recording thread that \
+                 starts it spends): {:.1} ms in its pass over textures picked by index; {:.0} buffer slots looked at by its pass \
+                 over buffer views, {:.1} ms on that pass's own thread, {:.1} ms submissions waited for it",
                 texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
+                slots as f64 / frames,
+                beside_us as f64 / 1e3 / frames,
+                waited_us as f64 / 1e3 / frames
             );
         }
         crate::shadow::exact_line(frames);
+        crate::draw::seen_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);

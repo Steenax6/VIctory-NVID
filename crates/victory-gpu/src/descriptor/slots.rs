@@ -146,11 +146,20 @@ pub(crate) const STRIPES: usize = 1024;
 /// while holding it shared.
 pub(crate) struct SlotLocks {
     gate: RwLock<()>,
-    stripes: Box<[Mutex<()>]>,
+    stripes: Box<[Stripe]>,
     /// `false` (`VICTORY_DESCRIPTOR_STRIPES=0`): every lock is the gate,
     /// exclusive: one lock for the heap, as before.
     striped: bool,
 }
+
+/// A stripe's lock, on a cache line of its own. A lock is a few bytes, and
+/// eight of them shared a line: the slots a draw makes are handed out one
+/// after the other, so the threads that record took neighbouring stripes
+/// and passed that line between them at every slot (8.7 ms a frame of the
+/// recording threads in `Striped::with`'s lock with nobody waiting for it,
+/// the profile of the evening of 2026-11-26).
+#[repr(align(64))]
+struct Stripe(Mutex<()>);
 
 /// A held lock of a single slot.
 pub(crate) enum SlotGuard<'a> {
@@ -180,7 +189,7 @@ impl SlotLocks {
     pub(crate) fn new(striped: bool) -> Self {
         SlotLocks {
             gate: RwLock::new(()),
-            stripes: (0..STRIPES).map(|_| Mutex::new(())).collect(),
+            stripes: (0..STRIPES).map(|_| Stripe(Mutex::new(()))).collect(),
             striped,
         }
     }
@@ -191,7 +200,7 @@ impl SlotLocks {
             return self.all();
         }
         let gate = self.gate.read().unwrap_or_else(|e| e.into_inner());
-        let stripe = self.stripes[slot as usize % STRIPES].lock().unwrap_or_else(|e| e.into_inner());
+        let stripe = self.stripes[slot as usize % STRIPES].0.lock().unwrap_or_else(|e| e.into_inner());
         SlotGuard::Shared(gate, stripe)
     }
 
@@ -220,7 +229,7 @@ impl SlotLocks {
         let mut last = None;
         for (at, &s) in held.iter().enumerate() {
             if last != Some(s) {
-                guard._stripes[at] = Some(self.stripes[s as usize].lock().unwrap_or_else(|e| e.into_inner()));
+                guard._stripes[at] = Some(self.stripes[s as usize].0.lock().unwrap_or_else(|e| e.into_inner()));
                 last = Some(s);
             }
         }
@@ -232,7 +241,7 @@ impl SlotLocks {
 /// [`SlotLocks`] of the heap): slot `i` by lock `i % STRIPES`.
 pub(crate) struct Striped<T> {
     cells: Box<[std::cell::UnsafeCell<T>]>,
-    locks: Box<[Mutex<()>]>,
+    locks: Box<[Stripe]>,
 }
 
 // SAFETY: every access to a cell goes through `with`, under the lock of its
@@ -243,7 +252,7 @@ impl<T> Striped<T> {
     pub(crate) fn new(n: usize, mut value: impl FnMut() -> T) -> Self {
         Striped {
             cells: (0..n).map(|_| std::cell::UnsafeCell::new(value())).collect(),
-            locks: (0..STRIPES).map(|_| Mutex::new(())).collect(),
+            locks: (0..STRIPES).map(|_| Stripe(Mutex::new(()))).collect(),
         }
     }
 
@@ -251,7 +260,7 @@ impl<T> Striped<T> {
     /// end. `f` must not reach this `Striped` again.
     pub(crate) fn with<R>(&self, slot: u32, f: impl FnOnce(&mut T) -> R) -> Option<R> {
         let cell = self.cells.get(slot as usize)?;
-        let _held = self.locks[slot as usize % STRIPES].lock().unwrap_or_else(|e| e.into_inner());
+        let _held = self.locks[slot as usize % STRIPES].0.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the stripe's lock is held, and only `with` reaches cells.
         Some(f(unsafe { &mut *cell.get() }))
     }
