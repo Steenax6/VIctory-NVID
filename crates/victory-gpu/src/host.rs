@@ -6266,6 +6266,10 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        // Descriptors the title copied into placed heaps directly, before
+        // command lists that index those slots are submitted.
+        crate::timeline::ev("sub.", 2, runs.len() as u64);
+        crate::descriptor::sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6283,18 +6287,9 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
-        // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted: on a thread
-        // of its own beside what follows, joined before the lists go
-        // (`crate::descriptor::beside`; it started before the sweep, now
-        // after it).
-        crate::timeline::ev("sub.", 2, runs.len() as u64);
-        let heap_sync = crate::descriptor::beside::begin();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
-        // The sync's askings come before the submission's own.
-        heap_sync.asked();
         crate::timeline::ev("sub.", 3, runs.len() as u64);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -6383,14 +6378,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
-        // The heap sync is done before the lists go; the slots it left
-        // waiting for a texture made since are made now. (The wait is left
-        // out of "preparing", as the sync was: the sync's line has it.)
         crate::timeline::ev("sub.", 6, runs.len() as u64);
-        let joining = std::time::Instant::now();
-        heap_sync.join();
-        settled += joining.elapsed();
-        crate::descriptor::make_waiting();
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.

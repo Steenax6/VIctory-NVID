@@ -11,8 +11,6 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
-pub(crate) mod beside;
-#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 pub(crate) mod slots;
@@ -188,26 +186,9 @@ fn mirror(handle: u64) {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    sync_heaps_then(|| {});
-}
-
-/// Whether [`sync_heaps`] is done at all (`VICTORY_HEAP_SYNC=0`: not).
-#[cfg(windows)]
-fn heap_sync_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0"))
-}
-
-/// [`sync_heaps`], calling `asked` once every heap's written pages have
-/// been asked for (the write watch, the guards) and before any record is
-/// read: what [`beside`] lets the submitting thread go on at. (Without
-/// [`sync_fast`] the pages are asked for heap by heap as they are read,
-/// and `asked` comes at the end.)
-#[cfg(windows)]
-fn sync_heaps_then(asked: impl FnOnce()) {
     use std::sync::atomic::Ordering::Relaxed;
-    if !heap_sync_on() {
-        asked();
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
     let started = std::time::Instant::now();
@@ -220,27 +201,7 @@ fn sync_heaps_then(asked: impl FnOnce()) {
     let mut shapes = sync_fast().then(|| SHAPES_SEEN.lock().unwrap_or_else(|e| e.into_inner()));
     let mut picked: Vec<u32> = Vec::new();
     let mut scratch = host::PickScratch::default();
-    // With the fast pass: every heap's pages asked for first, in the order
-    // of the heaps, then each heap's records read and mirrored. The askings
-    // are those the pass made before, one a heap, in the same order; only
-    // the reading moved behind the last of them.
-    let mut asked = Some(asked);
-    let mut answers: Vec<Option<Vec<(usize, crate::watch::Written)>>> = Vec::new();
-    if shapes.is_some() {
-        answers = heaps
-            .iter()
-            .map(|&(start, end, at)| {
-                // SAFETY: registered heaps are live (removed when dropped).
-                let heap = unsafe { &*(at as *const Heap) };
-                let mirrors = matches!(heap.host.get(), Some(Some(_))) && heap.written.is_some() && increment(heap.desc.kind).is_some();
-                mirrors.then(|| Pass::ask(start, end)).flatten()
-            })
-            .collect();
-        if let Some(asked) = asked.take() {
-            asked();
-        }
-    }
-    for (k, &(start, end, at)) in heaps.iter().enumerate() {
+    for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
         let (Some(Some(host)), Some(written), Some(step)) =
@@ -253,9 +214,6 @@ fn sync_heaps_then(asked: impl FnOnce()) {
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
         if let Some(shapes) = shapes.as_mut() {
-            let Some(answer) = answers.get_mut(k).and_then(Option::take) else {
-                continue;
-            };
             let mut pass = Pass {
                 heap,
                 host,
@@ -268,7 +226,7 @@ fn sync_heaps_then(asked: impl FnOnce()) {
                 scratch: &mut scratch,
                 shapes,
             };
-            let [p, l, m, q, k] = pass.run(answer);
+            let [p, l, m, q, k] = pass.run();
             (pages, looked, mirrored, quick) = (pages + p, looked + l, mirrored + m, quick + q);
             kernel_pages += k;
             continue;
@@ -309,9 +267,6 @@ fn sync_heaps_then(asked: impl FnOnce()) {
     }
     drop(shapes);
     drop(heaps);
-    if let Some(asked) = asked.take() {
-        asked();
-    }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64, quick, kernel_pages]) {
         count.fetch_add(n, Relaxed);
     }
@@ -354,22 +309,17 @@ struct Pass<'a> {
 
 #[cfg(windows)]
 impl Pass<'_> {
-    /// The heap `[start, end)`'s pages as the journal has them after this
-    /// asking (the write watch's, or the guards'), for [`Pass::run`]; `None`
-    /// where neither can say.
-    fn ask(start: u64, end: u64) -> Option<Vec<(usize, crate::watch::Written)>> {
-        crate::watch::writes_fine(start as usize, end as usize, true).map(|(_, written)| written)
-    }
-
-    /// With `written`, the heap's pages from [`Pass::ask`]: returns the
-    /// 64 KiB pages with host slots taken, the slots looked at, the new
-    /// records mirrored, those done in runs, and the 4 KiB pages read.
-    fn run(&mut self, written: Vec<(usize, crate::watch::Written)>) -> [u64; 5] {
+    /// Returns the 64 KiB pages with host slots taken, the slots looked
+    /// at, the new records mirrored, those done in runs, and the 4 KiB
+    /// pages read.
+    fn run(&mut self) -> [u64; 5] {
         use crate::watch::PAGE;
         const KERNEL: usize = 4096;
         let mut out = [0u64; 5];
-        let (start, step) = (self.start as usize, self.step as usize);
-        let end = self.end as usize;
+        let (start, end, step) = (self.start as usize, self.end as usize, self.step as usize);
+        let Some((_, written)) = crate::watch::writes_fine(start, end, true) else {
+            return out;
+        };
         // Where the slots with host counterparts end.
         let mirrored_end = start.saturating_add(self.mirrored_count as usize * step).min(end);
         let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -480,15 +430,6 @@ pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros, quick, kernel_pages] =
         [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let picked = [0, 1, 2, 3, 4, 5].map(|i| host::PICKED[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
-    let [asked_us, joined_us, beside] = [0, 1, 2].map(|i| beside::WAITED[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
-    if beside > 0.0 {
-        tracing::info!(
-            "the heap sync beside the refreshes per frame (VICTORY_HEAP_SYNC_BESIDE=0: before them, on the submitting thread): \
-             {beside:.1} syncs; the submitting thread waited {:.2} ms for their askings and {:.2} ms at their joins",
-            asked_us / 1000.0,
-            joined_us / 1000.0
-        );
-    }
     if pages == 0 {
         return;
     }
