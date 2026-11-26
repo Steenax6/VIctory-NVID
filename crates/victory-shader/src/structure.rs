@@ -46,8 +46,8 @@ pub enum Atom {
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
     /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// read, by its low and its high dword (in wave32 the low one twice).
+    Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -827,8 +827,8 @@ impl<'a> Lanes<'a> {
         // Exports go by low dword. A low dword read with two high dwords
         // (one rewritten alone) names no one mask: it is left out, so
         // lowering refuses what reads it instead of taking the other
-        // pair's lanes 32-63. Not where the low dword holds a number: see
-        // the shortcut in `mask`.
+        // pair's lanes 32-63. A mask held as a number is read by both its
+        // dwords anyway (`Atom::Opaque`, a select's own pair).
         let (mut high, mut split) = (Map::default(), HashSet::new());
         let keys = self.masks.keys().chain(self.other.keys());
         for &(lo, hi) in keys.chain(&self.seen) {
@@ -917,15 +917,13 @@ impl<'a> Lanes<'a> {
                     })
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
-                // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
+                // The atom names both dwords of the pair read: halves written
+                // apart (a pair copied whole after its high dword was
+                // rewritten alone) give lanes 32-63 the high dword the pair
+                // holds, not the one written beside the low dword.
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let born = self.born(k.0).max(self.born(k.1));
+                    self.b.atom(Atom::Opaque(k.0, k.1), born)
                 });
                 (m, derived)
             }
@@ -1660,6 +1658,29 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    /// A wave64 pair copied whole after its high dword was rewritten alone, then moved into
+    /// EXEC: the guard's opaque mask names the pair as it is, the rewritten high dword with
+    /// the copied low one, not the high dword written beside the low one (Marvisak/VIctory
+    /// pull request #2816).
+    #[test]
+    fn an_opaque_mask_names_both_dwords_of_the_pair_read() {
+        let p = build(
+            &[
+                0xBE82_0400, // s_mov_b64 s[2:3], s[0:1]
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let (lo, hi) = (insts[0].write(Reg::S(2)).unwrap(), insts[1].write(Reg::S(3)).unwrap());
+        let guard = s.guards[0][3].expect("the move is guarded");
+        assert_eq!(s.bools.support(guard), vec![Atom::Opaque(lo, hi)]);
     }
 
     #[test]
