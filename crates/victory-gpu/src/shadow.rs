@@ -4398,7 +4398,7 @@ fn buffers_changed() {
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let mut map = buffers();
-    map.insert(
+    let old = map.insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -4406,13 +4406,19 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         },
     );
     buffers_changed();
+    drop(map);
+    crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     let mut map = buffers();
-    map.remove(&(start, resource));
+    let old = map.remove(&(start, resource));
     buffers_changed();
+    drop(map);
+    if let Some(old) = old {
+        crate::memory::ownership_changed(start, old.end - start);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4454,6 +4460,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         buffers_changed();
     }
     let n = gone.len() as u64;
+    if n != 0 {
+        crate::memory::ownership_changed(at, len);
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
