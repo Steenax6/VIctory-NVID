@@ -1697,12 +1697,23 @@ fn plan_protect_run(g: &mut Guards, from: usize, to: usize, later: &mut Deferred
 /// know but do not hold guarded ([`unlocked_guards`]): if the block is
 /// read-only (a check made it so after something opened it), makes it
 /// writable and notes it written; true if that was done.
+///
+/// Known to the guards, or lying in a view the runtime told of
+/// (`crate::inplace::view_at`). A check notes its blocks guarded, lets
+/// the lock go and then changes their protection; a mapping of the
+/// runtime's that takes the lock in between drops all the guards knew of
+/// the blocks, and the check's call then makes the new view read-only
+/// with nothing left to say it was ours. The title's first write there
+/// faulted, found no guard, and went on as an access violation of the
+/// title's. The runtime maps the title's views read-write and nothing but
+/// a guard makes one read-only, so a read-only block of such a view is a
+/// guard's.
 fn reopen_stray(g: &mut Guards, at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
     };
     let block = at / BLOCK;
-    if g.protected.contains(&block) || !g.views.contains(&block) {
+    if g.protected.contains(&block) || !(g.views.contains(&block) || crate::inplace::view_at(at).is_some()) {
         return false;
     }
     // SAFETY: plain data filled in by the query.
@@ -3627,6 +3638,38 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, BLOCK);
+    }
+
+    /// The same when a mapping dropped all the guards knew of the block
+    /// between a check's note and its late call: the block lies in a view
+    /// the runtime told of, read-only by that call alone, and the title's
+    /// write there is opened and reported, not left to fault unanswered.
+    #[test]
+    fn a_block_armed_after_it_was_mapped_anew_is_opened_by_its_fault() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        if !unlocked_guards() {
+            return;
+        }
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let block = (one + BLOCK) / BLOCK;
+        // (A check of the other view: the handler is there.)
+        assert!(guard(two, two + SIZE, None).is_some());
+        // Mapped anew, as the runtime tells it: nothing is known of it.
+        title_memory_remapped(one, SIZE);
+        crate::inplace::title_memory_view(one, SIZE, section, 0);
+        assert!(!guards().views.contains(&block));
+        // The check's late call.
+        let mut old = 0;
+        // SAFETY: a block of our own view; only its protection changes.
+        assert_ne!(unsafe { VirtualProtect((one + BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) }, 0);
+        // SAFETY: inside the view, read-only now: the write faults.
+        unsafe { ((one + BLOCK + 100) as *mut u8).write_volatile(9) };
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((one + BLOCK + 100) as *const u8).read_volatile() }, 9);
+        let written = guard(one, one + SIZE, None).expect("view memory");
+        assert!(written.contains(&block), "reported written");
+        drop_views(section, &[one, two], SIZE);
     }
 
     #[test]
