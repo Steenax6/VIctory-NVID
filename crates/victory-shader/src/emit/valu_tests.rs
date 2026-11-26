@@ -2237,3 +2237,16 @@ fn normalized_codes_truncate_back_to_themselves() {
         });
     }
 }
+
+/// `s_pack_{ll,lh,hh}_b32_b16 s6, s0, s1`: src0's chosen half in bits 0-15,
+/// src1's in bits 16-31.
+#[test]
+fn scalar_packs_take_the_named_halves() {
+    let inputs = [0xAAAA_1111, 0xBBBB_2222, 0, 0];
+    for (op, want) in [(0x32u8, 0x2222_1111u32), (0x33, 0xBBBB_1111), (0x34, 0xBBBB_AAAA)] {
+        let shader = build_valu_cs(&[sop2(op, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: s_pack opcode {op:#x} = {got:#010x}, want {want:#010x}");
+        });
+    }
+}
