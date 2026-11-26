@@ -430,8 +430,12 @@ pub(crate) fn removal_context() -> String {
         (_, 0) => " (nothing of ours was running on the card)".to_owned(),
         (_, n) => format!(" ({n} submissions sent ahead had not landed: their lists were on the card or waiting for it)"),
     };
+    // A pass of the title's that is recorded and not run (its host
+    // pipeline is not made yet, or it is one the layer drops) leaves what
+    // it would have written as it was, and the passes that read it run.
+    let (dropped, drawn) = crate::draw::dropped_now();
     format!(
-        "the submitting thread was {doing}{card}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {started} finished {finished}",
+        "the submitting thread was {doing}{card}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {started} finished {finished}; since the last frame line {dropped} draws and dispatches were recorded and not run for want of a host pipeline ({drawn} draws run so far)",
         SUBMITTING[1].load(Ordering::Relaxed),
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
         crate::pipeline::library_removal_note(),
@@ -666,6 +670,99 @@ fn found_removed(e: &windows::core::Error) {
     }
 }
 
+/// Whether a failure text that names the lists of the submissions on the
+/// card has been said: 0 no, 1 it is being made (by the thread
+/// [`LISTS_BY`], in [`Host::removal_data`]), 2 said.
+static LISTS_SAID: Mutex<u8> = Mutex::new(0);
+static LISTS_DONE: std::sync::Condvar = std::sync::Condvar::new();
+static LISTS_BY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Before a failure with the device removed ends the run ([`fail`], its
+/// own text said): the thread whose text names the lists that were on the
+/// card says so, and any other waits for that text, three seconds at most,
+/// while submissions sent ahead have not landed.
+///
+/// Only the thread that lands submissions has their lists, and with them
+/// the device-removed data says which list stood at which command, what
+/// that command's marker says and which pipelines the list binds. Run
+/// s_we_x5c_full_2 had asked for all of that and got none of it: the
+/// submitting thread could not make a list, said so and ended the run
+/// while the landing thread had not come to its report yet.
+fn lists_said() {
+    let mut said = LISTS_SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if *said == 1 && LISTS_BY.load(Ordering::Relaxed) == thread_id() {
+        *said = 2;
+        LISTS_DONE.notify_all();
+        return;
+    }
+    let ahead = STARTED
+        .load(Ordering::Relaxed)
+        .saturating_sub(FINISHED.load(Ordering::Relaxed))
+        .saturating_sub(u64::from(SUBMITTING[0].load(Ordering::Relaxed) == 1));
+    if *said == 2 || ahead == 0 {
+        return;
+    }
+    let _ = LISTS_DONE.wait_timeout_while(said, std::time::Duration::from_secs(3), |said| *said != 2);
+}
+
+/// For the failure text of a removed device: what the indirect records of
+/// each of `runs` asked for, as far as this side knows it. An execution
+/// the card stands in ran either a count of work no bound of ours cut, or
+/// a program that does not come to its end on what it reads; the clamp's
+/// charge tells the two apart.
+///
+/// Per list with indirect work: the records left to its prelude (how many,
+/// in how many passes, of which kinds: clamped ahead of the list from the
+/// host copies as they were then, `crate::indirect::hoists`), and the
+/// words of its budget the CPU maps (`crate::indirect::BUDGET_WORDS`: the
+/// work charged of 2^27 a list, then the clamp's notes). With the budget
+/// in the card's memory (the default) those words are what the list's
+/// last finished run left; `VICTORY_INDIRECT_CARD_BUDGET=0` keeps the
+/// budget in them, and they then say what the list had charged when the
+/// card stood.
+fn indirect_of(runs: &[&HostList]) -> String {
+    let mut text = String::new();
+    for (i, run) in runs.iter().enumerate() {
+        let hoisted: Vec<(u32, usize)> = {
+            let deferred = run.deferred();
+            deferred.hoist.runs.iter().map(|r| (r.kind, r.entries.len())).collect()
+        };
+        let words = match run.budget.get() {
+            Some(Some((_, data))) => {
+                // SAFETY: the list's own mapped words, mapped for as long
+                // as the list lives, whatever became of the device.
+                let words: [u32; crate::indirect::BUDGET_WORDS] =
+                    std::array::from_fn(|k| unsafe { (*data as *const u32).add(k).read_volatile() });
+                Some(words)
+            }
+            _ => None,
+        };
+        if hoisted.is_empty() && words.is_none() {
+            continue;
+        }
+        let records: usize = hoisted.iter().map(|h| h.1).sum();
+        let mut kinds: Vec<u32> = hoisted.iter().map(|h| h.0).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        text.push_str(&format!(
+            "; indirect work of list {i} of {}: {records} records left to its prelude in {} passes (kinds {kinds:?})",
+            runs.len(),
+            hoisted.len()
+        ));
+        if let Some(words) = words {
+            text.push_str(&format!(
+                ", budget words {words:?} ({})",
+                if card_budget() && run.card_budget.get().is_some_and(|c| c.is_some()) {
+                    "as its last finished run left them: the budget is in the card's memory, VICTORY_INDIRECT_CARD_BUDGET=0 shows it as it stood"
+                } else {
+                    "as they stood: word 0 is the work charged, of 134217728"
+                }
+            ));
+        }
+    }
+    text
+}
+
 /// Whether [`Host::removal_data`] was asked for (once is enough for
 /// [`log_removal_context`]).
 static DATA_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -845,10 +942,12 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
+    let mut removed = false;
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            removed = true;
             log_removal_context();
         }
         match host.log_messages() {
@@ -863,6 +962,10 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     // Tests have no log: the reason goes to their output.
     #[cfg(test)]
     eprintln!("host GPU failure: {text}");
+    // The text that names the lists on the card, if another thread's.
+    if removed {
+        lists_said();
+    }
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -6869,7 +6972,18 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
-        self.removal_data_of(runs, true)
+        // This thread has the lists that were on the card: its failure
+        // text is the one that names them ([`lists_said`]).
+        {
+            let mut said = LISTS_SAID.lock().unwrap_or_else(|e| e.into_inner());
+            if *said == 0 {
+                *said = 1;
+                LISTS_BY.store(thread_id(), Ordering::Relaxed);
+            }
+        }
+        let mut text = self.removal_data_of(runs, true);
+        text.push_str(&indirect_of(runs));
+        text
     }
 
     /// [`Host::removal_data`]; `tables`: whether a faulting address is also
