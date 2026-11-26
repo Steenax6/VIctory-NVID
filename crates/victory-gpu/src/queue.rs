@@ -1102,6 +1102,14 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    // With the Series X profile the title presents one plane with its
+    // interface in it; a second plane (the interface apart, as with the
+    // Series S profile: fxceless/victory-fork pull request #1081) is not
+    // shown, and said once.
+    if planes > 1 {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!(planes, "the title presents more than one plane: only the first is shown"));
+    }
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.

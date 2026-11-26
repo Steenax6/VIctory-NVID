@@ -168,6 +168,53 @@ Ryzen 7 9800X3D (16 threads) with an RTX 4070 Ti, 14 cut the intro's time
 below 1 fps on an empty cache from 55 s to 6-12 s; 16 was no better than the
 default.
 
+## Textures the game reads back
+
+`VICTORY_TEXTURE_BACK` (on by default): textures the game's shaders write
+and its own code then reads on the processor are copied back into the
+game's memory once the list that wrote them has run, in the console's
+layout. The water's wave passes write such maps (256x256 R32_FLOAT and
+R32G32_FLOAT, 64x64 R32G32_FLOAT, 128x128 R16G16_UINT), and boats float
+on what the processor reads there; without the copy they sat in a pit in
+the water and the first boat mission failed (on an RTX 4070 Ti 12 GB in
+another fork, RyanCase94/victory-Rycas; Geckomacabre/vx-layer `eee5667d7`,
+fxceless/victory-fork pull requests #999 and #1152). Only the levels and
+layers the shaders' views expose are copied; a list that writes none of
+these textures costs nothing. The value is the list of kinds,
+`<width>x<height>f<format number>`: unset or `1` is the built-in
+`256x256f41,256x256f16,64x64f16,128x128f36`, `0` none, a list of its own
+replaces it, and entries with `+` or `-` add to or take from it
+(`+512x512f41,-64x64f16`). The log line "textures shaders wrote, copied back
+into title memory per frame" counts them; a texture in a pipe/bank XOR
+swizzle mode is counted as passed over until `victory-formats` has the
+address patterns of those modes (the log says "could not be tiled
+e=Unsupported" once).
+
+## When the card's memory is full
+
+`VICTORY_TEXTURE_SPILL` (on by default; `=0`: as on 2026-11-25): once the
+card has no room for more of the game's textures, their host copies are made
+whole in the PC's memory that the system lets the card read over the bus,
+instead of waiting for room. As memory fills, a texture is made whole on the
+card, then whole in the PC's memory, and only once that has no room either
+without its most detailed levels (`VICTORY_TEXTURE_DROP_LEVELS` above, which
+with the spill waits for that point). A texture in the PC's memory is read
+more slowly, but it is there and whole (fxceless/victory-fork pull request
+#601, NitricAcidDev/VIctory-Omega-Fork `4237574084`).
+`VICTORY_TEXTURE_SPILL_PERCENT` (50; 10 to 90) is the share of the system's
+budget for that memory the textures may fill; 4 GB of the PC's memory are
+always left free. The log line "host copies of textures in the PC's memory"
+counts them and their bytes. Not yet measured in a run here: compare the
+frame rate and the memory line with `=0`.
+
+`VICTORY_WAIT_RESIDENT` (on by default; `=0`: as before): new heaps for
+textures and committed host textures are made resident, and waited for,
+before anything names them. Lists already on the card read the descriptor
+heaps as they are, and a slot showing a texture in memory the system had
+not mapped yet was a page fault for them (avatarmanz/VIctory-7900XTX
+`0322b39ab`, a device loss about every 15 minutes there). The log line "new
+texture memory made resident" says how often and how long it waited.
+
 ## Shader warm-up (optional)
 
 A build that changes the shader translator starts with an empty shader
@@ -198,6 +245,7 @@ these are an NVIDIA card's.
 | `VICTORY_BACK_RUN_GAP=0` | every run of a copy-back is a write of its own; by default runs under 64 bytes apart are one write (upstream pull request #857) |
 | `VICTORY_WAVE_PAIRS=0` | no paired form for 64-lane programs on 32-lane cards (upstream pull request #854) |
 | `VICTORY_MESH_LINK=0` | mesh programs over 32 KiB are not linked with their pixel program (upstream pull request #854) |
+| `VICTORY_TEXTURE_FILL_LEVELS=0` | a streaming texture's levels that are still all zeros stay zeros; by default they show the nearest smaller level that is there until their pages come (AntoninMichelq/VIctory-forkAMD `440e19e5ee`: zeros drew a wire net over clothes) |
 | `VICTORY_GPU_TIMING=1` + `VICTORY_D3D12_DRED=1` | the card's time per command and per pass of ours (diagnostics build; submissions are waited for, so not for frame rate); `VICTORY_TIMING_LINES=<n>` lists that many commands |
 | `VICTORY_WINDOW_MAX=1920x1080` | largest size of the game window; unset, it is fitted to the screen's work area. The game's render targets keep their size |
 
