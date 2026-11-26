@@ -4179,8 +4179,7 @@ mod late_tests {
 /// zeros for what cannot be read, as a single copy does), where before
 /// only the copy that held it did.
 fn join_copies() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    crate::switch::toggled!("VICTORY_JOIN_COPIES")
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, those
