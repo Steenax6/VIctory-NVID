@@ -378,6 +378,12 @@ static LANDED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// under them, not tiled, and textures not copied back for want of an
 /// address pattern.
 static TOTALS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`TOTALS`], for the tests: landed, dropped, not tiled.
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn totals() -> [u64; 3] {
+    [0, 1, 2].map(|i| TOTALS[i].load(Ordering::Relaxed))
+}
 static UNADDRESSABLE: AtomicU64 = AtomicU64::new(0);
 
 /// Once the list has run: its texels into the same title allocation.
@@ -397,6 +403,7 @@ pub(crate) fn land(back: &Back) {
         TOTALS[1].fetch_add(1, Ordering::Relaxed);
         return;
     }
+    let before = tiled.clone();
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
@@ -439,10 +446,41 @@ pub(crate) fn land(back: &Back) {
         TOTALS[2].fetch_add(1, Ordering::Relaxed);
         return;
     }
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    // Only the bytes the texels changed go to title memory: the rest of the
+    // span (padding, the tail, a texture placed inside it) may have been
+    // written by the title since it was read here.
+    let mut written = 0;
+    for (from, to) in changed_runs(&before, &tiled) {
+        crate::host::copy_mapped(at.wrapping_add(from) as *mut u8, tiled[from..].as_ptr(), to - from, true);
+        written += to - from;
+    }
     LANDED[0].fetch_add(1, Ordering::Relaxed);
-    LANDED[1].fetch_add(size as u64, Ordering::Relaxed);
+    LANDED[1].fetch_add(written as u64, Ordering::Relaxed);
     TOTALS[0].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Where `after` differs from `before` (as long): runs `[from, to)`, those
+/// less than 64 bytes apart joined.
+fn changed_runs(before: &[u8], after: &[u8]) -> Vec<(usize, usize)> {
+    const GAP: usize = 64;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    let n = before.len().min(after.len());
+    while i < n {
+        if before[i] == after[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && before[i] != after[i] {
+            i += 1;
+        }
+        match runs.last_mut() {
+            Some(last) if start - last.1 < GAP => last.1 = i,
+            _ => runs.push((start, i)),
+        }
+    }
+    runs
 }
 
 /// The line on the copies back since the last one, per frame of `frames`;
@@ -503,6 +541,21 @@ mod tests {
         let (kinds, bad) = parse(Some("-64x64f16,128x128f36,+bogus"));
         assert_eq!(kinds, vec![(256, 256, 41), (256, 256, 16), (128, 128, 36)]);
         assert_eq!(bad, vec!["128x128f36".to_owned(), "+bogus".to_owned()]);
+    }
+
+    #[test]
+    fn only_changed_bytes_are_written_back() {
+        let before = [0u8; 300];
+        let mut after = before;
+        assert_eq!(changed_runs(&before, &after), []);
+        after[10] = 1;
+        after[20] = 1;
+        after[200..210].fill(2);
+        assert_eq!(changed_runs(&before, &after), [(10, 21), (200, 210)]);
+        after[299] = 3;
+        assert_eq!(changed_runs(&before, &after), [(10, 21), (200, 210), (299, 300)]);
+        after[250] = 4;
+        assert_eq!(changed_runs(&before, &after), [(10, 21), (200, 300)]);
     }
 
     #[test]

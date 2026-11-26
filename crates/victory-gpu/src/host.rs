@@ -3921,6 +3921,33 @@ mod late_tests {
         assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
     }
 
+    /// A copy into title memory that is no longer there writes nothing and
+    /// does not fault (the read-backs' landing goes through it).
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_into_memory_that_went_writes_nothing() {
+        use windows_sys::Win32::System::Memory::*;
+        // SAFETY: a private allocation of ours, released at once.
+        let gone = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null());
+            assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
+            p.cast::<u8>()
+        };
+        let bytes = [0xa5u8; 0x100];
+        super::copy_mapped(gone, bytes.as_ptr(), bytes.len(), true);
+        // Half there: what is there is written, the rest left alone.
+        // SAFETY: as above; the first page stays committed.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!p.is_null());
+            assert!(!VirtualAlloc(p.cast(), 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let big = [0x5au8; 0x1800];
+            super::copy_mapped(p, big.as_ptr(), big.len(), true);
+            assert_ne!(VirtualFree(p.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     /// A read-back's span runs from its first row to the end of its last;
     /// one of nothing, or past the end of the address space, has none.
     #[test]
@@ -4089,7 +4116,11 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    let deferred = list.deferred();
+    // While they land the runtime maps nothing: a page found there by the
+    // copy stays there (`crate::watch::title_memory_reading`).
+    let _mapping = (!deferred.backs.is_empty()).then(crate::watch::title_memory_reading);
+    for (buffer, at, [row, rows, pitch]) in &deferred.backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run. Each row goes to title memory as a copy-back does
@@ -6807,11 +6838,31 @@ impl HostList {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
         for target in wanted {
-            self.settle(&target.copy, COPY_SOURCE);
+            // The state the list leaves the texture in is put back after
+            // the copy: a later list whose shaders reach it by index without
+            // naming it finds it as the title left it, not in the copy's
+            // state (fxceless/victory-fork pull request #1170). A read state
+            // with the copy's in it needs no barrier at all.
+            let before = self.end_state(&target.copy);
+            let needs = before.is_none_or(|s| s & COPY_SOURCE == 0);
+            if needs {
+                self.settle(&target.copy, COPY_SOURCE);
+            }
+            let copy = target.copy.clone();
             if let Some(back) = crate::texback::record(&self.list, target) {
                 self.deferred().texture_backs.push(back);
             }
+            if needs && let Some(before) = before {
+                self.settle(&copy, before);
+            }
         }
+    }
+
+    /// The state this list leaves host texture `copy` in so far, if it
+    /// names it.
+    pub(crate) fn end_state(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) -> Option<u32> {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.get(&(std::sync::Arc::as_ptr(copy) as usize)).map(|entry| entry.1)
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
