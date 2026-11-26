@@ -714,8 +714,17 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
-    #[cfg(windows)]
-    crate::timeline::ev("close", this as u64, 0);
+    // With what the recording holds: draws, indexed draws, indirect
+    // executions and dispatches, sixteen bits each.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        let counts = unsafe { &(*this.cast::<List>()).tally.counts };
+        let held = [KIND_DRAW, KIND_INDEXED, KIND_INDIRECT, KIND_DISPATCH].iter().enumerate().fold(0u64, |all, (at, &kind)| {
+            all | u64::from(counts[kind].load(std::sync::atomic::Ordering::Relaxed).min(0xffff)) << (16 * at)
+        });
+        crate::timeline::ev("close", this as u64, held);
+    }
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();

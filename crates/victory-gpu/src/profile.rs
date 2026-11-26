@@ -317,6 +317,9 @@ struct Config {
     /// Microseconds a tick is put off by at most, a different time each
     /// tick ([`Pace::wait`]).
     jitter: u64,
+    /// The stacks written to the stacks file: those with this share of
+    /// their role's time or more; the rest go to one line per role.
+    fold_least: f64,
 }
 
 fn env_number(name: &str) -> Option<f64> {
@@ -340,6 +343,7 @@ impl Config {
             reuse: true,
             budget: 0.03,
             jitter: 250,
+            fold_least: 0.00005,
         }
     }
 
@@ -370,6 +374,9 @@ impl Config {
         config.budget = env_number("VICTORY_PROFILE_BUDGET")
             .map_or(config.budget, |v| v.clamp(0.0, 100.0) / 100.0);
         config.jitter = count("VICTORY_PROFILE_JITTER_US", 250, 2000) as u64;
+        // In percent, as the stacks file names it; 0 writes every stack.
+        config.fold_least = env_number("VICTORY_PROFILE_FOLD_LEAST")
+            .map_or(config.fold_least, |v| v.clamp(0.0, 100.0) / 100.0);
         if let Ok(list) = std::env::var("VICTORY_PROFILE_THREADS") {
             let named: Vec<&str> = list.split(',').map(str::trim).collect();
             for role in Role::ALL {
@@ -2187,10 +2194,6 @@ struct RoleSummary {
     waits: Vec<(String, String, u64)>,
 }
 
-/// The stacks written to the stacks file: those with this share of their
-/// role's time or more; the rest go to one line per role.
-const FOLD_LEAST: f64 = 0.00005;
-
 impl Sampler {
     fn report(&mut self) -> Report {
         let began = Instant::now();
@@ -2664,7 +2667,7 @@ impl Sampler {
                         .join(" > "),
                 );
             }
-            let least = (FOLD_LEAST * r.wall as f64) as u64;
+            let least = (self.config.fold_least * r.wall as f64) as u64;
             let mut rest = 0;
             for &(stack, us) in &stacks {
                 if us >= least {
@@ -2678,7 +2681,7 @@ impl Sampler {
                     folded,
                     "{};[stacks_under_{:.3}_%_each] {rest}",
                     role.name(),
-                    100.0 * FOLD_LEAST
+                    100.0 * self.config.fold_least
                 );
             }
             summaries.push(RoleSummary {

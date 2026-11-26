@@ -1737,6 +1737,7 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        let _span = crate::timeline::span("pass>", "pass<", 0, 0);
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
@@ -1990,7 +1991,10 @@ impl State {
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
-        self.heap_textures(list, heap, host);
+        {
+            let _span = crate::timeline::span("early>", "early<", u64::from(bake), 0);
+            self.heap_textures(list, heap, host);
+        }
         PASS_BUDGET.set(None);
         if bake && n.is_power_of_two() {
             bake_writes_line(frame);
