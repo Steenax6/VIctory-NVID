@@ -2426,8 +2426,9 @@ impl State {
                 Some(picked) => {
                     let (start, size) = picked.memory;
                     own = Some(picked.own);
-                    // A tell of written or mapped memory is for the slot
-                    // if it lies in what its view holds.
+                    // A tell of written or mapped memory that lies in
+                    // what its view holds is for the slot, whatever view
+                    // starts between.
                     host.texture_slot_holds(index, start, picked.own.min(size));
                     host.texture_slot_stamp(index, picked.stamp, picked.asked);
                     // What else the upload is, as recorded.

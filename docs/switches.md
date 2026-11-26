@@ -191,11 +191,13 @@ write are opened, so host copies of buffers and of textures read through
 tables take its bytes, and the stale slots are due at once at every pass;
 `guards`: the first alone, as it was by default while every upload brought
 a whole texture; `slots`: the second alone; `0`: neither). A write, and a
-mapping, is taken for the slots whose view holds its bytes: the first
-bytes of the texture, up to the end of the level the view starts at. The
-line "writes behind the guards" counts the writes, the slots under them,
-the stale ones, the stale ones now, and the slots that took a tell or were
-passed over by what their view holds.
+mapping, is taken for the slots the spans of the views name (a texture
+ends where the next view starts) and also for a slot whose view holds its
+bytes though another view starts between: the first bytes of the texture,
+up to the end of the level the view starts at. The line "writes behind the
+guards" counts the writes, the slots under them, the stale ones, the stale
+ones now, the slots that took a tell by what their view holds, and the
+slots the spans named whose view held none of the tell.
 
 What the texture pass does is counted (no switch; lines every five
 seconds). "texture uploads by reason" says for every upload what made its

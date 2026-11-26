@@ -135,18 +135,19 @@ pub(crate) struct HostHeap {
     /// 0 until the read), for [`HostHeap::texture_slot_found`].
     asked: Mutex<std::collections::HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
     /// Per title slot the texture pass uploaded, the title memory its
-    /// view holds: from where its texture starts to the end of the bytes
-    /// of the view's first level ([`HostHeap::texture_slot_holds`]). A
-    /// tell is for the slot if it lies in them ([`told_slots`]).
+    /// view held then: from where its texture starts to the end of the
+    /// bytes of the view's first level ([`HostHeap::texture_slot_holds`]).
+    /// A tell that lies in them is for the slot, whatever view starts
+    /// between ([`told_slots`]).
     held: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
 }
 
 /// Since the start, of the slots a tell of written or mapped memory might
 /// be for ([`told_slots`]): those that took it because their view holds
 /// its bytes though another texture's view starts between (they were
-/// passed over, and a look found them changed later or never); those
-/// passed over because their view does not hold its bytes (they were
-/// uploaded again for memory that is another texture's, or not there).
+/// passed over, and a look found them changed later or never); those the
+/// spans name whose view, as last uploaded, holds none of its bytes (told
+/// all the same; counted).
 pub(crate) static TOLD_BY_VIEW: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Of the slots a tell of title memory `[start, end)` may be for, the
@@ -155,19 +156,26 @@ pub(crate) static TOLD_BY_VIEW: [std::sync::atomic::AtomicU64; 2] = [const { std
 /// hold bytes of it (a texture ends where the next one starts); `over`:
 /// those whose texture's span it lies in at its full size.
 ///
-/// A slot the pass uploaded is asked by what its view holds (`held`: the
-/// first bytes of its texture, up to the end of the view's first level;
-/// the title holds a texture from the level it views it from). The tell
-/// is for it if it lies in those bytes, whatever view starts between, and
-/// is not if it lies past them. A slot not uploaded since its view was
-/// written is taken as the spans say.
+/// Every slot the spans name is told, as before. Beside them, a slot the
+/// pass uploaded whose view holds bytes of the tell (`held`: the first
+/// bytes of its texture, up to the end of the view's first level; the
+/// title holds a texture from the level it views it from) is told
+/// whatever view starts between: by the spans alone, a tell that lay in a
+/// texture's bytes behind an older view of other memory was taken for
+/// that view's texture only (16,175 textures found changed by a look in
+/// the opening cutscene had such a tell of DirectStorage, 4,177 one of a
+/// mapping).
 ///
-/// By the spans alone, a tell that lay in a texture's bytes behind an
-/// older view of other memory was taken for that view's texture (16,175
-/// textures found changed by a look in the opening cutscene had such a
-/// tell of DirectStorage, 4,177 one of a mapping), and one past the
-/// levels a view holds was taken for its slot (the title streams a level
-/// into its place before it views the texture from it).
+/// A slot the spans name is told also when its view, as last uploaded,
+/// holds none of the tell's bytes. For one refresh's worth of commits it
+/// was passed over then (the title streams a level into its place before
+/// it views the texture from it, and such a tell is for a level no view
+/// shows yet). But what the pass noted of a slot is what its view held at
+/// its last upload by the pass: a view written since, from a more
+/// detailed level, and served by a draw's read through a table instead of
+/// the pass, holds more, and the tell of that level's memory was then
+/// lost for the slot. An upload brings only what changed, so telling too
+/// many costs a read.
 fn told_slots(
     placed: &Spans,
     held: &std::collections::HashMap<u32, (u64, u64)>,
@@ -187,12 +195,10 @@ fn told_slots(
     };
     let (mut told, mut known) = (Vec::new(), Vec::new());
     for &slot in &by_rule {
-        match holds(slot) {
-            Some(false) => {
-                TOLD_BY_VIEW[1].fetch_add(1, Relaxed);
-            }
-            _ => told.push(slot),
+        if holds(slot) == Some(false) {
+            TOLD_BY_VIEW[1].fetch_add(1, Relaxed);
         }
+        told.push(slot);
     }
     for slot in over {
         if by_rule.binary_search(&slot).is_ok() {
@@ -6644,10 +6650,11 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
-    /// A tell is for the slots whose view holds its bytes: one that lies
-    /// in a texture's bytes behind an older view of other memory is taken
-    /// for the texture, and one past the levels a view holds is not taken
-    /// for its slot. A slot not uploaded is taken as the spans say.
+    /// A tell is for the slots the spans name and for those whose view
+    /// holds its bytes: one that lies in a texture's bytes behind an older
+    /// view of other memory is taken for the texture as well. A slot the
+    /// spans name is told whatever its view held when the pass last
+    /// uploaded it (the view may have been written since).
     #[test]
     fn a_tell_is_for_the_slots_whose_view_holds_its_bytes() {
         use crate::census::{F_HIDDEN, F_STALE};
@@ -6682,11 +6689,13 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.slots_written_under(&write(at + 0x7000, at + 0x7800), 51), [] as [u32; 0]);
         assert_ne!(heap.texture_slot_found(1, at, size), F_HIDDEN + Cause::Pages as usize);
         // One at its start, where the spans take it to hold the bytes: its
-        // own while the view holds them, and not once it holds none there.
+        // own, also when the view held none of them at its last upload
+        // (counted).
         assert_eq!(heap.slots_written_under(&write(at + 0x100, at + 0x200), 52), [1]);
         heap.texture_slot_stamp(1, stamp(), Arc::new(AtomicU64::new(0)));
         heap.texture_slot_holds(1, at, 0x80);
-        assert_eq!(heap.slots_written_under(&write(at + 0x100, at + 0x200), 53), [] as [u32; 0]);
+        assert_eq!(heap.slots_written_under(&write(at + 0x100, at + 0x200), 53), [1]);
+        heap.texture_slot_stamp(1, stamp(), Arc::new(AtomicU64::new(0)));
         // The inner view's slot was not asked what it holds: as the spans
         // say, a write into its memory is its own; with the large one's
         // view reaching over it, it is that one's as well.

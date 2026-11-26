@@ -9259,8 +9259,8 @@ impl Meter {
                      {slots} slots of placed textures held their bytes, {stale} of them stale ({by_copy} by copies; their upload \
                      read before the write ended, by the writes' numbers: {}), {} stale now; {left} due slots left for after a read the title had \
                      submitted, {} such reads so far; {} slots took a tell of written or mapped memory because their view holds \
-                     its bytes though another texture's view starts between, {} were passed over because their view does not \
-                     hold them (VICTORY_PAGE_WRITES: unset, 1 or all opens the guarded blocks and makes stale slots due at \
+                     its bytes though another texture's view starts between, {} were told as the spans say though their view \
+                     held none of them at its last upload (VICTORY_PAGE_WRITES: unset, 1 or all opens the guarded blocks and makes stale slots due at \
                      once, guards the first alone, slots the second, 0 neither)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
