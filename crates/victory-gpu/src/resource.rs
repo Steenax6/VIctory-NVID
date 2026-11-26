@@ -2658,6 +2658,14 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Whether the host takes a clear value on a texture of these (host) flags:
+/// render targets and depth buffers only.
+fn takes_clear_value(flags: u32) -> bool {
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    flags & (TARGET | DEPTH) != 0
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags; with `spill`, in the PC's
 /// memory the card reads over the bus ([`spill_on`]). Also whether it went
@@ -2729,7 +2737,10 @@ fn host_texture_as(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // The console allows one on any texture; the host only on render
+    // targets and depth buffers, and refuses the texture (E_INVALIDARG)
+    // otherwise: it is dropped there (Marvisak/VIctory pull request #3065).
+    let clear_value = (!clear.is_null() && takes_clear_value(d.flags)).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -3686,6 +3697,19 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// The console lets a title set a clear value on any texture; the host
+    /// refuses one (E_INVALIDARG) unless the texture is a render target or
+    /// a depth buffer (Marvisak/VIctory pull request #3065).
+    #[test]
+    fn only_targets_and_depth_buffers_keep_a_clear_value() {
+        assert!(!takes_clear_value(0));
+        assert!(!takes_clear_value(4), "unordered access alone");
+        assert!(!takes_clear_value(8));
+        assert!(takes_clear_value(1));
+        assert!(takes_clear_value(2));
+        assert!(takes_clear_value(1 | 4));
+    }
 
     /// The R8 family is R8 typeless (60) with UNORM, UINT, SNORM and SINT
     /// (61 to 64); A8_UNORM (65) is a family of its own (Marvisak 97c8783).
