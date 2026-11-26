@@ -52,6 +52,8 @@ pub mod pipeline;
 mod placed;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod rawrange;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
