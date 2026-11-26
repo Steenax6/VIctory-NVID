@@ -4433,11 +4433,22 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if resource[0] != BUFFER {
                 // No texture could be made for it ([`placed_texture`]): a
                 // null view, whose writes are dropped.
-                once!(
-                    dimension = resource[0],
-                    unordered = *unordered,
-                    "a placed texture view has no host texture: a null view"
-                );
+                // At address 0 the view is the title's null descriptor (no
+                // texture can be made there: `texture_at` and
+                // `uav_texture_at` refuse it): a null view is what it asks
+                // for, and nothing to say. The old "not mirrored" line was
+                // this, for a sampling view, not an unordered one.
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if address != 0 {
+                    once!(
+                        dimension = resource[0],
+                        unordered = *unordered,
+                        address = format_args!("{address:#x}"),
+                        resource = ?resource,
+                        view = ?desc,
+                        "a placed texture view has no host texture: a null view"
+                    );
+                }
                 return None;
             }
             // The resource description's width, after the alignment.
