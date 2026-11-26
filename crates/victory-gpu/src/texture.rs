@@ -121,6 +121,9 @@ pub(crate) struct Staging {
     /// What the texture's host copy holds of each part (the host copy's
     /// own: [`Sent`]).
     sent: Arc<Sent>,
+    /// For an upload of the texture pass: the level the view of the slot
+    /// it is for starts at ([`picked`]); `u32::MAX`: not said.
+    viewed: std::sync::atomic::AtomicU32,
     /// The texture is one of a view the title placed in memory
     /// (`crate::resource::texture_at`), not a texture object of its own:
     /// the title may hold only its less detailed levels, and an upload of
@@ -225,6 +228,18 @@ fn part_is(cut: bool, of_part: u32, end: u64, [first, limit]: [u64; 2], there: i
         PartIs::Read
     } else {
         PartIs::Zeros
+    }
+}
+
+/// The first level an upload of the texture pass takes as shown: the
+/// lowest of what the spans say a view in a slot picked by index shows
+/// (`spans`) and where the view of the slot the upload is for starts
+/// (`own`). Level 0 if neither says.
+fn first_shown(spans: Option<u32>, own: Option<u32>) -> u64 {
+    match (spans, own) {
+        (Some(spans), Some(own)) => u64::from(spans.min(own)),
+        (Some(first), None) | (None, Some(first)) => u64::from(first),
+        (None, None) => 0,
     }
 }
 
@@ -1533,8 +1548,10 @@ pub(crate) fn decide_uploads(uploads: &[TextureUpload]) -> Vec<Copies> {
         }
         // What a view may show of the texture and the host copy holds
         // nothing for, neither the title's bytes nor the card's: counted,
-        // and the first of them said.
-        let bare = staging.bare(sent) & !upload.copy.card.subs.load(Relaxed);
+        // and the first of them said. Where the upload brings levels: one
+        // that brings none found the texture's memory gone or all zeros
+        // and leaves the host copy as it is, with whatever view it had.
+        let bare = if subs == 0 { 0 } else { staging.bare(sent) & !upload.copy.card.subs.load(Relaxed) };
         if bare != 0 {
             by_level[crate::census::L_BARE].fetch_add(u64::from(bare.count_ones()), Relaxed);
             static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1544,6 +1561,10 @@ pub(crate) fn decide_uploads(uploads: &[TextureUpload]) -> Vec<Copies> {
                     bytes = staging.layout.size,
                     levels = staging.mips,
                     subresources = format_args!("{bare:#x}"),
+                    copied = format_args!("{subs:#x}"),
+                    first_shown = staging.judged[0].load(Relaxed),
+                    next_texture_at = staging.judged[1].load(Relaxed),
+                    slot_view_from = staging.viewed.load(Relaxed),
                     by_the_pass = staging.picked.load(Relaxed) != 0,
                     "an upload was decided and levels a view may show hold nothing on the host, neither the title's bytes \
                      nor the card's, though other levels of the texture were brought"
@@ -2615,7 +2636,17 @@ impl Staging {
         // were left alone and never went up.
         let why = self.picked.load(Relaxed);
         let cut = self.placed && why != 0;
-        let judged = if self.on_demand || cut { self.judgement() } else { [0, u64::MAX] };
+        let mut judged = if self.on_demand || cut { self.judgement() } else { [0, u64::MAX] };
+        if cut && !self.on_demand {
+            // The slot the upload is for shows the texture from its own
+            // view's first level, whether the spans hold that view or not
+            // (a view written over, or one the spans left out, is in none:
+            // every level then counted as shown, and those the title does
+            // not hold were read from the next textures' memory).
+            let own = self.viewed.load(Relaxed);
+            let spans = crate::descriptor::host::first_viewed(self.memory as u64);
+            judged[0] = first_shown(spans, (own != u32::MAX).then_some(own));
+        }
         self.judged[0].store(judged[0], Relaxed);
         self.judged[1].store(judged[1], Relaxed);
         let on_demand = self.on_demand.then(|| self.held_levels(judged));
@@ -3170,6 +3201,7 @@ pub(crate) fn picked(resource: This, why: u8, first: u32) -> Option<Picked> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let s = map.as_ref()?.get(&(resource as usize))?;
     s.picked.store(u32::from(why) + 1, std::sync::atomic::Ordering::Relaxed);
+    s.viewed.store(first, std::sync::atomic::Ordering::Relaxed);
     Some(Picked {
         stamp: s.stamp.clone(),
         asked: s.asked.clone(),
@@ -3182,13 +3214,14 @@ pub(crate) fn picked(resource: This, why: u8, first: u32) -> Option<Picked> {
 /// stages (a bit a level), as an upload of the texture pass (`picked`) or as
 /// a draw's read through a table; `None` without a host.
 #[cfg(test)]
-pub(crate) fn levels_staged(resource: This, picked: bool) -> Option<u32> {
+pub(crate) fn levels_staged(resource: This, picked: Option<u32>) -> Option<u32> {
     use std::sync::atomic::Ordering::Relaxed;
     let texture = crate::resource::host_resource(resource)?;
     unstage(resource);
     let staging = staging(resource, texture)?;
-    if picked {
+    if let Some(first) = picked {
         staging.picked.store(u32::from(crate::census::VIEW) + 1, Relaxed);
+        staging.viewed.store(first, Relaxed);
     }
     staging.refresh();
     let held = staging.detiled.load(Relaxed);
@@ -3650,6 +3683,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         staged: Default::default(),
         sent,
         placed: crate::resource::is_placed(resource),
+        viewed: std::sync::atomic::AtomicU32::new(u32::MAX),
         picked: std::sync::atomic::AtomicU32::new(0),
         counted: std::sync::atomic::AtomicBool::new(false),
         asked: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4115,6 +4149,14 @@ mod digest_tests {
         assert_eq!(part_is(true, 0, 1, [0, 0], never), PartIs::Left);
         assert_eq!(part_is(true, 1 << 31, u64::MAX, [31, 0], || true), PartIs::Read);
         assert_eq!(part_is(true, 1 << 31, u64::MAX, [32, u64::MAX], || true), PartIs::Read);
+        // The first level the pass takes as shown: the lowest of what the
+        // spans say and where the slot's own view starts.
+        use super::first_shown;
+        assert_eq!(first_shown(Some(3), Some(1)), 1);
+        assert_eq!(first_shown(Some(1), Some(3)), 1);
+        assert_eq!(first_shown(None, Some(2)), 2);
+        assert_eq!(first_shown(Some(4), None), 4);
+        assert_eq!(first_shown(None, None), 0);
         // A change no guard saw is a writer's the guards do not see,
         // unless a read of the title's was writing the memory at one of
         // the two checks, or the memory was mapped anew between them.

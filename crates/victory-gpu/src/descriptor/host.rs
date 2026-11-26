@@ -6659,13 +6659,23 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             // The pass: levels 3 and up are viewed; level 2 ends where
             // level 1 starts, before the other texture; levels 1 and 0
             // reach past its start and are left.
-            if let Some(levels) = crate::texture::levels_staged(resource, true) {
+            if let Some(levels) = crate::texture::levels_staged(resource, Some(3)) {
                 assert_eq!(levels, 0x1fc, "the pass's upload");
                 // A table's read: all of it.
-                assert_eq!(crate::texture::levels_staged(resource, false), Some(0x1ff), "a read through a table");
-                // Viewed from level 0, the pass reads all of it as well.
+                assert_eq!(crate::texture::levels_staged(resource, None), Some(0x1ff), "a read through a table");
+                // The pass, for a slot whose view starts lower than the
+                // spans know: from that level.
+                assert_eq!(crate::texture::levels_staged(resource, Some(0)), Some(0x1ff), "the slot's own view");
+                // Viewed from level 0 by the spans, the pass reads all of
+                // it whatever level the slot's view starts at.
                 heap.note_buffer(1, Some(&view(at, words, 0)), false);
-                assert_eq!(crate::texture::levels_staged(resource, true), Some(0x1ff), "viewed from its first level");
+                assert_eq!(crate::texture::levels_staged(resource, Some(3)), Some(0x1ff), "viewed from its first level");
+                // The spans hold no view of it any more (the slot was
+                // written over): the slot the upload is for says from
+                // where. (Every level counted as shown then.)
+                heap.note_buffer(1, Some(&view(at + 0x4_0000, small, 0)), false);
+                assert_eq!(first_viewed(at), None);
+                assert_eq!(crate::texture::levels_staged(resource, Some(3)), Some(0x1fc), "no view in the spans");
             }
         }
         // SAFETY: the allocation above, released once.
