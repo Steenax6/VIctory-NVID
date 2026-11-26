@@ -465,16 +465,31 @@ submitted recording is translated.
   threads. `VICTORY_THIN_PRIORITY=<-2..2>` (0, normal, unless told): their
   Windows thread priority.
 - `VICTORY_THIN_CHECK=1` (diagnostics build): for every draw and dispatch the
-  first 256 bytes of each bound descriptor table and root view are hashed at
-  the call and again at translation; the line "thin check" counts the draws
-  whose bytes differed, that is where the path in the call would have read
-  something else.
+  first 32 bytes of each bound descriptor table and root view (what the draw
+  reads for certain) are hashed at the call and again at translation; the
+  line "thin check" counts the draws whose bytes differed, tables and views
+  apart, that is where the path in the call would have read something else,
+  and the log names the first 16 addresses. First room, 2026-11-26: of about
+  13,060 draws and dispatches a frame, tables 0 to 0.04, root views 2.2 to
+  2.4 (with 256 bytes about 115: they reach into the next draw's slots).
 
 The line "list calls translated by threads of ours per frame" gives the calls
 and the threads' time, lists, pieces, recordings let go of unfinished, the
 title objects whose freeing waited and those freed past a recording held open,
 and how long presents stood for translation (the timeline's `thinwait`
 events; each translated piece is a `thin>`/`thin<` pair).
+
+First room, 2026-11-26 (indications: other work ran on the machine): the
+render thread no longer waits for the recording job (no wait of 3 ms or more
+in the timeline, 22 to 42 ms before); the title's job threads write their
+calls in a few milliseconds and six threads of ours translate about 42,000
+calls a frame in 200 ms summed (about 30 ms each). The frame is now the
+submitting thread's: it sends 60 to 64 ms of a 61 to 66 ms frame and idles
+under a millisecond, and the present stands for translation under a
+millisecond. So the frame did not get shorter (71.5 and 66.8 to 72.3 ms
+against 70.9 without), and its sending got slower (preparing 51 to 54 ms
+against 45). What shortens the frame from here is the submitting thread's
+work, or the present no longer waiting for it.
 
 To become the default and the path in the call to be removed: the picture of
 the first room and of the open world as without it; the always-on invariant
