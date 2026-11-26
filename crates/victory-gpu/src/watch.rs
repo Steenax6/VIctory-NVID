@@ -471,7 +471,12 @@ pub(crate) fn writes_fine(start: usize, end: usize, guarded: bool) -> Option<(u6
         let epoch = once().then_some(Epoch { submission: j.once_id, standing: j.kept });
         let written = guard_fine(first * PAGE, last * PAGE, epoch);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        {
+            crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+            if written.is_some() {
+                crate::copystat::buffers::view(first * PAGE, (last - first) * PAGE);
+            }
+        }
         written?
     } else {
         Vec::new()
@@ -1945,7 +1950,19 @@ pub fn writing(at: usize, len: usize) {
 /// (`cause`).
 pub(crate) fn writing_as(at: usize, len: usize, cause: crate::writes::Cause) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    {
+        let mut g = guards();
+        // Every block is opened under the guards' lock, so what the count
+        // of opened blocks grows by here is this write's.
+        #[cfg(feature = "diagnostics")]
+        let before = GUARD_CALLS[6].load(std::sync::atomic::Ordering::Relaxed);
+        open(&mut g, at, at.saturating_add(len));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::buffers::opened(
+            cause as usize,
+            GUARD_CALLS[6].load(std::sync::atomic::Ordering::Relaxed).saturating_sub(before),
+        );
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len, cause);
 }

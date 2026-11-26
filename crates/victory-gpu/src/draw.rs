@@ -1832,7 +1832,7 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            shadow.refresh_as(list, *from, to - from, crate::shadow::ASKED_BY_PICKED);
         }
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);

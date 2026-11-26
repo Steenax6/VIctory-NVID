@@ -82,7 +82,21 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Diagnostics: who asked for a refresh of the copy since it was last
+    /// brought up to date ([`ASKED_BY_DRAW`] and the others), for the
+    /// census (`crate::copystat::buffers`).
+    #[cfg(feature = "diagnostics")]
+    asked_by: AtomicU8,
 }
+
+/// Who asks for a refresh of a copy ([`Shadow::refresh_as`]): a draw for
+/// the views it binds; the pass over the buffer views shaders pick by
+/// index, for every copy one of them names; a program that reads title
+/// memory by address, for every numbered copy. Bits: a copy keeps the
+/// askers it had until it is brought up to date.
+pub(crate) const ASKED_BY_DRAW: u8 = 1;
+pub(crate) const ASKED_BY_PICKED: u8 = 2;
+pub(crate) const ASKED_BY_ADDRESS: u8 = 4;
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
@@ -312,6 +326,50 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
+}
+
+/// Diagnostics: the copies in the card's memory, as (start, bytes) of
+/// their title memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_spans() -> Vec<(u64, u64)> {
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.iter().filter_map(|w| w.upgrade()).map(|s| (s.start, s.len)).collect()
+}
+
+/// Diagnostics: the copies in the card's memory by when they were last
+/// asked for (`Shadow::used`): in this frame or the one before, within 60
+/// frames, within 600, longer ago; each as (copies, bytes of their card
+/// side).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_use() -> [[u64; 2]; 4] {
+    let now = crate::host::moment() >> 32;
+    let mut out = [[0u64; 2]; 4];
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    for shadow in carded.iter().filter_map(|w| w.upgrade()) {
+        let ago = now.saturating_sub(shadow.used.load(Ordering::Relaxed) >> 32);
+        let class = match ago {
+            0..=1 => 0,
+            2..=60 => 1,
+            61..=600 => 2,
+            _ => 3,
+        };
+        out[class][0] += 1;
+        out[class][1] += shadow.card.as_ref().map_or(0, |c| c.size);
+    }
+    out
+}
+
+/// Diagnostics: every host copy of title memory that is alive, as (start,
+/// bytes): title buffers' copies and windows outside buffers.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn copy_spans() -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = {
+        let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        map.iter().filter(|(_, entry)| entry.shadow.is_some()).map(|(key, entry)| (key.0, entry.end.saturating_sub(key.0))).collect()
+    };
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    spans.extend(loose.values().map(|s| (s.start, s.len)));
+    spans
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
@@ -2922,8 +2980,44 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.refresh_as(list, address, len, ASKED_BY_DRAW);
+    }
+
+    /// [`Shadow::refresh`] for `who` (one of the `ASKED_BY_` bits): what a
+    /// diagnostics build counts the refresh under. Nothing else differs.
+    pub(crate) fn refresh_as(self: &Arc<Self>, list: &HostList, address: u64, len: u64, who: u8) {
         let len = len.min(self.start + self.len - address);
+        #[cfg(feature = "diagnostics")]
+        {
+            // (Loaded first: recording threads ask for the same copies, and
+            // a store each time would pass the copy's line between them.)
+            if self.asked_by.load(Ordering::Relaxed) & who != who {
+                self.asked_by.fetch_or(who, Ordering::Relaxed);
+            }
+            crate::copystat::buffers::asked(who, len);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = who;
         list.defer_refresh(self, address as usize, len as usize);
+    }
+
+    /// Diagnostics: the askers the copy had ([`Shadow::refresh_as`]), taken.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn asked_taken(&self) -> u8 {
+        self.asked_by.swap(0, Ordering::Relaxed)
+    }
+
+    /// Diagnostics: at the landing of flight `flight`, its compare flagged
+    /// the blocks `mask` of the copy's piece `piece` (as
+    /// [`Shadow::card_flagged`] counts pieces): told to the census by the
+    /// title address of the piece.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn census_flagged(&self, flight: u64, piece: u32, mask: u32) {
+        if mask == 0 {
+            return;
+        }
+        let at = (self.start as usize / PIECE * PIECE).saturating_add((piece as usize).saturating_mul(PIECE));
+        crate::copystat::buffers::flagged(flight, at, mask);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -2953,6 +3047,8 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            #[cfg(feature = "diagnostics")]
+            asked_by: AtomicU8::new(0),
         }
     }
 
@@ -3480,6 +3576,8 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::buffers::gave_up(crate::copystat::buffers::UNWATCHED, self.start, self.len, from, 0, *runs_left);
             return true;
         }
         let base = start / PAGE;
@@ -3494,6 +3592,8 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes_fine(a, e, true) else {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::buffers::gave_up(crate::copystat::buffers::NO_JOURNAL, self.start, self.len, a, 0, *runs_left);
                 return true;
             };
             let stale: Vec<(usize, Runs)> = {
@@ -3541,7 +3641,11 @@ impl Shadow {
                         } else {
                             (joined_over(changed_runs(title, held), merge_gap()), Vec::new())
                         };
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::buffers::under_page(runs.len());
                         if runs.len() > *runs_left {
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::buffers::gave_up(crate::copystat::buffers::RUN_CAP, self.start, self.len, lo, runs.len(), *runs_left);
                             return true;
                         }
                         *runs_left -= runs.len();
@@ -3550,15 +3654,24 @@ impl Shadow {
                             self.card_changed(at + r, at + r + m);
                             MERGED[1].fetch_add(1, Ordering::Relaxed);
                             MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::buffers::title_wrote(lo + r, m);
                         }
                         for (r, m) in joined {
                             held[r..r + m].copy_from_slice(&title[r..r + m]);
                             self.card_changed(at + r, at + r + m);
                             MERGED[3].fetch_add(1, Ordering::Relaxed);
                             MERGED[4].fetch_add(m as u64, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                crate::copystat::buffers::title_wrote(lo + r, m);
+                                crate::copystat::buffers::joined(lo + r, m, PREPARED.load(Ordering::Relaxed));
+                            }
                         }
                     } else {
                         let Some(snapshot) = before.as_mut() else {
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::buffers::gave_up(crate::copystat::buffers::NO_SNAPSHOT, self.start, self.len, lo, 0, *runs_left);
                             return true;
                         };
                         // SAFETY: the snapshot's allocation holds the copy's
@@ -3863,7 +3976,10 @@ impl Shadow {
                 let mut k = 0;
                 while k < n {
                     let m = (SMALL - (at + k) % SMALL).min(n - k);
-                    if read[k..k + m] == held[k..k + m] {
+                    let equal = read[k..k + m] == held[k..k + m];
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::buffers::refreshed_block(at + k, m, equal);
+                    if equal {
                         SENT_SAME[0].fetch_add(1, Ordering::Relaxed);
                         SENT_SAME[1].fetch_add(m as u64, Ordering::Relaxed);
                     } else {
@@ -4017,7 +4133,21 @@ impl Shadow {
             let bits = card.flagged.lock().unwrap_or_else(|e| e.into_inner());
             (first..=last).map(|g| bits.get(g / 64).is_some_and(|w| w & (1 << (g % 64)) != 0)).collect()
         };
-        page_runs(pos, title, held, merge_gap(), |g| marks.get(g - first).copied().unwrap_or(true))
+        let (exact, joined) = page_runs(pos, title, held, merge_gap(), |g| marks.get(g - first).copied().unwrap_or(true));
+        // For the census: the exact runs block by block (a run is counted
+        // with the block it starts in).
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut runs = exact.iter().map(|r| (pos + r.0) / BLOCK).peekable();
+            while let Some(block) = runs.next() {
+                let mut n = 1;
+                while runs.next_if_eq(&block).is_some() {
+                    n += 1;
+                }
+                crate::copystat::buffers::under_block(n);
+            }
+        }
+        (exact, joined)
     }
 
     /// The walls trace (`crate::host::walls_trace`): a piece of `fetched`
@@ -4100,6 +4230,8 @@ impl Shadow {
                 crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::buffers::landed(start + at, n);
                 written = n;
             }
         } else {
@@ -4190,6 +4322,8 @@ impl Shadow {
         crate::watch::writing_as(start + at, n, crate::writes::Cause::Back);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::buffers::landed(start + at, n);
         n
     }
 
@@ -4302,6 +4436,8 @@ impl Shadow {
                 crate::host::shaders_write(start + a, t);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + a, t, "card relay");
                 write_title(start + a, t);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::buffers::landed(start + a, n);
                 written += n;
             }
             if merge_forget() {

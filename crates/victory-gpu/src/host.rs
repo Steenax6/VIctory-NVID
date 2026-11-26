@@ -909,6 +909,16 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // Said once, for whoever weighs card memory the CPU maps (GPU upload
+        // heaps) for the copies of title buffers: the layer makes none. A
+        // runtime that does not know the question says so by failing it.
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let asked = device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32);
+        tracing::info!(
+            known = asked.is_ok(),
+            offered = asked.is_ok() && o16.GPUUploadHeapSupported.as_bool(),
+            "the card's memory mapped by the CPU (GPU upload heaps); the layer uses none"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -2745,7 +2755,10 @@ fn fine_runs(plans: &[(u64, &CardPlan)], differs: &[u32], noted: Option<&crate::
         for r in &plan.ranges {
             let copy = Arc::as_ptr(&r.shadow) as usize;
             for p in 0..r.span.pieces {
-                *masks.entry((copy, r.span.first + p)).or_default() |= range_piece_mask(r, p, differs);
+                let mask = range_piece_mask(r, p, differs);
+                #[cfg(feature = "diagnostics")]
+                r.shadow.census_flagged(number, r.span.first + p, mask);
+                *masks.entry((copy, r.span.first + p)).or_default() |= mask;
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
@@ -3473,6 +3486,8 @@ fn late_copy(dst: usize, src: usize, len: usize) {
     }
     LATE_COPIES[0].fetch_add(1, Ordering::Relaxed);
     LATE_COPIES[1].fetch_add(len as u64, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::buffers::cpu_read(src, len);
     // As a shader's write that lands: reads of the destination ahead of it
     // are checked against it, and its guards are opened.
     shaders_write(dst, &new);
@@ -8333,7 +8348,10 @@ impl HostList {
                     }
                     batch.title_written();
                     #[cfg(feature = "diagnostics")]
-                    fill_check::copy_runs(dst, src, len);
+                    {
+                        fill_check::copy_runs(dst, src, len);
+                        crate::copystat::buffers::cpu_read(src, len);
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -8348,6 +8366,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
+                        crate::copystat::buffers::cpu_read(src, len);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
@@ -8486,7 +8505,10 @@ impl Batch {
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
+        {
+            crate::copystat::range(from, to - from, us, 0);
+            crate::copystat::buffers::updated(shadow.asked_taken(), to.saturating_sub(from), copied);
+        }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
