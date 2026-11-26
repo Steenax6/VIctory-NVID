@@ -23,6 +23,8 @@ mod capture;
 mod card_fine;
 #[cfg(windows)]
 mod census;
+#[cfg(windows)]
+mod code_use;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -54,6 +56,8 @@ pub mod query;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;
+#[cfg(windows)]
+mod resubmit;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

@@ -611,6 +611,12 @@ fn note_other_targets(p: &Pipeline, bound: &windows::Win32::Graphics::Direct3D12
     }
 }
 
+/// The line on the driver's calls for pipelines, with the periodic lines.
+#[cfg(windows)]
+pub(crate) fn driver_line() {
+    library::driver_line();
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
