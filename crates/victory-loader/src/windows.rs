@@ -90,6 +90,9 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
                 unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
             tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
         }
+        // SAFETY: as above; does nothing unless `VICTORY_OUTPUT` or
+        // `VICTORY_RENDER_SCALE` is set.
+        unsafe { crate::resolution::apply_asked(loaded.base(), &prepared.original_hash) };
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
