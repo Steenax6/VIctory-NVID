@@ -8,9 +8,9 @@ frame line over a scene. State: 2026-11-26.
 
 | Scene | before 2026-11-25 | 2026-11-25 | 2026-11-26 |
 |---|---|---|---|
-| Opening cutscene | 1-5 fps | 132-135 ms a frame | 106 ms (about 9 fps) |
-| First room | 182 ms (5.5 fps) | 89-90 ms | 78.6 ms (12.7 fps) |
-| Open world, by boat and by car | | | 77 ms (63 to 94 over 22 minutes) |
+| Opening cutscene | 1-5 fps | 132-135 ms a frame | about 100 ms (10 fps) |
+| First room | 182 ms (5.5 fps) | 89-90 ms | 76 ms (13 fps) |
+| Open world | | | 77 to 97 ms, by scene (77 ms by boat and by car, 63 to 94 over 22 minutes) |
 
 ## What `scripts\play.ps1` sets
 
@@ -146,8 +146,10 @@ cutscene took 170 ms a frame against 106, with the same picture. In the
 prologue (205 s, to the first room) 11,356 textures were made there instead
 of waiting, 2,391 of them alive at the end (606 MB), beside 2,346 alive
 without their most detailed levels (2.8 GB of the card not taken); none was
-held back. The open world has not been run with it yet: the session of
-2026-11-26 there had it off.
+held back. In the open world (eight minutes from a save at the first boat
+mission) 22,389 textures were made there, 4,368 of them alive at the end
+(1.4 GB), and none waited for room; the frame time was that of the
+session without it (78.9 against 77.0 ms).
 
 `VICTORY_WAIT_RESIDENT` (on by default): new heaps for textures and
 committed host textures are made resident, and waited for, before anything
