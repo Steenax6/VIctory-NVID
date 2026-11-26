@@ -453,6 +453,8 @@ pub(crate) fn events_line(frames: f64) {
         (happened + arrived + late) as f64 / frames,
         outside as f64 / frames,
     );
+    // (With it: what the landings took of the guards' marks.)
+    landed_views_line(frames);
 }
 
 /// Notes in `written` that asking `now` found `page` written in the kernel
@@ -816,6 +818,136 @@ fn take_run(j: &mut Journal, pieces: &[(usize, usize)], now: u64, noted: &mut Ve
     let (a, b) = pieces.split_at(pieces.len() / 2);
     take_run(j, a, now, noted);
     take_run(j, b, now, noted);
+}
+
+/// [`take_landed`]'s twin for view memory, which the kernel does not
+/// write-watch: for a landing that wrote `ranges` of title memory beside
+/// the guards and has told them (`crate::beside`, [`written_beside`]).
+/// Takes the guards' marks of the blocks there now, and notes the pages
+/// they name as written at an asking of its own, whose number is returned
+/// with the pages noted (each with what the journal now holds of it, in
+/// page order).
+///
+/// What it is for: the landing's mark counts its blocks written, the next
+/// refresh's check reported them, and the landing's own copy read the
+/// kernel pages it had just been given and found them equal: the half of
+/// the echo that lies in view memory ([`take_landed`] has dealt with the
+/// half in private memory). Taken here, right behind the telling and with
+/// the journal's lock held as every asking holds it, the marks stand for
+/// "written up to now": the note tells every other copy over the pages,
+/// exactly as the next check would have, and the landing's copy can
+/// compare each page with its own bytes and count it taken if they are the
+/// same.
+///
+/// A block is taken only if a check could note it clean without a call:
+/// guarded, counted written in kernel pages that are known (a mark's; a
+/// block counted written anywhere is its next check's), not open from a
+/// fault's page on, no opening of it under way, and no view of its pages
+/// become writable since it was last clean ([`Region::apart`]). So the
+/// rule of [`guard_fine`] holds for the block noted clean here: it is
+/// read-only in full at every view. A store of the title's since the
+/// landing's write has faulted and opened the block in part, or another
+/// view of its pages: either leaves it to the next check. A write told
+/// since (another landing's, a read's) is in the marks taken, noted for
+/// every copy, and in the bytes the landing's copy compares. A store after
+/// this faults, as after a check. No check is between its notes and its
+/// changes of protection while this runs: each is made with the
+/// journal's lock held throughout.
+pub(crate) fn take_landed_views(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, Written)>) {
+    let mut j = journal();
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    // As in `wrote`: an asking that stands moves with the note.
+    if j.kept {
+        j.ahead_asked = now;
+    }
+    // The blocks that may be taken, read without a lock; decided again
+    // with their regions locked.
+    let takable = |r: &Region| r.protected.get() & !r.clean.get() & !r.partly.get() & !r.apart.get() & !r.absent.get();
+    let mut blocks: Vec<usize> = Vec::new();
+    for &(start, end) in ranges {
+        each_region(start / BLOCK, end.div_ceil(BLOCK), |index, r, want| {
+            blocks.extend(each_bit(want & takable(r)).map(|i| index * REGION + i));
+        });
+    }
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut noted = Vec::new();
+    if blocks.is_empty() {
+        return (now, noted);
+    }
+    let mut l = Locked::blocks(Holder::Landing, blocks.iter().copied());
+    for &block in &blocks {
+        let Some((r, m, i)) = l.at(block) else {
+            continue;
+        };
+        let b = 1u64 << i;
+        if takable(r) & b != 0 && m.opening[i] == 0 && m.dirty[i] != 0 {
+            let mask = std::mem::take(&mut m.dirty[i]);
+            r.clean.set(b);
+            note(&mut j.written, block, now, mask);
+            if let Some(w) = j.written.get_mut(block) {
+                noted.push((block, *w));
+            }
+        }
+    }
+    (now, noted)
+}
+
+/// Since the last frame line ([`landed_views`]): landings that took marks
+/// in view memory, the 64 KiB blocks noted by them, and their kernel
+/// pages.
+static LANDED_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// For `crate::shadow::landed`, the one call it makes for view memory.
+/// `pieces`: what a landing merged into title memory, as `(copy, start,
+/// end)` in title addresses, `copy` a number that is the same for the
+/// pieces of one host copy and for no other. Of the pieces that lie in
+/// views of the title's physical pages, the guards' marks are taken
+/// ([`take_landed_views`]), and `taken` is called once for each copy with
+/// pages noted: the copy's number, the pages noted (all of them, in page
+/// order), the title memory the landing wrote of that copy, and the
+/// asking's number. The copy then compares each noted page with its own
+/// bytes and counts it taken, as it does for the kernel's bits in private
+/// memory. Pieces in private memory are passed by: `landed` takes the
+/// kernel's bits of those itself.
+pub(crate) fn landed_views(pieces: impl Iterator<Item = (usize, usize, usize)>, mut taken: impl FnMut(usize, &[(usize, Written)], &[(usize, usize)], u64)) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut views: Vec<(usize, usize, usize)> =
+        pieces.filter(|&(_, start, end)| start < end && crate::inplace::view_at(start).is_some()).collect();
+    if views.is_empty() {
+        return;
+    }
+    let ranges: Vec<(usize, usize)> = views.iter().map(|&(_, start, end)| (start, end)).collect();
+    let (now, noted) = take_landed_views(&ranges);
+    if noted.is_empty() {
+        return;
+    }
+    LANDED_VIEWS[0].fetch_add(1, Relaxed);
+    LANDED_VIEWS[1].fetch_add(noted.len() as u64, Relaxed);
+    LANDED_VIEWS[2].fetch_add(noted.iter().map(|(_, w)| u64::from(w.mask.count_ones())).sum(), Relaxed);
+    // Copy by copy, each with what the landing wrote of it.
+    views.sort_unstable();
+    for of_one in views.chunk_by(|a, b| a.0 == b.0) {
+        let runs: Vec<(usize, usize)> = of_one.iter().map(|&(_, start, end)| (start, end)).collect();
+        // (Only if a page of it was noted.)
+        if runs.iter().any(|&(start, end)| noted.iter().any(|&(page, _)| page * PAGE < end && (page + 1) * PAGE > start)) {
+            taken(of_one[0].0, &noted, &runs, now);
+        }
+    }
+}
+
+/// With the frame line ([`events_line`]).
+fn landed_views_line(frames: f64) {
+    let [takings, blocks, kernel_pages] = [0, 1, 2].map(|i| LANDED_VIEWS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "landings' marks taken in view memory, per frame: {takings:.1} landings took them, {blocks:.0} blocks of 64 KiB with \
+         {kernel_pages:.0} 4 KiB pages ({:.2} MB) noted; what the landings' copies count taken of them and no longer read is in \
+         the line of the landings' written bits, with the pages of private memory, and so are the counts of its check \
+         (VICTORY_LAND_TAKEN=2)",
+        kernel_pages * KERNEL_PAGE as f64 / 1e6,
+    );
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -1553,6 +1685,8 @@ enum Holder {
     Mapped,
     /// Memory the runtime mapped or unmapped ([`title_memory_remapped`]).
     Remapped,
+    /// A landing taking its own marks ([`take_landed_views`]).
+    Landing,
 }
 
 impl Holder {
@@ -1567,11 +1701,12 @@ impl Holder {
             Holder::Marking => ("H:marking", "HS:marking"),
             Holder::Mapped => ("H:mapped", "HS:mapped"),
             Holder::Remapped => ("H:remapped", "HS:remapped"),
+            Holder::Landing => ("H:landing", "HS:landing"),
         }
     }
 }
 
-const _: () = assert!((Holder::Remapped as usize) < crate::timeline::HOLDERS);
+const _: () = assert!((Holder::Landing as usize) < crate::timeline::HOLDERS);
 
 /// Regions of the guards locked together, always in the order of their
 /// addresses: two takers that share regions cannot wait for each other.
@@ -2796,17 +2931,40 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     // and leaves the bits (no reset). What another asking took meanwhile
     // is in the journal, above.
     if open > 0
-        && let Some(pages) = watched_dirty(first * BLOCK, (last - first) * BLOCK)
+        && let Some(pages) = kernel_dirty(first * BLOCK, (last - first) * BLOCK)
     {
         (written, open) = (written + pages, 0);
     }
     (noted, written, open)
 }
 
+/// How many pages of `[at, at + len)` count as written since whatever
+/// watches them was last asked, without taking anything: for write-watched
+/// memory the pages whose bit the kernel holds (up to a few,
+/// [`kernel_dirty`]); for view memory the guards hold, the blocks not
+/// noted clean (counted written, open, or not guarded). `None` if the
+/// range is neither. For the check of what a landing's taking would have
+/// had its copy pass by (`crate::shadow`, `VICTORY_LAND_TAKEN=2`): a page
+/// written again since the taking is none of its finds.
+pub(crate) fn watched_dirty(at: usize, len: usize) -> Option<usize> {
+    if let Some(pages) = kernel_dirty(at, len) {
+        return Some(pages);
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    (first < last && held(first)).then(|| {
+        (first / REGION..=(last - 1) / REGION)
+            .map(|index| {
+                let want = span(index, first, last);
+                (want & !region(index).map_or(0, |r| r.clean.get())).count_ones() as usize
+            })
+            .sum()
+    })
+}
+
 /// How many pages of `[at, at + len)` the kernel's write watch holds as
 /// written (up to a few), without taking the bits; `None` if the range is
 /// not write-watched memory of one reservation.
-pub(crate) fn watched_dirty(at: usize, len: usize) -> Option<usize> {
+fn kernel_dirty(at: usize, len: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     let mut found = [0usize; 8];
     let mut count = found.len();
@@ -4544,6 +4702,64 @@ mod tests {
         // SAFETY: the second view; the write faults and the handler opens it.
         unsafe { ((two + 16) as *mut u8).write_volatile(1) };
         assert_eq!(guard(one, one + SIZE, None), Some(vec![page(one, 0)]), "a write through the view opened before");
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// A landing that wrote beside the guards takes its own marks
+    /// ([`take_landed_views`]): the blocks are noted clean and the pages in
+    /// the journal, so that the view written at has nothing to report and
+    /// every asking learns of the pages; the other view of the pages still
+    /// reports them. A block a store of the title's opened meanwhile, here
+    /// or at another view of its pages, is left to its check.
+    #[test]
+    fn a_landing_takes_its_own_marks_in_view_memory() {
+        if !guard_pages() {
+            return;
+        }
+        const SIZE: usize = 3 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        crate::inplace::title_memory_section(section, SIZE as u64, true);
+        let block = |view: usize, k: usize| view / BLOCK + k;
+        assert!(guard(one, one + SIZE, None).is_some() && guard(two, two + SIZE, None).is_some());
+        assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()));
+        let land = |at: usize, bytes: &[u8]| {
+            let place = crate::beside::find(at, bytes.len()).expect("a place in a view of our own");
+            assert_eq!(place.write(at, bytes), bytes.len());
+            written_beside(at, bytes.len(), crate::writes::Cause::Back);
+        };
+        // The first block: written beside in two kernel pages, and taken.
+        land(one + 2 * KERNEL_PAGE + 8, &[7; KERNEL_PAGE]);
+        // The second: a store of the title's through the same view first.
+        // SAFETY: inside the view; the store faults and opens the tail.
+        unsafe { ((one + BLOCK + 5 * KERNEL_PAGE) as *mut u8).write_volatile(1) };
+        land(one + BLOCK + 16, &[8; 32]);
+        // The third: a store through the other view of its pages first.
+        // SAFETY: as above, the other view.
+        unsafe { ((two + 2 * BLOCK + 9 * KERNEL_PAGE) as *mut u8).write_volatile(2) };
+        land(one + 2 * BLOCK + 16, &[9; 32]);
+        let before = asked_now();
+        let (now, noted) = take_landed_views(&[(one, one + SIZE)]);
+        assert!(now > before);
+        assert_eq!(noted.iter().map(|&(page, w)| (page, w.at, w.mask)).collect::<Vec<_>>(), vec![(block(one, 0), now, 0b1100)]);
+        // The other blocks are their check's: where the title stored, and
+        // armed again whole (the second), with its other view (the third).
+        assert_eq!(
+            guard_fine(one, one + SIZE, None, &mut Look::default()),
+            Some(vec![(block(one, 1), FULL << 5 | 1), (block(one, 2), FULL << 9 | 1)])
+        );
+        // Every other asking learns of the pages taken from the journal.
+        let (_, pages) = writes_fine(one, one + SIZE, true).expect("view memory");
+        assert!(pages.iter().any(|&(page, w)| page == block(one, 0) && w.at == now && w.mask == 0b1100));
+        // And the other view of the pages reports them at its own check.
+        let other = guard_fine(two, two + SIZE, None, &mut Look::default()).expect("view memory");
+        assert!(other.contains(&(block(two, 0), 0b1100)), "{other:x?}");
+        // Nothing to take a second time.
+        assert!(take_landed_views(&[(one, one + SIZE), (two, two + SIZE)]).1.is_empty());
+        // What the check of the taking asks: is a block written again?
+        assert_eq!(watched_dirty(one, BLOCK), Some(0));
+        // SAFETY: as above.
+        unsafe { ((one + 8) as *mut u8).write_volatile(3) };
+        assert_eq!(watched_dirty(one, BLOCK), Some(1));
         drop_views(section, &[one, two], SIZE);
     }
 
