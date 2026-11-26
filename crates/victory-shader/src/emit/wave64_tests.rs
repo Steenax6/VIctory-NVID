@@ -1095,6 +1095,40 @@ fn paired_lanes_loop_apart_and_meet_the_other_wave_at_the_barrier() {
     eprintln!("ran on the hardware device: two console waves, their loops and LDS as on the console");
 }
 
+/// One console wave whose lane 0 alone (the upper half has no lane in that arm) writes a dword
+/// of LDS after a chain of multiplies, as the water's transmission volumetrics give a group's
+/// one value to its lanes; past the join every lane reads it, with no barrier. On NVIDIA a
+/// fence alone let threads read before lane 0's thread had written (whole groups of the
+/// title's output zero, others each frame): the group of one host wave now waits there.
+/// Run 64 times, since a thread running ahead is a matter of timing.
+#[test]
+fn paired_lanes_read_what_one_lane_wrote_while_the_other_half_had_no_lane_there() {
+    let mut w = vec![
+        vop1(0x01, 1, k(0)),       // v_mov_b32 v1, 0: the dword every lane uses
+        vop1(0x01, 4, LIT),        // v_mov_b32 v4, 0x1234
+        0x1234,
+        vopc(0xC2, k(0), 0),       // v_cmp_eq_u32 vcc, 0, v0: lane 0
+        sop1(0x24, 12, VCC),       // s_and_saveexec_b64 s[12:13], vcc
+        sopp(0x08, 18),            // s_cbranch_execz past lane 0's arm
+    ];
+    for _ in 0..8 {
+        w.extend(vop3(0x169, 4, v(4), k(3))); // v_mul_lo_u32 v4, v4, 3
+    }
+    w.extend(ds(0x0D, 0, 1, 4, 0)); // ds_write_b32 v1, v4
+    w.push(sop1(0x04, EXEC, 12)); // s_mov_b64 exec, s[12:13]
+    w.extend(ds(0x36, 6, 1, 0, 0)); // ds_read_b32 v6, v1
+    w.extend(stores([6, 6, 6, 6]));
+    let shader = paired(&native_with(&w, true, 64, 256));
+    let value = 0x1234u32.wrapping_mul(3u32.pow(8));
+    let want = vec![value; 256];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..64 {
+        let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+        same_as_console(&got, &want);
+    }
+    eprintln!("ran on the hardware device: every lane read what lane 0 wrote, 64 times");
+}
+
 /// One console wave: `ds_bpermute_b32` from the mirror lane; a DPP row shift whose row mask
 /// leaves rows 0 and 3 alone (rows 2 and 3 are lanes 32-63: rows are counted in console lanes); a
 /// `ds_swizzle_b32` swapping the two 16-lane rows of each 32 lanes; `v_writelane_b32` of s0

@@ -371,10 +371,22 @@ struct Lower<'a> {
     /// The paired form: scalars each lane has its own of (a waterfall loop's first-lane reads
     /// and what is computed from them), on which no branch takes both lanes of a thread.
     lane_scalars: HashSet<Value>,
+    /// The paired form: the accesses of [`Self::paired_inst`] wait for the group, not only
+    /// fence ([`paired_lds_sync`]).
+    paired_lds_sync: bool,
     /// Linked for one pipeline ([`super::link`]): per input and output element, whether it
     /// is left out (empty when not linking).
     drop_in: Vec<bool>,
     drop_out: Vec<bool>,
+}
+
+/// The paired form, a group of one console wave: whether its LDS accesses wait for the group
+/// (a group barrier with the shared-memory fence) instead of only fencing. Every thread of the
+/// one host wave goes the wave's way, so every thread reaches each wait, unless a scalar is a
+/// lane's own (a waterfall loop: `lanes`, [`lane_scalars`]), where threads may part; then, or
+/// with `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]), the fence alone as before.
+fn paired_lds_sync(lanes: &HashSet<Value>) -> bool {
+    lanes.is_empty() && super::group_sync() != 0
 }
 
 /// What the lowering keeps per console lane, for the paired form ([`with_paired_lanes`]): each
@@ -827,10 +839,16 @@ thread_local! {
 /// console does (`structure::structure_wide`): the wave goes where some lane has to, and EXEC
 /// stays each lane's guard. So control flow is the same in every thread of a host wave, and
 /// the program's barriers are reached as on the console.
-// shortcut: D3D12 orders no groupshared accesses of two threads without a group barrier; the
-// host is taken to run a wave's threads in step where they all go the same way (as for the
-// console's 32-lane programs that share LDS within a wave), the fences only keeping its
-// compiler from moving one thread's accesses past each other.
+// D3D12 orders no groupshared accesses of two threads without a group barrier, and NVIDIA's
+// waves do not run their threads in step (each thread is scheduled on its own since Volta):
+// with only a fence, a thread read a dword another had not written yet. The water's
+// transmission volumetrics (`CS_TransmissionVolumetrics_Tiled`, one console wave a group)
+// left whole groups of their 1280x720 output zero, other groups each frame: black 8x8
+// squares on the water. Where the group is one console wave, and so one host wave whose
+// threads all go the same way, the accesses wait for the group ([`paired_lds_sync`]).
+// shortcut: in a group of several console waves the host waves do not go the same way and a
+// wait could stand for a wave that never comes; there the fences stay, and the threads of a
+// host wave are taken to run in step.
 pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
     let was = PAIRED.replace(true);
     let r = f();
@@ -1268,6 +1286,8 @@ impl<'a> Lower<'a> {
         let mut halves: Option<u32> = None;
         // a program in host waves of the console's size whose group a host wave may tile
         let mut relabel: Option<u32> = None;
+        // the paired form with one console wave in the group: its host group is one host wave
+        let mut paired_alone = false;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
         if let StageIo::Cs(cs) = x.native.io
             && paired
@@ -1275,6 +1295,7 @@ impl<'a> Lower<'a> {
             // (`with_paired_lanes`) a host wave of 32 for each console wave of the group, its
             // threads in a row; the caller has checked that the console's waves are full
             let waves = cs.threads.iter().product::<u32>().div_ceil(64);
+            paired_alone = waves == 1;
             s.threads = Some([32 * waves, 1, 1]);
             s.lds_dwords = cs.lds_bytes() / 4;
             if waves > 1 {
@@ -1517,6 +1538,8 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let lane_scalars = if paired { lane_scalars(p, x.res) } else { HashSet::new() };
+        let paired_lds_sync = paired_alone && paired_lds_sync(&lane_scalars);
         Lower {
             s,
             x,
@@ -1634,7 +1657,8 @@ impl<'a> Lower<'a> {
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
-            lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
+            lane_scalars,
+            paired_lds_sync,
             drop_in,
             drop_out,
         }
@@ -5381,7 +5405,8 @@ impl<'a> Lower<'a> {
         {
             let write = !name.starts_with("ds_read");
             if write || self.lds_last != Some(false) {
-                let (mode, void) = (self.s.m.i32(8), self.s.t.void);
+                let mode = if self.paired_lds_sync { meeting_mode() } else { 8 };
+                let (mode, void) = (self.s.m.i32(mode), self.s.t.void);
                 self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
             }
             self.lds_last = Some(write);
