@@ -118,10 +118,12 @@ pub(crate) fn cuts() -> bool {
     waits() && split() && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
 }
 
-/// Whether a present runs what queues still hold (on by default: a wait
-/// is not kept across frames). `VICTORY_WAIT_FORCE=0` keeps it held: for
-/// finding out whether the title's waits reach across its presents; a
-/// wait nothing ever meets then stops the title for good.
+/// Whether a present on the title's thread runs what queues still hold
+/// (on by default: a wait is not kept across frames). `VICTORY_WAIT_FORCE=0`
+/// keeps it held: for finding out whether the title's waits reach across
+/// its presents; a wait nothing ever meets then stops the title for good.
+/// A present in the line ([`async_present`]) never forces: it keeps the
+/// waits in order whatever this says.
 #[cfg(windows)]
 fn forces() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -368,14 +370,19 @@ pub(crate) fn behind() -> bool {
 /// off by default, and off while frames are captured, whose dumps are
 /// made at the present call).
 ///
-/// AN EXPERIMENT THAT DOES NOT WORK YET: in both runs with it (e20, e21)
+/// Still opt-in. Its first form passed every wait the queues held at the
+/// present call, met or not, as a present on the title's thread does
+/// ([`forces`]): in both runs with it (e20, e21) and again on 2026-11-25
 /// the title faulted in its own job threads some seconds into the first
 /// 3D scene (a null pointer, a read of reserved memory), and value waits
 /// were passed unmet ("a wait for a memory value was not met at a
-/// present", none without it). The title running a frame ahead of our
-/// thread is not covered by what the copy-back assumes: what shaders
-/// wrote goes into title memory when its flight lands, by then a frame
-/// later than the title has gone on, into memory it may use anew.
+/// present", none without it). Run with the waits kept in order
+/// (`VICTORY_WAIT_FORCE=0` then) it ran 175 s in the first room without a
+/// fault and with the picture right. So a present in the line keeps them:
+/// it stands in the line until every wait before it is met, and the title
+/// stands at its next present until this one was shown
+/// ([`previous_present_shown`]); only a wait that is still not met after
+/// two seconds is passed there, from the title's thread, as before.
 ///
 /// Why: a present ran the queues' lines on the title's render thread
 /// first, that is, it stood until our thread had prepared and sent every
@@ -388,9 +395,7 @@ pub(crate) fn behind() -> bool {
 /// card runs a frame the title submitted while the title makes the next.
 ///
 /// The title never gets more than one present ahead: its next present
-/// waits until this one was shown. A wait of the queue that stands before
-/// a present in the line is passed as a present always passed it
-/// ([`forces`]).
+/// waits until this one was shown.
 ///
 /// What it assumes beyond [`behind`]: title memory a frame's submissions
 /// read is not rewritten by the title while it records the next frame,
@@ -406,7 +411,10 @@ fn async_present() -> bool {
             && crate::host::late_free_present()
             && !capturing();
         if on {
-            tracing::info!("presents are shown in their queue's line by a thread of ours; the title goes on (VICTORY_ASYNC_PRESENT=1: an experiment, the title faulted with it)");
+            tracing::info!(
+                "presents are shown in their queue's line by a thread of ours, behind every wait before them; the title goes on \
+                 (VICTORY_ASYNC_PRESENT=1: opt-in until a longer run has shown it stable)"
+            );
         }
         on
     })
@@ -427,16 +435,24 @@ fn capturing() -> bool {
 #[cfg(windows)]
 static PRESENTS: (std::sync::Mutex<u64>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
 
-/// Since the last look: presents put in a line, presents shown at once
-/// (nothing was held), and the microseconds presents stood for the one
-/// before them.
+/// Since the last look ([`present_line`]): presents put in a line,
+/// presents shown at once (their queue held nothing), the microseconds
+/// presents stood for the one before them to be shown, the longest such
+/// stand, and the stands that reached two seconds and ran the lines from
+/// the title's thread, waits passed.
 #[cfg(windows)]
-pub(crate) static PRESENT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(crate) static PRESENT_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Before a present goes into its queue's line: the one before it has
-/// been shown. If it has not after two seconds (our thread stands at
-/// something only this thread moves), the lines are run from here, waits
-/// passed, as a present did before.
+/// been shown. If it has not after two seconds (our thread stands at a
+/// wait nothing has met, or at something only this thread moves), the
+/// lines are run from here, waits passed, as a present on this thread
+/// does ([`forces`]); counted and said.
+///
+/// The waits a line holds at the present call are not passed there (the
+/// first form of [`async_present`] passed them, and the title faulted): a
+/// present in the line comes to be shown only behind them, in order, as
+/// the title's queues meet them.
 #[cfg(windows)]
 fn previous_present_shown() {
     let started = std::time::Instant::now();
@@ -449,52 +465,42 @@ fn previous_present_shown() {
         pending = next;
         if *pending > 0 && started.elapsed() > std::time::Duration::from_secs(2) {
             drop(pending);
+            let forced = PRESENT_STATS[4].fetch_add(1, Ordering::Relaxed) + 1;
+            if forced <= 8 || forced.is_power_of_two() {
+                tracing::warn!(
+                    forced,
+                    "a present in the line was not shown within two seconds: the lines are run from the title's thread, waits passed"
+                );
+            }
             release_held_now(true);
             pending = lock(&PRESENTS.0);
             break;
         }
     }
     drop(pending);
-    PRESENT_STATS[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let us = started.elapsed().as_micros() as u64;
+    PRESENT_STATS[2].fetch_add(us, Ordering::Relaxed);
+    PRESENT_STATS[3].fetch_max(us, Ordering::Relaxed);
 }
 
-/// With [`async_present`], at a present call: the waits every queue holds
-/// at this moment are taken out of its line, met or not. That is what a
-/// present on the title's thread did ([`forces`]: it ran everything held,
-/// whatever its waits), decided at the same moment and for the same
-/// things; what the title adds to a line afterwards keeps its waits.
-/// (Passing waits when our thread came to them was not the same: by then
-/// the title had gone on, values it had set for the frame were changed
-/// again, and waits of its next frame were passed with them.)
+/// With the frame line, with [`async_present`]: what [`PRESENT_STATS`]
+/// counted over `frames`.
 #[cfg(windows)]
-fn pass_waits_held() {
-    if !forces() {
+pub(crate) fn present_line(frames: f64) {
+    if !async_present() {
         return;
     }
-    let queues = lock(&WAITING).clone();
-    for q in queues {
-        // SAFETY: a live queue: one released is taken off the list.
-        let line = unsafe { &(*(q as *const Queue)).held };
-        let mut held = lock(line);
-        held.retain(|h| match h {
-            Held::Wait(..) => false,
-            Held::Value(wait) => {
-                if !value_met(wait) {
-                    static SEEN: AtomicU64 = AtomicU64::new(0);
-                    if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
-                        tracing::warn!(
-                            queue = format_args!("{q:#x}"),
-                            ?wait,
-                            "a wait for a memory value was not met at a present: the queue runs on"
-                        );
-                    }
-                }
-                false
-            }
-            _ => true,
-        });
-    }
-    wake();
+    let [queued, at_once, stood, longest] = [0, 1, 2, 3].map(|i| PRESENT_STATS[i].swap(0, Ordering::Relaxed));
+    let forced = PRESENT_STATS[4].load(Ordering::Relaxed);
+    tracing::info!(
+        "presents in the line per frame (VICTORY_ASYNC_PRESENT=1): {:.2} put behind what their queue held, {:.2} shown at once \
+         (it held nothing); the title stood {:.1} ms a frame at its present for the one before to be shown, {:.1} ms at most; \
+         since the start {forced} stands of two seconds that passed the waits held (0 is what the present in the line needs)",
+        queued as f64 / frames,
+        at_once as f64 / frames,
+        stood as f64 / 1000.0 / frames,
+        longest as f64 / 1000.0,
+    );
 }
 
 /// Whether there is something for [`worker`] to look at.
@@ -1056,9 +1062,9 @@ extern "system" fn present(
     let in_line = async_present();
     #[cfg(windows)]
     if in_line {
-        // The present goes into the line below; at most one stands there.
+        // The present goes into the line below, behind the waits there;
+        // at most one stands there.
         previous_present_shown();
-        pass_waits_held();
     } else if crate::host::late() && !crate::host::late_free_present() {
         // (With `behind`: what the queues hold runs here first, and what
         // it sent is settled with the rest.)

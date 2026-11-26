@@ -476,10 +476,21 @@ less work in `State::bind` on the recording threads.
 
 ## Tried and not kept
 
-- `VICTORY_ASYNC_PRESENT=1` (the title records the next frame while the
-  last is sent): as it stands the title faults with it within two minutes,
-  because waits between its queues are passed at the present; a variant
-  that met them in order ran without a fault and no faster.
+- `VICTORY_ASYNC_PRESENT=1` (opt-in; the title records the next frame
+  while the last is sent): its first form passed every wait the queues
+  held at the present call, and the title faulted within two minutes. A
+  present in the line now keeps those waits in order: it is shown only
+  once every wait before it is met, and the title stands at its next
+  present until then; a stand that reaches two seconds passes the waits
+  from the title's thread, as a present there does, and is counted. Run
+  that way (2026-11-26, `VICTORY_WAIT_FORCE=0` then) it was 175 s clean
+  in the first room with the picture right, 63.6 against 65.2 ms a frame.
+  The line "presents in the line per frame" says how many went into a
+  line, how long the title stood at its present, and the two-second
+  stands since the start. For it to become the default: a run of the
+  prologue into the open world and some minutes there with that count at
+  0, no fault, no device loss, and the picture and the boat as without
+  it.
 - `VICTORY_HOT_BLOCKS=1`, `VICTORY_NAMED_WRITES=1`: not yet tried in a run.
   (`VICTORY_MERGE_FORGET` is gone: it dropped the kernel's written bits a
   landing set, and with them the title's of before the landing;
