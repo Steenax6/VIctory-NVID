@@ -7382,8 +7382,23 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            // (in the paired form rows 2 and 3 are the upper lanes')
-            let row_lane = if self.twin.is_some() { self.console_lane() } else { lane };
+            // Rows by console lane: rows 2 and 3 are lanes 32-63, which a console wave run as
+            // two host waves has in its upper host wave's lanes 0-31 (and the paired form in
+            // the upper lane of each thread).
+            let halves = self.x.native.wave64
+                && self.s.threads.is_some()
+                && self.s.mesh.is_none()
+                && self.s.wave_size != Some(64)
+                && host_max_wave() == 32;
+            let row_lane = if self.exchange.is_some() || self.twin.is_some() {
+                self.console_lane()
+            } else if halves {
+                let t = self.console_thread();
+                let k63 = k(self, 63);
+                self.s.m.bin(self.s.entry, Bin::And, t, k63)
+            } else {
+                lane
+            };
             let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
