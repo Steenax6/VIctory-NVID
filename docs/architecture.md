@@ -283,6 +283,48 @@ were measured).
 | S5 parts in a pipeline | the plan of part k+1 while the jobs of part k run; sends in order; `Host::submitted` no longer over bulk work; the line of all queues as one sequencer (avatarmanz/VIctory-7900XTX `queue/behind.rs` is the shape) | R1 to R6 | jobs of parts up to k not done at the send of k; a refresh not done under a write of ours over its pages; a copy's flights landed out of order | `host.rs`, `queue.rs`, `shadow.rs` |
 | S6a transfer heaps on title memory | for buffers in private memory that shaders write and the title's processor side does not (the census names them): a heap opened on the title's pages (`OpenExistingHeapFromAddress1`, `inplace.rs`) is the end of our copies only, card to title memory and title memory to card; shaders keep the copy in the card's memory. A block whose written bit the kernel holds, or with bytes still to go up, lands the old way | the bytes are in title memory before the flight is told, as now; a block the title wrote since goes through the merge byte by byte | in a check mode the same blocks fetched a second time into memory of ours: bytes that differ | `inplace.rs`, `shadow.rs`, `host.rs` `Host::relay_card_back`, `Host::card_before` |
 
+#### Where the stages stand (2026-11-27)
+
+| Stage | State |
+|---|---|
+| S1a | the pass's part is in; the flush's part was built and taken out (its check counted old bytes) |
+| S1b, the heap sync ahead | built on a branch of its own with a check that reads 0 and the picture right; four runs of one binary on a quiet machine, the switch alone changed: 61.9 and 59.0 ms a frame without it, 62.0 and 59.7 with it. Not merged: the passes over picked buffer views (one for every submit call) already read the heaps' records beside the submitting thread, whose heap sync fell from 16.3 to 3.1 ms a frame |
+| S1b, the refreshes ahead | not built |
+| S2 | built |
+| S3 | steps 1 to 3 built; the journal's step open |
+| S4, S5, S6a | not built |
+| S6b, landing only what is read | built on a branch, not merged: the moment of the fill is open |
+
+What a look at another tree added (avatarmanz/VIctory-7900XTX with the
+community's changes, 2026-11-27) and where it belongs: the title's bytes
+under flights on several threads (S4), refreshes ahead (S1b), guards left
+standing between frames (S3); copies of indirect arguments in one batch,
+new textures shown a frame later, textures kept over a release: outside
+the stages, each to be timed on its own.
+
+A timeline of the first room on that day (twelve frames of 62.2 ms): the
+submitting thread is 53.3 ms a frame in sends: refreshes of host copies
+12.9, the wait for flights 12.4, steps 8.8, the title's bytes under
+flights 5.0, write-watch asking 3.5, heap sync 3.1. The card is busy
+43.4 ms and has nothing of ours 18.8 ms, 14.2 of them while a send is
+prepared; the title's render thread stands 54.4 ms in its present and
+needs 6.4 ms from one present to the next. So the frame is still the
+sends, and what the card can gain is its 18.8 ms.
+
+The wait for flights is one thing: 0.8 times a frame a submission's
+refresh reads title memory that a flight in the air writes, and stands
+until that flight has landed (16 to 19 ms a frame; 0.4 times and 7 to 9
+ms before the passes ran for every submit call, whose refreshes read
+ranges shaders write). The frame did not grow with it (56.5 and 55.6 ms
+before, 57.4 with), since the card works through that wait.
+
+Order from here, each to be counted before it is built: which ranges
+those refreshes wait for and whether they need the landed bytes at all;
+the refreshes themselves (later passes of a frame name 2.2 GB of spans
+that earlier ones named, 60 to 80 MB of them on written pages: a cheap
+"nothing written since" would leave the asking out); then S4 and S5,
+which let a send be prepared while the flight before it runs.
+
 Built (2026-11-26, Package B; single runs on a machine other work ran
 on, twelve frames of a timeline each against run i_thinap1: indications):
 
