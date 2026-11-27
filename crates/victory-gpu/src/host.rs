@@ -9436,6 +9436,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         {
             crate::draw::picked_counts::line();
+            crate::pagemap::line(frames);
             standing_line();
             crate::descriptor::host::shown_line();
             crate::texture::staging_line();
