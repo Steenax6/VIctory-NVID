@@ -1442,12 +1442,34 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once, once the
-/// flights sent ahead whose shaders may write the pages have landed
+/// one constant page or of unmapped pages).
+///
+/// A command of a queue's: the console makes the mapping behind the work
+/// the title sent before it, to whichever queue. Here the mapping is one
+/// of the title's address space and is made at once, because the title's
+/// own code goes on to use the addresses. So everything it sent before
+/// must have taken its bytes first: what the queues' lines hold and is
+/// free to run is run from the caller's thread ([`before_sync`]), and the
+/// flights sent ahead whose shaders may write the pages land
 /// ([`crate::host::land_before_remap`]).
-/// shortcut: a submission a queue still holds behind a wait (`Held`) runs
-/// after the remap, where the console runs it before when it was sent to
-/// the same queue first (fxceless/victory-fork #1131).
+///
+/// Without the first of the two, a submission that only stood in a line
+/// ([`behind`]: every one, for some milliseconds) was prepared after the
+/// remap, and its host copies took the bytes of the pages mapped now, often
+/// not filled yet, for lists recorded against the pages mapped before. At
+/// the open world's entry, where the title maps pages by the thousand, a
+/// mesh program then read tables of zeros and the host device was lost: 9
+/// of 39 entries on 2026-11-27, none of 28 with the lines run first.
+///
+/// Tried and not kept: the copy standing in a line and made in its place
+/// while the title's thread goes on. In its own queue's line it changed
+/// nothing (5 of 14 entries lost: that line is empty, the lists stand in
+/// another queue's); placed among the submissions of every queue by the
+/// order the title made them in, 4 of 7 were lost: the title uses the
+/// addresses right after the call.
+/// shortcut: a submission a queue still holds behind a wait that is not
+/// met runs after the remap, where the console runs it before when it was
+/// sent first (fxceless/victory-fork #1131).
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1466,9 +1488,12 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    // The console maps the pages behind the work sent before: what that
-    // work's shaders write must land in the pages mapped now, not in those
-    // mapped next (flights sent ahead land after their submission returned).
+    // What the title sent before takes its bytes first (see above).
+    #[cfg(windows)]
+    before_sync();
+    // And what that work's shaders write must land in the pages mapped
+    // now, not in those mapped next (flights sent ahead land after their
+    // submission returned).
     #[cfg(windows)]
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
