@@ -956,9 +956,9 @@ pub(crate) fn picked_found(call: u64) -> Vec<PickedRange> {
 /// had asked for no pass (prepared with one asked for there and waited
 /// for); the buffer views written and not made when the submission had
 /// its passes' refreshes: they were written after its submit call; and
-/// the buffer views a pass looked at and found no host copy for, which is
-/// what a list can still name and read nothing of (their memory has no
-/// copy, or the title wrote the slot again while the pass ran).
+/// the buffer views a pass looked at that read title memory and for which
+/// it found no host copy, which is what a list can still name and read
+/// nothing of.
 #[cfg(feature = "diagnostics")]
 pub(crate) mod picked_counts {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -972,12 +972,10 @@ pub(crate) mod picked_counts {
     /// Since the start: 0, 3 and 8 of [`COUNTS`].
     static EVER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-    /// A pass looked at slots and found no copy for `views` buffer views.
-    pub(super) fn left(views: u64) {
-        if views > 0 {
-            COUNTS[8].fetch_add(views, Relaxed);
-            EVER[2].fetch_add(views, Relaxed);
-        }
+    /// A pass found no host copy for a buffer view that reads title memory.
+    pub(super) fn left() {
+        COUNTS[8].fetch_add(1, Relaxed);
+        EVER[2].fetch_add(1, Relaxed);
     }
 
     /// A submission with `lists` such lists (`binds` binds) is prepared and
@@ -1006,9 +1004,9 @@ pub(crate) mod picked_counts {
              ahead of its lists; {} of them had no pass asked for and waited for one asked for there; {:.0} buffer views \
              a submission were written and not made by then (written after its submit call: its lists do not name them); \
              {:.1} submissions stood in a line not begun and {:.1} were in the air on average then (at most {} in the air: \
-             none of them names a view a later pass makes); the passes found no host copy for {} buffer views they looked \
-             at (their memory has none, or the slot was written again meanwhile); since the start: {} such submissions, \
-             {} without a pass asked for, {} views without a copy",
+             none of them names a view a later pass makes); the passes found no host copy for {} buffer views that read \
+             title memory (a list that names one reads nothing there); since the start: {} such submissions, {} without \
+             a pass asked for, {} views without a copy",
             c[0],
             c[1],
             c[2],
@@ -1103,11 +1101,15 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
                     let mut out: Found = Vec::with_capacity(chunk.len());
                     let _together = crate::descriptor::host::Together::begin();
                     for index in chunk {
-                        let range = heap
-                            .handle(index)
-                            .and_then(|handle| host.mirror_passed(index, handle))
-                            .and_then(|view| crate::descriptor::host::buffer_copy(&view))
+                        let view = heap.handle(index).and_then(|handle| host.mirror_passed(index, handle));
+                        let range = view
+                            .as_ref()
+                            .and_then(crate::descriptor::host::buffer_copy)
                             .map(|(shadow, address, len)| (shadow, address, address + len));
+                        #[cfg(feature = "diagnostics")]
+                        if range.is_none() && view.as_ref().is_some_and(crate::descriptor::host::buffer_reads) {
+                            picked_counts::left();
+                        }
                         out.push((index, range));
                     }
                     *found[part].lock().unwrap_or_else(|e| e.into_inner()) = out;
@@ -1160,6 +1162,10 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                #[cfg(feature = "diagnostics")]
+                if crate::descriptor::host::buffer_reads(&view) {
+                    picked_counts::left();
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1168,13 +1174,6 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
             }
             ranges.insert(index, (shadow, address, address + len));
         }
-    }
-    // Diagnostics: the buffer views the pass looked at and found no copy
-    // to bring up to date for.
-    #[cfg(feature = "diagnostics")]
-    {
-        let none: Vec<u32> = slots.iter().copied().filter(|index| !ranges.contains_key(index)).collect();
-        picked_counts::left(host.buffer_views_among(&none));
     }
     let views = ranges.len() as u32;
     // Per host copy, the span its picked views cover: of all of them in
