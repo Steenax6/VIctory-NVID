@@ -481,6 +481,13 @@ on in these runs and not in those and holds the frame at 140 ms, or of
 the title's threads no longer waiting for the guards, is not told apart
 here: it wants the thin check alone on this tree.
 
+Of S3's fourth step, built (2026-11-27): the journal answers a refresh
+by the copy's stamps, a summary of the highest number noted for each 64
+pages of its table passing by what is not newer (`watch.rs` `Pages`,
+`After`; `shadow.rs` `pages_known`; checked by `VICTORY_JOURNAL_CHECK=1`,
+see `docs/switches.md`). An answer held 20 entries on average in the
+first room and the refresh acted on 0.3 of them; it holds those only now.
+
 Open of S3, its fourth step: the journal by chunk of its table, and the
 standing asking the burst's. The journal's lock is still one, held
 around each asking with the guards' check inside it, and checks do not
