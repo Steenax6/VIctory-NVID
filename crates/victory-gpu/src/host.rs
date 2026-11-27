@@ -82,6 +82,12 @@ pub(crate) fn submissions_in_flight() -> u64 {
     STARTED.load(Ordering::Acquire).saturating_sub(FINISHED.load(Ordering::Acquire))
 }
 
+/// The number of the last submission begun, and of the last finished.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn submissions_numbered() -> [u64; 2] {
+    [STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire)]
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -9431,6 +9437,8 @@ impl Meter {
         {
             crate::draw::picked_counts::line();
             standing_line();
+            crate::descriptor::host::shown_line();
+            crate::texture::staging_line();
         }
         crate::shadow::exact_line(frames);
         crate::draw::seen_line(frames);
