@@ -2736,6 +2736,13 @@ impl State {
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
+        // The slots held until their texture's first upload had run on the
+        // card (`crate::descriptor::after`) that are settled now.
+        crate::descriptor::after::flip(std::ptr::from_ref(host) as usize, |index| {
+            if let Some(handle) = heap.handle(index) {
+                let _ = host.mirror(index, handle, true);
+            }
+        });
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
         if room {
@@ -2994,8 +3001,11 @@ impl State {
                     );
                 }
             }
+            // (Before a bake draw, which reads the slot once in this list
+            // after the upload, the slot is made at once.)
             let view = heap.handle(index).and_then(|handle| {
-                let _by = crate::descriptor::after::by(crate::descriptor::after::PASS);
+                use crate::descriptor::after::{AT_ONCE, PASS, by};
+                let _by = by(if bake { AT_ONCE } else { PASS });
                 host.mirror(index, handle, true)
             });
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
@@ -3899,27 +3909,31 @@ impl State {
         known.then_some(key)
     }
 
-    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+    /// Brings the view of a table entry bound in the heap up to date for
+    /// the draw. True if its slot is held until its texture is settled
+    /// (`crate::descriptor::after`): the draw then reads the table made
+    /// afresh, where the view is made for it.
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) -> bool {
         let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
+            return false;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
         let Some(heap) = self.heap_of(handle) else {
-            return;
+            return false;
         };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
+            return false;
         };
         if let Some(key) = self.slot_known(host, index, handle) {
             self.ready(list, u.kind, key, None);
-            return;
+            return false;
         }
         let made = {
             let _by = crate::descriptor::after::by(crate::descriptor::after::TABLE);
             host.mirror_key(index, handle, true)
         };
         let (Some(view), key) = made else {
-            return;
+            return false;
         };
         // (The record the slot is made from, unless another thread made it
         // from another meanwhile: then nothing is noted.)
@@ -3936,6 +3950,7 @@ impl State {
         if made {
             self.seen.slots.insert((std::ptr::from_ref(host) as usize, index), key);
         }
+        !made && crate::descriptor::after::held(std::ptr::from_ref(host) as usize, index)
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -4036,10 +4051,19 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        // A table with a slot held until its texture is settled is made
+        // afresh too: the draw reads the new view there, in the list that
+        // uploads its texture, while lists in the air read the held slot.
+        let mut held = false;
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+            if !fresh.contains(&u.slot) && self.table_entry(list, u, compute) {
+                fresh.push(u.slot);
+                held = true;
             }
+        }
+        if held {
+            fresh.sort_unstable();
+            fresh.dedup();
         }
         let mut made = std::mem::take(&mut self.scratch.made);
         made.clear();

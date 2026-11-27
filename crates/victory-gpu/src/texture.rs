@@ -1641,6 +1641,9 @@ pub(crate) fn decide_uploads(uploads: &[TextureUpload]) -> Vec<Copies> {
         staging.uploaded.store(true, Relaxed);
         staging.dirty.store(false, Relaxed);
         staging.copied.store(upload.copied, Relaxed);
+        // What a slot that shows the texture reads is settled once this
+        // submission has run, copied or not (`crate::descriptor::after`).
+        crate::descriptor::after::uploaded(&upload.copy.texture);
         let by_level = &crate::census::BY_LEVEL;
         if subs == 0 {
             by_level[crate::census::L_NONE].fetch_add(1, Relaxed);
@@ -1648,7 +1651,6 @@ pub(crate) fn decide_uploads(uploads: &[TextureUpload]) -> Vec<Copies> {
             by_level[crate::census::L_SOME].fetch_add(1, Relaxed);
             by_level[crate::census::L_COPIED].fetch_add(staging.bytes_of(subs), Relaxed);
             staging.mark_sent(sent, subs);
-            crate::descriptor::after::uploaded(&upload.copy.texture);
             #[cfg(feature = "diagnostics")]
             staging.copy_in.store(crate::host::submissions_numbered()[0], Relaxed);
             copies.push((upload.copy.clone(), staging.clone(), subs));

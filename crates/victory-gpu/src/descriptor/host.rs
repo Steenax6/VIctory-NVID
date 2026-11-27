@@ -3387,6 +3387,26 @@ impl HostHeap {
                     return Ok(Some(view));
                 }
             }
+            // A texture whose first upload has not run on the card, or made
+            // while submissions begun before it may still run: lists in the
+            // air read this slot by index ([`super::after`]). It shows what
+            // it showed, where that can stand for the new texture, or
+            // nothing, and the new view once the texture is settled.
+            if !later
+                && !self.sampler
+                && is_texture_view(&view)
+                && let Some(now) = super::after::hold(std::ptr::from_ref(self) as usize, index, key, &view)
+            {
+                let shown = made(index);
+                let stands = view_at(shown as u32, (shown >> 32) as u32)
+                    .is_some_and(|old| is_texture_view(&old) && kin(&old, &view) <= keep_shown());
+                if now && !stands {
+                    super::after::held_null();
+                    self.shown_null(index, shown, NULL_WRITTEN);
+                    self.unmake(index);
+                }
+                return Ok(Some(view));
+            }
             if later {
                 self.shown_null(index, made(index), NULL_WRITTEN);
             } else {

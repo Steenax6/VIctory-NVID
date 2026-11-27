@@ -83,7 +83,6 @@ pub(crate) fn submissions_in_flight() -> u64 {
 }
 
 /// The number of the last submission begun, and of the last finished.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn submissions_numbered() -> [u64; 2] {
     [STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire)]
 }
