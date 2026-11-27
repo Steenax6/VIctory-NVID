@@ -222,6 +222,14 @@ fn walk(
                     hit(2, vec![(*address, *len)], Some(shadow.span()));
                 }
             }
+            // (Made on the card: only a flight's copy still to land in its
+            // source waits, as in `blocked_by`; one made on the CPU as well
+            // is not told apart here.)
+            &Step::Card(_, src, len) => {
+                if waits(src, len) {
+                    hit(0, vec![(src, len)], None);
+                }
+            }
             Step::GpuWrite(..) | Step::Host(_) => {}
         }
     }
