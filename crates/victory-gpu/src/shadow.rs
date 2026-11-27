@@ -101,6 +101,31 @@ pub(crate) struct Shadow {
     /// asking ([`Shadow::landed_pages`]); looked at by the refresh that
     /// reads them.
     landed_check: Mutex<std::collections::HashMap<usize, u64>>,
+    /// Diagnostics, for the report of a removed device: the last refresh of
+    /// a range of the copy where no shader writes ([`Shadow::update_free`]),
+    /// as [`Refreshed`] says.
+    #[cfg(feature = "diagnostics")]
+    refreshed: Mutex<Refreshed>,
+}
+
+/// Diagnostics: what a copy's last refresh did ([`Shadow::lag_report`]).
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, Default)]
+struct Refreshed {
+    /// The frame, the range, and how it went: 0 none yet, 1 left out by
+    /// events, 2 asked (with the asking's number and the bytes copied),
+    /// 3 copied whole (memory not watched).
+    frame: u64,
+    from: usize,
+    to: usize,
+    how: u8,
+    asking: u64,
+    bytes: usize,
+    /// The last refresh that asked, as above (frame, range, asking, bytes).
+    asked: (u64, usize, usize, u64, usize),
+    /// When the last refresh and the last that asked were made
+    /// (`crate::host::now_us`).
+    us: (u64, u64),
 }
 
 /// Who asks for a refresh of a copy ([`Shadow::refresh_as`]): a draw for
@@ -3308,6 +3333,8 @@ impl Shadow {
             asked_by: AtomicU8::new(0),
             events_seen: Mutex::default(),
             landed_check: Mutex::default(),
+            #[cfg(feature = "diagnostics")]
+            refreshed: Mutex::default(),
         }
     }
 
@@ -4059,20 +4086,34 @@ impl Shadow {
         if by_event == 1 && matches!(looked, Some((_, true, true, _))) {
             let left_out = Checked { inside: true, quiet: true, quiet_locked: true, uncounted: true, copied: None };
             crate::watch::event_checked(left_out, (self.start, self.len), from, to, None);
+            #[cfg(feature = "diagnostics")]
+            self.note_refreshed(from, to, 1, 0, 0);
             return 0;
         }
         if watched {
             // The asking looks at the counts again with its locks held:
             // what it finds is then what they stand for.
             let mut look = Look { seen: looked.map(|l| l.0), ..Look::default() };
+            // (The asking's number, for the diagnostics' record.)
+            let mut asking = 0u64;
             let copied = if refresh_parts() || refresh_kernel_pages() {
-                crate::watch::writes_fine_look(from, to, true, &mut look).map(|(now, written)| self.copy_stale_fine(from, to, now, &written))
+                crate::watch::writes_fine_look(from, to, true, &mut look).map(|(now, written)| {
+                    asking = now;
+                    self.copy_stale_fine(from, to, now, &written)
+                })
             } else {
                 crate::watch::writes_fine_look(from, to, true, &mut look)
                     .map(|(now, written)| (now, written.into_iter().map(|(p, w)| (p, w.at)).collect::<Vec<_>>()))
-                    .map(|(now, written)| self.copy_stale(from, to, now, &written))
+                    .map(|(now, written)| {
+                        asking = now;
+                        self.copy_stale(from, to, now, &written)
+                    })
             };
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = asking;
             if let Some(copied) = copied {
+                #[cfg(feature = "diagnostics")]
+                self.note_refreshed(from, to, 2, asking, copied);
                 if let Some((_, inside, quiet, before)) = looked {
                     let checked = Checked {
                         inside,
@@ -4105,6 +4146,8 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+        #[cfg(feature = "diagnostics")]
+        self.note_refreshed(from, to, 3, 0, to - from);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
@@ -4216,6 +4259,86 @@ impl Shadow {
             // The first bytes of the next 64 KiB block.
             at = (at / PAGE + 1) * PAGE;
         }
+    }
+
+    /// Diagnostics: notes a refresh of `[from, to)` ([`Refreshed`]).
+    #[cfg(feature = "diagnostics")]
+    fn note_refreshed(&self, from: usize, to: usize, how: u8, asking: u64, bytes: usize) {
+        let frame = crate::frame::current();
+        let mut r = self.refreshed.lock().unwrap_or_else(|e| e.into_inner());
+        let now = crate::host::now_us();
+        let asked = if how == 2 { (frame, from, to, asking, bytes) } else { r.asked };
+        let us = (now, if how == 2 { now } else { r.us.1 });
+        *r = Refreshed { frame, from, to, how, asking, bytes, asked, us };
+    }
+
+    /// Diagnostics, for the report of a removed device: what the copy holds
+    /// of the 64 KiB page at title address `at` and of how it was brought
+    /// up to date: the page's stamp (the asking after which it was last
+    /// copied) and the part taken of it, whether the memory is watched,
+    /// what the copy remembers by events, the ranges shaders may write over
+    /// the page, and the last refreshes. Locks are only taken if they can
+    /// be had at once.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn lag_report(&self, at: usize) -> String {
+        use std::fmt::Write;
+        let page = at / PAGE;
+        let i = page.wrapping_sub(self.start as usize / PAGE);
+        let mut out = format!("copy {} {:#x}+{:#x}", self.id, self.start, self.len);
+        let _ = write!(
+            out,
+            " (watched {}, card {}, window {}, frame now {})",
+            self.watched.load(Ordering::Relaxed),
+            self.card.is_some(),
+            self.window,
+            crate::frame::current()
+        );
+        match self.copied.try_lock() {
+            Ok(c) => {
+                let _ = write!(out, ": page stamp {:?}", c.get(i));
+            }
+            Err(_) => out.push_str(": stamps locked"),
+        }
+        if let Ok(p) = self.partial.try_lock()
+            && let Some((stamp, runs)) = p.get(&i)
+        {
+            let _ = write!(out, ", taken in part after {stamp}: {runs:?}");
+        }
+        match self.events_seen.try_lock() {
+            Ok(seen) => {
+                let _ = write!(out, "; {}", seen.describe());
+            }
+            Err(_) => out.push_str("; seen locked"),
+        }
+        if let Ok(p) = self.pending.try_lock() {
+            let over: Vec<String> =
+                p.iter().filter(|&&(a, e)| a < (page + 1) * PAGE && e > page * PAGE).map(|(a, e)| format!("{a:#x}..{e:#x}")).collect();
+            if !over.is_empty() {
+                let _ = write!(out, "; shaders may write {}", over.join(" "));
+            }
+        }
+        if let Ok(r) = self.refreshed.try_lock() {
+            let how = ["none", "left out by events", "asked", "copied whole"][usize::from(r.how.min(3))];
+            let now = crate::host::now_us();
+            let ago = |us: u64| now.saturating_sub(us) as f64 / 1000.0;
+            let _ = write!(
+                out,
+                "; last refresh frame {} {:#x}..{:#x} {how} (asking {}, {} bytes) {:.1} ms ago; last that asked frame {} {:#x}..{:#x} asking {} {} bytes {:.1} ms ago",
+                r.frame,
+                r.from,
+                r.to,
+                r.asking,
+                r.bytes,
+                ago(r.us.0),
+                r.asked.0,
+                r.asked.1,
+                r.asked.2,
+                r.asked.3,
+                r.asked.4,
+                ago(r.us.1)
+            );
+        }
+        out
     }
 
     /// Diagnostics, for the report of a removed device: `len` bytes of the

@@ -479,12 +479,40 @@ pub(crate) fn reads_against_title(ranges: &[Read]) -> String {
         })
         .collect();
     format!(
-        "; its reads against title memory now: {} ranges ({} MB) of host copies, {} differ{}{}",
+        "; its reads against title memory now: {} ranges ({} MB) of host copies, {} differ{}{}{}",
         ranges.len(),
         bytes >> 20,
         differ.len(),
         if shown.is_empty() { "" } else { ": " },
-        shown.join("; ")
+        shown.join("; "),
+        why_behind(ranges, &differ)
     )
+}
+
+/// For [`reads_against_title`]: of the first ranges that differ (by words
+/// differing), the first 64 KiB block that differs, with what the guards,
+/// the journal, Windows and the copy hold of it now: why the copy can be
+/// behind title memory there.
+#[cfg(feature = "diagnostics")]
+fn why_behind(ranges: &[Read], differ: &[(usize, usize, usize, u64, bool, Vec<(usize, u32, u32)>)]) -> String {
+    /// Ranges looked at.
+    const MOST: usize = 8;
+    let mut out = String::new();
+    for (k, (_, address, len, copy, _, first)) in differ.iter().take(MOST).enumerate() {
+        let Some(&(at, _, _)) = first.first() else {
+            continue;
+        };
+        let Some((shadow, _, _)) = ranges.iter().find(|(s, a, l)| s.id() == *copy && a == address && l == len) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "; why {k} ({address:#x}, first differing word {at:#x}): {}; {}; {}; {}",
+            crate::watch::block_report(at),
+            crate::inplace::view_report(at),
+            crate::watch::query_report(at),
+            shadow.lag_report(at)
+        ));
+    }
+    out
 }
 

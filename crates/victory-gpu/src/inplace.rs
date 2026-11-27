@@ -403,6 +403,19 @@ pub(crate) fn others_of(blocks: impl IntoIterator<Item = usize>) -> Vec<(usize, 
     out
 }
 
+/// Diagnostics: the view the runtime told of at `at` (its address, bytes,
+/// section and offset) and how many views show the page there.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn view_report(at: usize) -> String {
+    let v = views();
+    let Some((&base, &(bytes, section, offset))) = v.views.range(..=at).next_back().filter(|(base, (bytes, _, _))| at - **base < *bytes) else {
+        return "no view told there".to_owned();
+    };
+    let within = (at - base) / K64 * K64;
+    let shown = v.pages.get(&(section, offset + within as u64)).map_or(0, Vec::len);
+    format!("in view {base:#x}+{bytes:#x} of section {section:#x} at {offset:#x}; its page is shown in {shown} views")
+}
+
 /// The title views that show any of the physical bytes `[offset, offset +
 /// len)` of `section`, as `(address, bytes)` ranges in address order; not
 /// those of a page shown in very many views (`MANY_VIEWS`).
