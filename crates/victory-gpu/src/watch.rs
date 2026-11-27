@@ -1403,6 +1403,12 @@ struct Region {
     /// such a block and notes it clean makes the other views read-only
     /// first: see [`guard_fine`].
     apart: Bits,
+    /// The openings under way on blocks of the region ([`Marks::opening`],
+    /// summed), for a look without its lock ([`openings_done`]). Raised
+    /// before the block's guard is taken away and lowered after the block
+    /// is writable: a look that finds a block not guarded and this 0 finds
+    /// it writable as far as the guards go.
+    openings: std::sync::atomic::AtomicU32,
     marks: Mutex<Marks>,
 }
 
@@ -1430,6 +1436,7 @@ impl Region {
             views: Bits::new(),
             partly: Bits::new(),
             apart: Bits::new(),
+            openings: std::sync::atomic::AtomicU32::new(0),
             marks: Mutex::new(Marks { dirty: [0; REGION], opening: [0; REGION] }),
         }
     }
@@ -1664,10 +1671,12 @@ fn guard_line(submission: u64) {
         c[10], c[9], c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[11], c[12], c[13], c[14], c[15], c[16], same[0], same[1] / 1e6
     );
     let [waited, found, vain] = [0, 1, 2].map(|i| OPENED_BESIDE[i].load(Relaxed));
-    if waited + found + vain > 0 {
+    let [stood, stood_vain] = [0, 1].map(|i| OPENINGS_AWAITED[i].load(Relaxed));
+    if waited + found + vain + stood > 0 {
         tracing::info!(
             "guards, since the start: {waited} faults on a block another thread was opening waited for it, {found} found it \
-             opened by the time they asked, {vain} waited in vain"
+             opened by the time they asked, {vain} waited in vain; {stood} openings for a write of ours or the kernel's \
+             waited for another thread's opening of a block of theirs, {stood_vain} of them in vain"
         );
     }
 }
@@ -2298,6 +2307,25 @@ fn settle(failed: &Failed, epoch: Option<Epoch>) {
     }
 }
 
+/// An opening of the block at `i` of `r` begins: noted with the region's
+/// lock held, before anything else of the block changes
+/// ([`Region::openings`]).
+fn opening_begins(r: &Region, m: &mut Marks, i: usize) {
+    if m.opening[i] < u8::MAX {
+        r.openings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        m.opening[i] += 1;
+    }
+}
+
+/// The opening is said done (the region's lock held): its change of
+/// protection has been made.
+fn opening_ends(r: &Region, m: &mut Marks, i: usize) {
+    if m.opening[i] > 0 {
+        m.opening[i] -= 1;
+        r.openings.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The block at `i` of `r` is no longer guarded (opened, or its protection
 /// failed): counted, as everything is that changes what a check finds.
 fn unguard(r: &Region, m: &mut Marks, i: usize, block: usize) {
@@ -2356,7 +2384,7 @@ fn reopen_stray(at: usize) -> Fault {
             return Fault::Again;
         }
         // (No check guards it while this stands.)
-        m.opening[i] = m.opening[i].saturating_add(1);
+        opening_begins(r, m, i);
         for &view in &others {
             if mark_block(&mut l, view, FULL)
                 && let Some((r, _, i)) = l.at(view)
@@ -2376,8 +2404,8 @@ fn reopen_stray(at: usize) -> Fault {
         // SAFETY: a block of title view memory we made read-only.
         && unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
     let mut l = Locked::blocks(Holder::Fault, [block]);
-    if let Some((_, m, i)) = l.at(block) {
-        m.opening[i] = m.opening[i].saturating_sub(1);
+    if let Some((r, m, i)) = l.at(block) {
+        opening_ends(r, m, i);
     }
     if !opened {
         return Fault::No;
@@ -2542,10 +2570,20 @@ fn uncommitted_end(block: usize) -> usize {
 /// after the locks are let go; until that is said done no check guards
 /// them again ([`Marks::opening`]).
 fn open(by: Holder, start: usize, end: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     if start >= end {
         return 0;
     }
+    let opened = open_own(by, start, end);
+    // What another thread is opening there is writable when this returns
+    // as well: the write this is for may be the kernel's, which no fault
+    // of ours answers.
+    openings_done(by, start / BLOCK, end.div_ceil(BLOCK));
+    opened
+}
+
+/// [`open`] for the blocks this call finds guarded.
+fn open_own(by: Holder, start: usize, end: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (guarded, shared) = guarded_and_shared(start / BLOCK, end.div_ceil(BLOCK));
     if guarded.is_empty() && shared.is_empty() {
         return 0;
@@ -2563,8 +2601,8 @@ fn open(by: Holder, start: usize, end: usize) -> usize {
             };
             if r.protected.has(1 << i) {
                 count(6);
+                opening_begins(r, m, i);
                 unguard(r, m, i, block);
-                m.opening[i] = m.opening[i].saturating_add(1);
                 opened.push(block);
             }
         }
@@ -2600,11 +2638,53 @@ fn open(by: Holder, start: usize, end: usize) -> usize {
     }
     let mut l = Locked::blocks(by, opened.iter().copied());
     for &block in &opened {
-        if let Some((_, m, i)) = l.at(block) {
-            m.opening[i] = m.opening[i].saturating_sub(1);
+        if let Some((r, m, i)) = l.at(block) {
+            opening_ends(r, m, i);
         }
     }
     opened.len()
+}
+
+/// Since the start: calls of [`open`] that waited for another thread's
+/// opening of a block of theirs; those that waited [`BESIDE_WAIT`] in vain.
+pub(crate) static OPENINGS_AWAITED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Waits until no opening is under way on a block of `[first, last)`.
+///
+/// A block another thread has noted open and not yet made writable is no
+/// guard's any more: [`open`] finds nothing to do for it. A write of the
+/// processor's then faults and is answered ([`opened_beside`]); the
+/// kernel's does not fault into a handler, it fails (a read of the title's
+/// into its own memory then ends with an error, and the title's loading
+/// with it). So the caller stands here until the other thread has said its
+/// opening done. Regions with none under way are passed without a lock.
+fn openings_done(by: Holder, first: usize, last: usize) {
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    let mut began = None;
+    loop {
+        let mut busy: Vec<(usize, u64)> = Vec::new();
+        each_region(first, last, |index, r, want| {
+            if r.openings.load(SeqCst) != 0 {
+                busy.push((index, want));
+            }
+        });
+        let under_way = busy.into_iter().any(|(index, want)| {
+            let mut l = Locked::take(by, vec![index]);
+            l.at(index * REGION).is_some_and(|(_, m, _)| each_bit(want).any(|i| m.opening[i] != 0))
+        });
+        if !under_way {
+            return;
+        }
+        let began = *began.get_or_insert_with(|| {
+            OPENINGS_AWAITED[0].fetch_add(1, Relaxed);
+            std::time::Instant::now()
+        });
+        if began.elapsed() > BESIDE_WAIT {
+            OPENINGS_AWAITED[1].fetch_add(1, Relaxed);
+            return;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// The kernel pages of `block` that `[start, end)` touches, a bit each
@@ -2745,7 +2825,7 @@ fn open_tail(at: usize) -> Fault {
         }
         note_dirty(r, m, i, block, mask);
         r.partly.set(b);
-        m.opening[i] = m.opening[i].saturating_add(1);
+        opening_begins(r, m, i);
         for &view in &others {
             if mark_block(&mut l, view, mask)
                 && let Some((r, _, i)) = l.at(view)
@@ -2764,7 +2844,7 @@ fn open_tail(at: usize) -> Fault {
     let opened = unsafe { VirtualProtect(from as *const _, (block + 1) * BLOCK - from, PAGE_READWRITE, &mut old) } != 0;
     let mut l = Locked::blocks(Holder::Fault, [block]);
     if let Some((r, m, i)) = l.at(block) {
-        m.opening[i] = m.opening[i].saturating_sub(1);
+        opening_ends(r, m, i);
         if !opened && r.protected.has(b) {
             // Not to be opened (its memory went meanwhile): no guard's
             // any more. The write faults once more and is the title's.
@@ -4182,15 +4262,15 @@ mod tests {
             // SAFETY: a block of our allocation; only its protection changes.
             assert_ne!(unsafe { VirtualProtect(p as *const _, BLOCK, how, &mut old) }, 0);
         };
-        let opening = |by: i8| {
+        let opening = |begins: bool| {
             let mut l = Locked::blocks(Holder::Opening, [block]);
-            let (_, m, i) = l.at(block).expect("its region");
-            m.opening[i] = m.opening[i].saturating_add_signed(by);
+            let (r, m, i) = l.at(block).expect("its region");
+            if begins { opening_begins(r, m, i) } else { opening_ends(r, m, i) }
         };
         // As `open` leaves a guarded block when its locks are let go: no
         // guard's, an opening under way, read-only still.
         protect(PAGE_READONLY);
-        opening(1);
+        opening(true);
         let before = OPENED_BESIDE[0].load(Relaxed);
         let writer = std::thread::spawn(move || {
             // SAFETY: inside our allocation; the write faults and waits.
@@ -4200,7 +4280,7 @@ mod tests {
         assert!(!writer.is_finished(), "the write waits for the opening");
         // The opening's second step.
         protect(PAGE_READWRITE);
-        opening(-1);
+        opening(false);
         writer.join().expect("the write went through");
         // SAFETY: inside our allocation.
         assert_eq!(unsafe { ((p + 3 * KERNEL_PAGE) as *const u8).read_volatile() }, 7);
@@ -4210,6 +4290,58 @@ mod tests {
         protect(PAGE_READONLY);
         assert!(!opened_beside(p + 3 * KERNEL_PAGE), "read-only with no opening under way: not the guards'");
         protect(PAGE_READWRITE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// An opening for a write of the kernel's does not return while another
+    /// thread is opening a block of its range: the kernel's write meets no
+    /// read-only page (it would fail there with no fault of ours).
+    #[test]
+    fn an_opening_waits_for_another_threads_opening_of_its_blocks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: private memory of our own, of two blocks.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let block = p / BLOCK;
+        let protect = |how: u32| {
+            let mut old = 0;
+            // SAFETY: a block of our allocation; only its protection changes.
+            assert_ne!(unsafe { VirtualProtect(p as *const _, BLOCK, how, &mut old) }, 0);
+        };
+        let opening = |begins: bool| {
+            let mut l = Locked::blocks(Holder::Opening, [block]);
+            let (r, m, i) = l.at(block).expect("its region");
+            if begins { opening_begins(r, m, i) } else { opening_ends(r, m, i) }
+        };
+        // As `open` leaves a guarded block when its locks are let go.
+        protect(PAGE_READONLY);
+        opening(true);
+        let before = OPENINGS_AWAITED[0].load(Relaxed);
+        let writer = std::thread::spawn(move || {
+            writing(p + 100, 3 * KERNEL_PAGE);
+            // The kernel's write, as a read of the title's into its memory
+            // makes it: no fault of ours, it fails on a read-only page.
+            let bytes = [7u8; 16];
+            let mut done = 0;
+            // SAFETY: inside our allocation, from a buffer of that length.
+            let ok = unsafe { WriteProcessMemory(GetCurrentProcess(), (p + 100) as *const _, bytes.as_ptr().cast(), bytes.len(), &mut done) };
+            ok != 0 && done == bytes.len()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!writer.is_finished(), "the opening waits for the other thread's");
+        // The other thread's second step.
+        protect(PAGE_READWRITE);
+        opening(false);
+        assert!(writer.join().expect("no panic"), "the kernel wrote");
+        // SAFETY: inside our allocation.
+        assert_eq!(unsafe { ((p + 100) as *const u8).read_volatile() }, 7);
+        assert!(OPENINGS_AWAITED[0].load(Relaxed) > before, "counted as an opening that waited");
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
