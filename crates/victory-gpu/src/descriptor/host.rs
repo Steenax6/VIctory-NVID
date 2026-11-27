@@ -2453,6 +2453,13 @@ impl HostHeap {
         self.buffers.lock().unwrap_or_else(|e| e.into_inner()).to_vec()
     }
 
+    /// One pass of a round over the slots that hold buffer views
+    /// ([`SlotSet::pass_of`]): those of part `part` of `parts`, and the
+    /// `written` slots besides.
+    pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32, written: Vec<u32>) -> Vec<u32> {
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).pass_of(part, parts, written)
+    }
+
     /// The title slots whose buffer view was written, or went, since the
     /// last call (in the order first written; the set this was gave them
     /// in no order).

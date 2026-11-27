@@ -1023,6 +1023,20 @@ pub(crate) mod picked_counts {
     }
 }
 
+/// Frames after which every buffer slot of a heap was looked at again
+/// without a write ([`picked_pass`]).
+const HEAP_ROUND: u64 = 16;
+
+/// Whether the slots looked at again for no write are a sixteenth of them at
+/// every frame's first pass (`VICTORY_HEAP_SPREAD=0`: all of them at every
+/// sixteenth frame, as before). All at once was one submission waiting 48 ms
+/// for a pass over 232,914 slots, and 130 ms at most in a play session
+/// against a median of 5 ms.
+fn heap_spread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SPREAD").is_none_or(|v| v != "0"))
+}
+
 /// One pass over the buffer views of `heap` ([`Passes`]): the host slots
 /// of the views written since the pass before are made, and the
 /// ranges of host copies to bring up to date are returned: in the first
@@ -1036,9 +1050,10 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
     // Per host heap: the host copy and range each slot's buffer view
     // reads, kept from pass to pass. Only the slots written since the
     // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-    // at best); all of them every 16 frames, because a view of a
-    // released resource goes stale without a write, and a slot written
-    // before its memory had a host copy is only made then.
+    // at best); every slot again every 16 frames (a sixteenth of them a
+    // frame, [`heap_spread`]), because a view of a released resource goes
+    // stale without a write, and a slot written before its memory had a
+    // host copy is only made then.
     // (By slot with a multiply for a hash, not SipHash: the pass looks
     // at tens of thousands of slots a frame.)
     // (Declared before the table's guard, so let go after it: what was
@@ -1053,9 +1068,17 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
     // The frame's first pass over this heap.
     let first = std::mem::replace(last, frame) != frame;
     let changed = host.buffer_changes();
-    let slots = if first && *frames % 16 == 0 {
+    // The slots looked at again for no write: all of them at the heap's
+    // first pass and (`VICTORY_HEAP_SPREAD=0`) at every sixteenth frame, or
+    // a sixteenth of them at every frame's first pass, each at every
+    // sixteenth frame as well. A slot looked at is forgotten first (below),
+    // so a view gone stale without a write is dropped in its frame of the
+    // round; a slot that left the set was written, and is in `changed`.
+    let slots = if first && *frames == 0 || first && *frames % HEAP_ROUND == 0 && !heap_spread() {
         ranges.clear();
         host.buffer_slots()
+    } else if first && heap_spread() {
+        host.buffer_slots_of((*frames % HEAP_ROUND) as u32, HEAP_ROUND as u32, changed)
     } else {
         changed
     };
