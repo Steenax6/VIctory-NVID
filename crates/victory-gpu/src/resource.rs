@@ -1545,6 +1545,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        if host.filled {
+            crate::descriptor::after::made(&host.texture);
+        }
         let host = std::sync::Arc::new(host);
         if host.tiled.as_ref().is_some_and(|t| t.dropped() > 0) {
             REDUCED

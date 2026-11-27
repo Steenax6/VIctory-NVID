@@ -6690,6 +6690,7 @@ impl Host {
         }
         steps.mark("p.card", card.as_ref().map_or(0, |c| c.ranges.len() as u64));
         let prepared = std::time::Instant::now();
+        crate::descriptor::after::sending(this_submission);
         crate::timeline::ev("sub.", 8, runs.len() as u64);
         if late {
             *submitted += 1;
@@ -9439,6 +9440,7 @@ impl Meter {
             crate::pagemap::line(frames);
             standing_line();
             crate::descriptor::host::shown_line();
+            crate::descriptor::after::line();
             crate::texture::staging_line();
         }
         crate::shadow::exact_line(frames);

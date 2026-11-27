@@ -2994,7 +2994,10 @@ impl State {
                     );
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = heap.handle(index).and_then(|handle| {
+                let _by = crate::descriptor::after::by(crate::descriptor::after::PASS);
+                host.mirror(index, handle, true)
+            });
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -3911,7 +3914,11 @@ impl State {
             self.ready(list, u.kind, key, None);
             return;
         }
-        let (Some(view), key) = host.mirror_key(index, handle, true) else {
+        let made = {
+            let _by = crate::descriptor::after::by(crate::descriptor::after::TABLE);
+            host.mirror_key(index, handle, true)
+        };
+        let (Some(view), key) = made else {
             return;
         };
         // (The record the slot is made from, unless another thread made it
@@ -4200,6 +4207,7 @@ impl State {
                                 host.texture_slot_tabled(title + k, false);
                             } else if self.slot_known(host, title + k, handle).is_none() {
                                 host.texture_slot_tabled(title + k, true);
+                                let _by = crate::descriptor::after::by(crate::descriptor::after::IN_PLACE);
                                 let (made, key) = host.mirror_key(title + k, handle, true);
                                 if made.is_some() && host.made_from(title + k, key) {
                                     self.seen.slots.insert((std::ptr::from_ref(host) as usize, title + k), key);

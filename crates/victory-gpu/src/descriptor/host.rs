@@ -3408,6 +3408,12 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            if let Some(Some(texture)) = &kept
+                && !self.sampler
+                && is_texture_view(&view)
+            {
+                super::after::named(std::ptr::from_ref(self) as usize, index, texture);
+            }
             // The slot holds the view or a null view of its kind: now its
             // entry may say so, behind the slot's own bytes.
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);

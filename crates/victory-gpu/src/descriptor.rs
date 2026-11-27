@@ -11,6 +11,8 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+pub(crate) mod after;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 pub(crate) mod slots;
@@ -1131,6 +1133,7 @@ pub(crate) fn remake_at_quiet_point() -> usize {
 
 pub(crate) fn make_waiting() {
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    let _by = after::by(after::WAITING);
     for resource in made {
         let handles = WAITING
             .lock()
