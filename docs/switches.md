@@ -211,7 +211,11 @@ The timeline names each job (`job>`, `job<`). `=1` samples, at the
 telling, the last stretch of every eighth run: the bytes it landed in
 title memory and the copy's CPU side must be the same; the line "the
 landings' merges as jobs" counts those that are not (0 is what the merge
-needs).
+needs). Where two copies hold the same pages (the title maps a buffer at
+several addresses, each with a copy of its own) and both land, the later
+flight's copy is merged last and the other one's piece is not looked at;
+the line counts those pieces. A stretch found apart is named with the
+layer's own writes over it since its merge.
 
 `VICTORY_REFRESH_CHECK=1` (a diagnostic, slow): after every refresh the
 first 256 bytes of each 64 KiB block of it are read from title memory

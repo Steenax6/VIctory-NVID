@@ -314,6 +314,31 @@ on, twelve frames of a timeline each against run i_thinap1: indications):
   `VICTORY_SEEN_CHECK=1` 0 and 0, the sample at the telling
   (`VICTORY_LAND_SAMPLE=1`) 0 of 63,395 stretches in the prologue and 0 of
   48,726 in the world.
+- The sample set alone (2026-11-27): it read 63 of 278,218 stretches
+  apart in 125 s of the prologue (run z_lf_d1), at five copies, 60 of
+  them at two. Every one had been written again, 0.2 to 5 ms after its
+  merge (17 on the same thread, 46 on another), by another merge of the
+  same landing over the same physical bytes (the layer's own writes, kept by place for the sample:
+  `land_trace.rs`). The title maps a
+  buffer's pages at several addresses and binds it by more than one; each
+  address has a copy and a card side of its own, and two flights that
+  write the buffer by two addresses and land together each bring bytes
+  for the same pages. The jobs were cut by address, so the two were
+  merged in the order of their addresses, in one job or in two beside
+  each other. Pieces are placed by the pages they lie in now, and a copy
+  stands behind those of every earlier flight (`land_jobs::cut`,
+  `fine_runs`): of 1,403 pieces a later flight's copy landed over in a
+  prologue run (z_lf_p_after), 1,385 were at the higher address (884 of
+  884 at the world's entry), where the old order left the earlier
+  flight's bytes in title memory. With it the sample alone reads 0 of
+  644,220 in the prologue (z_lf_p_smp) and 0 of 419,030 at the world's
+  entry (z_lf_w_smp); it does not look at a piece a later run lands
+  over. Beside the other checks it had read 0 because the two flights
+  then do not land together: 1 such piece in 175 s (z_lf_chk; 1.6
+  flights a landing against 2.2). Not told apart yet: two copies of the
+  same pages that one flight wrote both (merged in the order of that
+  flight's ranges), and a copy an earlier and a later flight wrote, which
+  stands behind as a whole.
 
 Expected, with what speaks for it: S1a 7 to 14 ms of the submitting
 thread (the longest send); S2 the landing from 28 to 34 ms to about 10
