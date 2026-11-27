@@ -1666,7 +1666,8 @@ fn guard_line(submission: u64) {
     let [waited, found, vain] = [0, 1, 2].map(|i| OPENED_BESIDE[i].load(Relaxed));
     if waited + found + vain > 0 {
         tracing::info!(
-            "guards, since the start: {waited} faults on a block another thread was opening waited for it, {found} found it              opened by the time they asked, {vain} waited in vain"
+            "guards, since the start: {waited} faults on a block another thread was opening waited for it, {found} found it \
+             opened by the time they asked, {vain} waited in vain"
         );
     }
 }
