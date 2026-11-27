@@ -112,7 +112,7 @@ is to be rebuilt. The switches named are in `switches.md`.
 | Stage | Thread | What it does | Held meanwhile |
 |---|---|---|---|
 | capture | the title's render thread | the lists' host sides are taken from the title's lists, cut at their waits for memory values and put on their queue's line (`Held`): two bursts a frame (83 lists when the present returns, 121 before the next present call), 28 parts | the queue's line |
-| prepare and send | `victory-submit` (one) | `release_held_now`, then `Host::submit` part by part: heap sync (descriptor records), write-watch asking, title bytes under flights' shader writes, the lists' steps in recorded order (fills, title buffer copies, declared writes; the refreshes of host copies are flushed before every step that writes title memory or gives a range to shaders), textures, preludes, the card's sync and compare lists, `ExecuteCommandLists`, `Signal` | `RELEASING` (one releaser); `Host::submitted` from the first step to the send |
+| prepare and send | `victory-submit` (one) | `release_held_now`, then `Host::submit` part by part: heap sync (descriptor records), write-watch asking, title bytes under flights' shader writes, the lists' steps in recorded order (fills, title buffer copies, declared writes; a title buffer copy out of memory shaders write is made on the card instead, between the host copies, and its destination declared written, so no refresh of it waits for a landing, `host/card_copy.rs`; the refreshes of host copies are flushed before every step that writes title memory or gives a range to shaders), textures, preludes, the card's sync and compare lists, `ExecuteCommandLists`, `Signal` | `RELEASING` (one releaser); `Host::submitted` from the first step to the send |
 | flight | the card | our sync list (changed ranges of the copies' CPU sides to their card sides, hashes), the title's lists, our compare list (flags the 4 KiB blocks whose hash changed) | |
 | land | `victory-relay` (one) | for the flights the card has run, in the order sent: the flagged blocks fetched on the copy queue (`queue2.rs`), merged into title memory and the copy's CPU side (`Shadow::card_merge_relay`) as jobs of 256 KiB of one copy on the wide threads and this one (`host/land_jobs.rs`), all done before the landing goes on; the ranges opened to refreshes again; then, in order, copies left to the landing, read-backs, bottom-of-pipe writes, fence signals | `LINE` to take and to give back; the side locks of the 64 KiB pieces a merge writes |
 | after | `victory-late-wait` | landed lists reset; the submitting thread woken for waits now met | |
@@ -480,6 +480,13 @@ translation. Whether the two lines come of the refresh check, which was
 on in these runs and not in those and holds the frame at 140 ms, or of
 the title's threads no longer waiting for the guards, is not told apart
 here: it wants the thin check alone on this tree.
+
+Of S3's fourth step, built (2026-11-27): the journal answers a refresh
+by the copy's stamps, a summary of the highest number noted for each 64
+pages of its table passing by what is not newer (`watch.rs` `Pages`,
+`After`; `shadow.rs` `pages_known`; checked by `VICTORY_JOURNAL_CHECK=1`,
+see `docs/switches.md`). An answer held 20 entries on average in the
+first room and the refresh acted on 0.3 of them; it holds those only now.
 
 Open of S3, its fourth step: the journal by chunk of its table, and the
 standing asking the burst's. The journal's lock is still one, held

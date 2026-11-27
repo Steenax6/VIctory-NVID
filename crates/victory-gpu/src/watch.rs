@@ -90,58 +90,110 @@ const NEAR_PAGES: usize = (1 << 40) / PAGE;
 /// frame), and walking the map's nodes for them was 4 ms a frame of the
 /// submitting thread (profile of 2026-11-26: `entries` 3.97 ms); a chunk is
 /// walked as an array.
+///
+/// Most of what a refresh was handed it threw away: of the entries of its
+/// range it acts on those numbered after the asking its copy took the page
+/// at, and most pages were last written long before: in the first room
+/// 1,500 of 103,000 entries a frame were acted on, and 4,400 of 5,100
+/// answers held nothing to act on (`answers_line`, run jr_count_p of
+/// 2026-11-27; the open world's entry alike). So each group of
+/// [`GROUP_PAGES`] pages keeps the highest number noted in it, and a walk
+/// for what is newer than the caller's stamps ([`After`]) passes by the
+/// groups whose highest is not.
 struct Pages {
-    chunks: Vec<Option<Box<[Written]>>>,
+    chunks: Vec<Option<Box<Chunk>>>,
     far: BTreeMap<usize, Written>,
+    /// The highest number noted in `far`.
+    far_top: u64,
+}
+
+/// Pages of one summary ([`Chunk::tops`]): 4 MiB of title memory, as
+/// much as one count of [`EVENTS`] stands for. A refresh's range is from
+/// a few pages to some thousands (2,784 for the title's 174 MB buffer):
+/// at this grain the big range is 44 numbers to look at, and a group that
+/// holds something newer is a walk of 64 entries.
+const GROUP_PAGES: usize = 64;
+
+/// [`CHUNK_PAGES`] entries and, for each [`GROUP_PAGES`] of them, the
+/// highest number noted there (0: none).
+struct Chunk {
+    entries: Box<[Written]>,
+    tops: [u64; CHUNK_PAGES / GROUP_PAGES],
 }
 
 impl Pages {
     const fn new() -> Pages {
-        Pages { chunks: Vec::new(), far: BTreeMap::new() }
+        Pages { chunks: Vec::new(), far: BTreeMap::new(), far_top: 0 }
     }
 
     /// What is noted of `page`, if anything is.
-    fn get_mut(&mut self, page: usize) -> Option<&mut Written> {
+    fn get(&self, page: usize) -> Option<Written> {
         if page >= NEAR_PAGES {
-            return self.far.get_mut(&page);
+            return self.far.get(&page).copied();
         }
         self.chunks
-            .get_mut(page / CHUNK_PAGES)?
-            .as_mut()?
-            .get_mut(page % CHUNK_PAGES)
+            .get(page / CHUNK_PAGES)?
+            .as_ref()?
+            .entries
+            .get(page % CHUNK_PAGES)
+            .copied()
             .filter(|w| w.at != 0)
     }
 
-    /// Notes `w` (an asking's number is never 0) of `page`.
+    /// Notes `w` (an asking's number is never 0) of `page`. The group's
+    /// highest number only rises: a number lowered in an entry (tests)
+    /// leaves the group walked more often than needed, never passed by
+    /// wrongly.
     fn insert(&mut self, page: usize, w: Written) {
         if page >= NEAR_PAGES {
             self.far.insert(page, w);
+            self.far_top = self.far_top.max(w.at);
             return;
         }
         let chunk = page / CHUNK_PAGES;
         if self.chunks.len() <= chunk {
             self.chunks.resize_with(chunk + 1, || None);
         }
-        let entries = self.chunks[chunk].get_or_insert_with(|| vec![UNNOTED; CHUNK_PAGES].into_boxed_slice());
-        if let Some(entry) = entries.get_mut(page % CHUNK_PAGES) {
-            *entry = w;
-        }
+        let c = self.chunks[chunk].get_or_insert_with(|| {
+            Box::new(Chunk { entries: vec![UNNOTED; CHUNK_PAGES].into_boxed_slice(), tops: [0; CHUNK_PAGES / GROUP_PAGES] })
+        });
+        let i = page % CHUNK_PAGES;
+        c.entries[i] = w;
+        let top = &mut c.tops[i / GROUP_PAGES];
+        *top = (*top).max(w.at);
     }
 
     /// Forgets what is noted of `page` (tests).
     #[cfg(test)]
     fn remove(&mut self, page: usize) {
-        if let Some(w) = self.get_mut(page) {
-            *w = UNNOTED;
+        if page >= NEAR_PAGES {
+            self.far.remove(&page);
+        } else if let Some(Some(c)) = self.chunks.get_mut(page / CHUNK_PAGES) {
+            c.entries[page % CHUNK_PAGES] = UNNOTED;
         }
-        self.far.remove(&page);
     }
 
-    /// Calls `f` with every noted page of `[first, last)` and what is
-    /// noted of it, in page order.
-    fn each(&self, first: usize, last: usize, mut f: impl FnMut(usize, &Written)) {
+    /// Makes the summary of `page`'s group say nothing was noted there,
+    /// whatever its entries hold: a summary gone wrong, for the tests of
+    /// the check ([`check_answer`]).
+    #[cfg(test)]
+    fn stale_top(&mut self, page: usize) {
+        if page >= NEAR_PAGES {
+            self.far_top = 0;
+        } else if let Some(Some(c)) = self.chunks.get_mut(page / CHUNK_PAGES) {
+            c.tops[page % CHUNK_PAGES / GROUP_PAGES] = 0;
+        }
+    }
+
+    /// Calls `f` with every page of `[first, last)` noted after what
+    /// `after` gives for it and what is noted of it, in page order; groups
+    /// whose highest number is no later than what `after` gives for every
+    /// page of theirs in the range are passed by. Returns the groups looked
+    /// at and those walked.
+    fn each_after(&self, first: usize, last: usize, after: After, mut f: impl FnMut(usize, &Written)) -> (u64, u64) {
+        let (mut looked, mut walked) = (0, 0);
         if first >= last {
-            return;
+            return (looked, walked);
         }
         let near = last.min(NEAR_PAGES);
         let mut page = first;
@@ -150,23 +202,124 @@ impl Pages {
             if chunk >= self.chunks.len() {
                 break;
             }
-            let end = ((chunk + 1) * CHUNK_PAGES).min(near);
-            if let Some(entries) = &self.chunks[chunk] {
-                let from = page % CHUNK_PAGES;
-                for (i, w) in entries.iter().enumerate().take(from + (end - page)).skip(from) {
-                    if w.at != 0 {
-                        f(chunk * CHUNK_PAGES + i, w);
+            let chunk_end = ((chunk + 1) * CHUNK_PAGES).min(near);
+            let Some(c) = &self.chunks[chunk] else {
+                page = chunk_end;
+                continue;
+            };
+            while page < chunk_end {
+                let i = page % CHUNK_PAGES;
+                let group = i / GROUP_PAGES;
+                let end = (chunk * CHUNK_PAGES + (group + 1) * GROUP_PAGES).min(chunk_end);
+                looked += 1;
+                let top = c.tops[group];
+                if top != 0 && top > after.least(page, end) {
+                    walked += 1;
+                    for (k, w) in c.entries[i..i + (end - page)].iter().enumerate() {
+                        if w.at > after.page(page + k) {
+                            f(page + k, w);
+                        }
                     }
                 }
+                page = end;
             }
-            page = end;
+        }
+        if last > NEAR_PAGES && self.far_top != 0 {
+            for (&page, w) in self.far.range(first.max(NEAR_PAGES)..last) {
+                if w.at > after.page(page) {
+                    f(page, w);
+                }
+            }
+        }
+        (looked, walked)
+    }
+
+    /// [`Pages::each_after`] without the summaries: every entry of the
+    /// range looked at. For the check ([`check_answer`]) alone.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn each_after_walked(&self, first: usize, last: usize, after: After, mut f: impl FnMut(usize, &Written)) {
+        if first >= last {
+            return;
+        }
+        let near = last.min(NEAR_PAGES);
+        for page in first..near.max(first) {
+            match self.chunks.get(page / CHUNK_PAGES) {
+                Some(Some(c)) => {
+                    let w = &c.entries[page % CHUNK_PAGES];
+                    if w.at > after.page(page) {
+                        f(page, w);
+                    }
+                }
+                Some(None) => {}
+                None => break,
+            }
         }
         if last > NEAR_PAGES {
             for (&page, w) in self.far.range(first.max(NEAR_PAGES)..last) {
-                f(page, w);
+                if w.at > after.page(page) {
+                    f(page, w);
+                }
             }
         }
     }
+}
+
+/// What a walk of the journal lists ([`Pages::each_after`]): the pages
+/// noted after an asking, one number for every page or one for each.
+#[derive(Clone, Copy, Debug)]
+enum After<'a> {
+    /// After this asking (0: every page noted).
+    All(u64),
+    /// After `known[page - first]`, or after `cap` where that is earlier
+    /// (a page outside `known`: after 0).
+    Pages { first: usize, known: &'a [u64], cap: u64 },
+}
+
+impl After<'_> {
+    /// The number `page` is listed after.
+    fn page(&self, page: usize) -> u64 {
+        match *self {
+            After::All(n) => n,
+            After::Pages { first, known, cap } => page.checked_sub(first).and_then(|i| known.get(i)).map_or(0, |&n| n.min(cap)),
+        }
+    }
+
+    /// The least number a page of `[from, to)` is listed after.
+    fn least(&self, from: usize, to: usize) -> u64 {
+        match *self {
+            After::All(n) => n,
+            After::Pages { first, known, cap } => {
+                if from < first || to - first > known.len() || from >= to {
+                    return 0;
+                }
+                known[from - first..to - first].iter().copied().fold(cap, u64::min)
+            }
+        }
+    }
+}
+
+/// Whether every answer to a refresh is also walked entry by entry and the
+/// two compared (`VICTORY_JOURNAL_CHECK=1`; diagnostics builds): the
+/// differences are counted with the frame line and the first ones named.
+#[cfg(feature = "diagnostics")]
+fn journal_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOURNAL_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// The check of an answer: `got`, what the walk by summaries gave for
+/// `[first, last)` after `after`, against every entry of the range
+/// looked at. `None` if they are the same; else the first page at which
+/// they differ.
+#[cfg(any(test, feature = "diagnostics"))]
+fn check_answer(pages: &Pages, first: usize, last: usize, after: After, got: &[(usize, Written)]) -> Option<usize> {
+    let mut want = Vec::new();
+    pages.each_after_walked(first, last, after, |page, w| want.push((page, *w)));
+    if want == got {
+        return None;
+    }
+    let differ = want.iter().zip(got).find(|(a, b)| a != b).map(|(a, b)| a.0.min(b.0));
+    Some(differ.unwrap_or_else(|| want.get(got.len()).or(got.get(want.len())).map_or(first, |e| e.0)))
 }
 
 /// How a copy in view memory is brought up to date: only when something
@@ -455,24 +608,58 @@ pub(crate) fn events_line(frames: f64) {
     );
     // (With it: what the landings took of the guards' marks.)
     landed_views_line(frames);
+    #[cfg(feature = "diagnostics")]
+    answers_line(frames);
+}
+
+/// Since the last frame line, of the journal's answers to host copies'
+/// refreshes (`crate::shadow`'s `copy_stale_fine`): the answers; the
+/// entries they held; those the copy acted on (numbered after its page's
+/// stamp, `crate::shadow`'s `page_known`); answers with no entry; answers
+/// with none acted on. Before the walk went by the copy's stamps, every
+/// noted page of the range was listed: 103,000 entries a frame in the first
+/// room, 1,500 of them acted on (run jr_count_p of 2026-11-27).
+#[cfg(feature = "diagnostics")]
+static ANSWERS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// A refresh's answer held `returned` entries, and it acted on `used`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn answered(returned: usize, used: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    ANSWERS[0].fetch_add(1, Relaxed);
+    ANSWERS[1].fetch_add(returned as u64, Relaxed);
+    ANSWERS[2].fetch_add(used as u64, Relaxed);
+    ANSWERS[3].fetch_add(u64::from(returned == 0), Relaxed);
+    ANSWERS[4].fetch_add(u64::from(used == 0), Relaxed);
+}
+
+/// With the frame line ([`events_line`]).
+#[cfg(feature = "diagnostics")]
+fn answers_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [answers, returned, used, empty, none_used] = [0, 1, 2, 3, 4].map(|i| ANSWERS[i].swap(0, Relaxed) as f64 / frames);
+    let [looked, walked] = [0, 1].map(|i| GROUPS[i].swap(0, Relaxed) as f64 / frames);
+    let [compared, differed] = [0, 1].map(|i| CHECKED[i].load(Relaxed));
+    tracing::info!(
+        "journal answers to refreshes, per frame: {answers:.0} answers with {returned:.0} entries, {used:.0} of them          acted on; {empty:.0} answers empty, {none_used:.0} with nothing acted on; of all the journal's answers,          {looked:.0} groups of {GROUP_PAGES} pages looked at and {walked:.0} walked; since the start, with          VICTORY_JOURNAL_CHECK=1, {compared} answers compared with a walk of every entry, {differed} differed (0 is          what the summaries need)"
+    );
 }
 
 /// Notes in `written` that asking `now` found `page` written in the kernel
 /// pages `mask`.
 fn note(written: &mut Pages, page: usize, now: u64, mask: u16) {
     event(page.wrapping_mul(PAGE));
-    match written.get_mut(page) {
-        None => {
-            written.insert(page, Written { at: now, before: 0, mask });
-        }
-        Some(w) if w.at < now => *w = Written { at: now, before: w.at, mask },
+    let w = match written.get(page) {
+        None => Written { at: now, before: 0, mask },
+        Some(w) if w.at < now => Written { at: now, before: w.at, mask },
         // The same asking again (another range of it): its pages together.
-        Some(w) if w.at == now => w.mask |= mask,
+        Some(w) if w.at == now => Written { mask: w.mask | mask, ..w },
         // An answer numbered before the last one noted (an asking that
         // stood while another was made): kept at the later number, which
         // is the safe side, and where is no longer known.
-        Some(w) => w.mask = FULL,
-    }
+        Some(w) => Written { mask: FULL, ..w },
+    };
+    written.insert(page, w);
 }
 
 struct Journal {
@@ -527,12 +714,47 @@ fn note_found(j: &mut Journal, count: usize, now: u64) {
     }
 }
 
-/// The journal's entries for pages `[first, last)`.
-fn entries(j: &Journal, first: usize, last: usize) -> Vec<(usize, Written)> {
+/// The journal's entries for pages `[first, last)` noted after what the
+/// caller has of each (`known`, from `first` on; empty: nothing) or after
+/// `now`, the answer's number, where that is earlier: empty, and nothing
+/// allocated, if no group of the range holds a later number.
+fn entries(j: &Journal, first: usize, last: usize, known: &[u64], now: u64) -> Vec<(usize, Written)> {
+    let after = After::Pages { first, known, cap: now };
     let mut out = Vec::new();
-    j.written.each(first, last, |page, w| out.push((page, *w)));
+    let _groups = j.written.each_after(first, last, after, |page, w| out.push((page, *w)));
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        GROUPS[0].fetch_add(_groups.0, Relaxed);
+        GROUPS[1].fetch_add(_groups.1, Relaxed);
+        if journal_check() {
+            CHECKED[0].fetch_add(1, Relaxed);
+            if let Some(page) = check_answer(&j.written, first, last, after, &out)
+                && CHECKED[1].fetch_add(1, Relaxed) < 32
+            {
+                tracing::warn!(
+                    range = format_args!("{:#x}..{:#x}", first * PAGE, last * PAGE),
+                    now,
+                    known = after.page(page),
+                    page = format_args!("{:#x}", page * PAGE),
+                    "the journal's answer by its summaries differs from every entry of the range looked at \
+                     (VICTORY_JOURNAL_CHECK=1)"
+                );
+            }
+        }
+    }
     out
 }
+
+/// Since the last frame line: the groups of the journal's table its answers
+/// looked at, and those of them walked ([`Pages::each_after`]).
+#[cfg(feature = "diagnostics")]
+static GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the last frame line, with `VICTORY_JOURNAL_CHECK=1`: the answers
+/// compared with a walk of every entry, and those that differed.
+#[cfg(feature = "diagnostics")]
+static CHECKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether ranges whose first block the guards hold are left out of the
 /// submission's kernel askings ([`ask_ahead`], [`ask_once`]):
@@ -805,7 +1027,8 @@ fn take_run(j: &mut Journal, pieces: &[(usize, usize)], now: u64, noted: &mut Ve
     };
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel_as(j, first, last, now) {
-        j.written.each(first, last, |page, w| {
+        // (Nothing is numbered after `now`: it is the journal's last.)
+        j.written.each_after(first, last, After::All(now - 1), |page, w| {
             if w.at == now {
                 noted.push((page, *w));
             }
@@ -887,8 +1110,8 @@ pub(crate) fn take_landed_views(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, 
             let mask = std::mem::take(&mut m.dirty[i]);
             r.clean.set(b);
             note(&mut j.written, block, now, mask);
-            if let Some(w) = j.written.get_mut(block) {
-                noted.push((block, *w));
+            if let Some(w) = j.written.get(block) {
+                noted.push((block, w));
             }
         }
     }
@@ -1015,17 +1238,15 @@ fn ask_kernel_as(j: &mut Journal, first: usize, last: usize, now: u64) -> bool {
 /// pages written since tracking began and the asking that last found each
 /// written, with the number of the asking that stands (as [`writes`] gives
 /// it). `None` if the kernel would have to be asked.
-pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+///
+/// `known`: what the caller has of each page, as for [`writes_fine_look`].
+pub(crate) fn asked(start: usize, end: usize, known: &[u64]) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| {
-            let mut out = Vec::new();
-            j.written.each(first, last, |page, w| out.push((page, w.at)));
-            (j.ahead_asked, out)
-        })
+        .then(|| (j.ahead_asked, entries(&j, first, last, known, j.ahead_asked).into_iter().map(|(p, w)| (p, w.at)).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -1034,18 +1255,36 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    writes_fine(start, end, guarded).map(|(now, pages)| (now, pages.into_iter().map(|(p, w)| (p, w.at)).collect()))
+    writes_fine(start, end, guarded, &[]).map(|(now, pages)| (now, pages.into_iter().map(|(p, w)| (p, w.at)).collect()))
 }
 
-/// [`writes`], with what the journal knows of where in each page.
-pub(crate) fn writes_fine(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, Written)>)> {
-    writes_fine_look(start, end, guarded, &mut Look::default())
+/// [`writes`], with what the journal knows of where in each page; `known`
+/// as for [`writes_fine_look`].
+pub(crate) fn writes_fine(start: usize, end: usize, guarded: bool, known: &[u64]) -> Option<(u64, Vec<(usize, Written)>)> {
+    writes_fine_look(start, end, guarded, known, &mut Look::default())
 }
 
 /// [`writes_fine`] for a copy that goes by events ([`events_mode`]):
 /// `look` takes what the copy remembers and brings back what the asking
 /// learned beside the pages.
-pub(crate) fn writes_fine_look(start: usize, end: usize, guarded: bool, look: &mut Look) -> Option<(u64, Vec<(usize, Written)>)> {
+///
+/// `known`: for each page of the range from its first on, the asking up
+/// to which the caller has it (empty, or 0 for a page: every page noted is
+/// listed). The list then holds only the pages noted after that or after
+/// this answer's own number, whichever is earlier: one noted up to both
+/// changes neither what the caller copies nor the stamp it leaves
+/// (`crate::shadow`'s `page_known`). A refresh asked for the entries of
+/// its whole range every time, 2,784 pages for the title's 174 MB buffer
+/// fifteen times a frame, and acted on 1.5 % of them ([`Pages`];
+/// `entries` was 1.5 to 1.8 ms a frame of the submitting thread in the
+/// profiles of 2026-11-27).
+pub(crate) fn writes_fine_look(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    known: &[u64],
+    look: &mut Look,
+) -> Option<(u64, Vec<(usize, Written)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -1058,7 +1297,7 @@ pub(crate) fn writes_fine_look(start: usize, end: usize, guarded: bool, look: &m
     look.absent = Some(EVERY_TIME);
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((j.ahead_asked, entries(j, first, last)));
+        return Some((j.ahead_asked, entries(j, first, last, known, j.ahead_asked)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -1140,7 +1379,7 @@ pub(crate) fn writes_fine_look(start: usize, end: usize, guarded: bool, look: &m
     for (page, mask) in guarded {
         note(&mut j.written, page, now, mask);
     }
-    Some((now, entries(j, first, last)))
+    Some((now, entries(j, first, last, known, now)))
 }
 
 impl Tracked {
@@ -1403,6 +1642,12 @@ struct Region {
     /// such a block and notes it clean makes the other views read-only
     /// first: see [`guard_fine`].
     apart: Bits,
+    /// The openings under way on blocks of the region ([`Marks::opening`],
+    /// summed), for a look without its lock ([`openings_done`]). Raised
+    /// before the block's guard is taken away and lowered after the block
+    /// is writable: a look that finds a block not guarded and this 0 finds
+    /// it writable as far as the guards go.
+    openings: std::sync::atomic::AtomicU32,
     marks: Mutex<Marks>,
 }
 
@@ -1430,6 +1675,7 @@ impl Region {
             views: Bits::new(),
             partly: Bits::new(),
             apart: Bits::new(),
+            openings: std::sync::atomic::AtomicU32::new(0),
             marks: Mutex::new(Marks { dirty: [0; REGION], opening: [0; REGION] }),
         }
     }
@@ -1663,6 +1909,15 @@ fn guard_line(submission: u64) {
          not sent up (VICTORY_SEND_CHANGED=0 sends them)",
         c[10], c[9], c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[11], c[12], c[13], c[14], c[15], c[16], same[0], same[1] / 1e6
     );
+    let [waited, found, vain] = [0, 1, 2].map(|i| OPENED_BESIDE[i].load(Relaxed));
+    let [stood, stood_vain] = [0, 1].map(|i| OPENINGS_AWAITED[i].load(Relaxed));
+    if waited + found + vain + stood > 0 {
+        tracing::info!(
+            "guards, since the start: {waited} faults on a block another thread was opening waited for it, {found} found it \
+             opened by the time they asked, {vain} waited in vain; {stood} openings for a write of ours or the kernel's \
+             waited for another thread's opening of a block of theirs, {stood_vain} of them in vain"
+        );
+    }
 }
 
 /// Who takes locks of the guards: a hold is an event of `crate::timeline`
@@ -1986,7 +2241,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
                     // Known as view memory (made read-only or noted absent
                     // since the runtime last mapped or unmapped it): no
                     // question to Windows.
-                    note_guarded(r, m, i);
+                    note_guarded(r, m, i, block);
                     later.runs.push(block);
                     together.push(block);
                 } else {
@@ -2066,7 +2321,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
             let b = 1u64 << i;
             if !(r.protected.has(b) || r.absent.has(b) || m.opening[i] != 0) {
                 r.views.set(b);
-                note_guarded(r, m, i);
+                note_guarded(r, m, i, block);
                 later.runs.push(block);
             }
         }
@@ -2124,12 +2379,16 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
         }
     }
     written.sort_unstable();
+    #[cfg(feature = "diagnostics")]
+    for &(block, _) in &written {
+        history(block, "reported");
+    }
     Some(written)
 }
 
 /// Notes the block at `i` of `r` guarded and clean (a check's, which makes
 /// it read-only before its copy reads it).
-fn note_guarded(r: &Region, m: &mut Marks, i: usize) {
+fn note_guarded(r: &Region, m: &mut Marks, i: usize, block: usize) {
     let b = 1u64 << i;
     r.protected.set(b);
     r.views.set(b);
@@ -2137,6 +2396,7 @@ fn note_guarded(r: &Region, m: &mut Marks, i: usize) {
     r.apart.clear(b);
     m.dirty[i] = 0;
     r.clean.set(b);
+    history(block, "guarded");
 }
 
 /// The changes of protection a check decided, made with no lock of the
@@ -2268,6 +2528,7 @@ fn settle(failed: &Failed, epoch: Option<Epoch>) {
                 r.absent.set(1 << i);
                 ABSENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            history(block, "noted absent");
         } else {
             r.views.clear(1 << i);
             if let Some(e) = epoch.filter(|_| absent_once()) {
@@ -2291,6 +2552,25 @@ fn settle(failed: &Failed, epoch: Option<Epoch>) {
     }
 }
 
+/// An opening of the block at `i` of `r` begins: noted with the region's
+/// lock held, before anything else of the block changes
+/// ([`Region::openings`]).
+fn opening_begins(r: &Region, m: &mut Marks, i: usize) {
+    if m.opening[i] < u8::MAX {
+        r.openings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        m.opening[i] += 1;
+    }
+}
+
+/// The opening is said done (the region's lock held): its change of
+/// protection has been made.
+fn opening_ends(r: &Region, m: &mut Marks, i: usize) {
+    if m.opening[i] > 0 {
+        m.opening[i] -= 1;
+        r.openings.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The block at `i` of `r` is no longer guarded (opened, or its protection
 /// failed): counted, as everything is that changes what a check finds.
 fn unguard(r: &Region, m: &mut Marks, i: usize, block: usize) {
@@ -2301,6 +2581,7 @@ fn unguard(r: &Region, m: &mut Marks, i: usize, block: usize) {
     r.apart.clear(b);
     m.dirty[i] = 0;
     event(block.wrapping_mul(BLOCK));
+    history(block, "unguarded");
 }
 
 /// What became of a write's fault ([`open_tail`], [`reopen_stray`]).
@@ -2349,7 +2630,7 @@ fn reopen_stray(at: usize) -> Fault {
             return Fault::Again;
         }
         // (No check guards it while this stands.)
-        m.opening[i] = m.opening[i].saturating_add(1);
+        opening_begins(r, m, i);
         for &view in &others {
             if mark_block(&mut l, view, FULL)
                 && let Some((r, _, i)) = l.at(view)
@@ -2369,8 +2650,8 @@ fn reopen_stray(at: usize) -> Fault {
         // SAFETY: a block of title view memory we made read-only.
         && unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
     let mut l = Locked::blocks(Holder::Fault, [block]);
-    if let Some((_, m, i)) = l.at(block) {
-        m.opening[i] = m.opening[i].saturating_sub(1);
+    if let Some((r, m, i)) = l.at(block) {
+        opening_ends(r, m, i);
     }
     if !opened {
         return Fault::No;
@@ -2535,10 +2816,20 @@ fn uncommitted_end(block: usize) -> usize {
 /// after the locks are let go; until that is said done no check guards
 /// them again ([`Marks::opening`]).
 fn open(by: Holder, start: usize, end: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     if start >= end {
         return 0;
     }
+    let opened = open_own(by, start, end);
+    // What another thread is opening there is writable when this returns
+    // as well: the write this is for may be the kernel's, which no fault
+    // of ours answers.
+    openings_done(by, start / BLOCK, end.div_ceil(BLOCK));
+    opened
+}
+
+/// [`open`] for the blocks this call finds guarded.
+fn open_own(by: Holder, start: usize, end: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (guarded, shared) = guarded_and_shared(start / BLOCK, end.div_ceil(BLOCK));
     if guarded.is_empty() && shared.is_empty() {
         return 0;
@@ -2556,8 +2847,8 @@ fn open(by: Holder, start: usize, end: usize) -> usize {
             };
             if r.protected.has(1 << i) {
                 count(6);
+                opening_begins(r, m, i);
                 unguard(r, m, i, block);
-                m.opening[i] = m.opening[i].saturating_add(1);
                 opened.push(block);
             }
         }
@@ -2593,11 +2884,53 @@ fn open(by: Holder, start: usize, end: usize) -> usize {
     }
     let mut l = Locked::blocks(by, opened.iter().copied());
     for &block in &opened {
-        if let Some((_, m, i)) = l.at(block) {
-            m.opening[i] = m.opening[i].saturating_sub(1);
+        if let Some((r, m, i)) = l.at(block) {
+            opening_ends(r, m, i);
         }
     }
     opened.len()
+}
+
+/// Since the start: calls of [`open`] that waited for another thread's
+/// opening of a block of theirs; those that waited [`BESIDE_WAIT`] in vain.
+pub(crate) static OPENINGS_AWAITED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Waits until no opening is under way on a block of `[first, last)`.
+///
+/// A block another thread has noted open and not yet made writable is no
+/// guard's any more: [`open`] finds nothing to do for it. A write of the
+/// processor's then faults and is answered ([`opened_beside`]); the
+/// kernel's does not fault into a handler, it fails (a read of the title's
+/// into its own memory then ends with an error, and the title's loading
+/// with it). So the caller stands here until the other thread has said its
+/// opening done. Regions with none under way are passed without a lock.
+fn openings_done(by: Holder, first: usize, last: usize) {
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    let mut began = None;
+    loop {
+        let mut busy: Vec<(usize, u64)> = Vec::new();
+        each_region(first, last, |index, r, want| {
+            if r.openings.load(SeqCst) != 0 {
+                busy.push((index, want));
+            }
+        });
+        let under_way = busy.into_iter().any(|(index, want)| {
+            let mut l = Locked::take(by, vec![index]);
+            l.at(index * REGION).is_some_and(|(_, m, _)| each_bit(want).any(|i| m.opening[i] != 0))
+        });
+        if !under_way {
+            return;
+        }
+        let began = *began.get_or_insert_with(|| {
+            OPENINGS_AWAITED[0].fetch_add(1, Relaxed);
+            std::time::Instant::now()
+        });
+        if began.elapsed() > BESIDE_WAIT {
+            OPENINGS_AWAITED[1].fetch_add(1, Relaxed);
+            return;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// The kernel pages of `block` that `[start, end)` touches, a bit each
@@ -2638,6 +2971,7 @@ fn note_dirty(r: &Region, m: &mut Marks, i: usize, block: usize, mask: u16) {
         r.clean.clear(b);
         event(block.wrapping_mul(BLOCK));
         m.dirty[i] = mask;
+        history(block, "counted written");
     } else if m.dirty[i] != 0 {
         // Not clean with pages noted: written there before; with none:
         // written anywhere already.
@@ -2738,7 +3072,7 @@ fn open_tail(at: usize) -> Fault {
         }
         note_dirty(r, m, i, block, mask);
         r.partly.set(b);
-        m.opening[i] = m.opening[i].saturating_add(1);
+        opening_begins(r, m, i);
         for &view in &others {
             if mark_block(&mut l, view, mask)
                 && let Some((r, _, i)) = l.at(view)
@@ -2757,7 +3091,7 @@ fn open_tail(at: usize) -> Fault {
     let opened = unsafe { VirtualProtect(from as *const _, (block + 1) * BLOCK - from, PAGE_READWRITE, &mut old) } != 0;
     let mut l = Locked::blocks(Holder::Fault, [block]);
     if let Some((r, m, i)) = l.at(block) {
-        m.opening[i] = m.opening[i].saturating_sub(1);
+        opening_ends(r, m, i);
         if !opened && r.protected.has(b) {
             // Not to be opened (its memory went meanwhile): no guard's
             // any more. The write faults once more and is the title's.
@@ -2916,7 +3250,7 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     let noted = asked != 0 && {
         let j = journal();
         let mut after = false;
-        j.written.each(first, last, |_, w| after |= w.at > asked);
+        let _ = j.written.each_after(first, last, After::All(asked), |_, _| after = true);
         after
     };
     let (mut written, mut open) = (0, 0);
@@ -3101,6 +3435,159 @@ pub(crate) fn guard_state(at: usize) -> String {
     out
 }
 
+/// Diagnostics: what last happened to a block, for [`block_report`]: the
+/// last few changes of each block (microseconds since the start, and what),
+/// newest last. A lock of its own, taken last and alone; at most
+/// [`HISTORY_BLOCKS`] blocks are followed, the first ones met.
+#[cfg(feature = "diagnostics")]
+static HISTORY: Mutex<Option<std::collections::HashMap<usize, [(u64, &'static str); 6]>>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+const HISTORY_BLOCKS: usize = 1 << 20;
+
+/// Notes in [`HISTORY`] that `what` happened to `block`.
+#[cfg(feature = "diagnostics")]
+fn history(block: usize, what: &'static str) {
+    let at = crate::host::now_us();
+    let mut h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    let map = h.get_or_insert_with(std::collections::HashMap::new);
+    let full = map.len() >= HISTORY_BLOCKS;
+    let entry = match map.get_mut(&block) {
+        Some(e) => e,
+        None if full => return,
+        None => map.entry(block).or_insert([(0, ""); 6]),
+    };
+    entry.rotate_left(1);
+    entry[5] = (at, what);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn history(_: usize, _: &'static str) {}
+
+/// Diagnostics, for the report of a removed device: what the guards, the
+/// journal and Windows hold of the 64 KiB block at `at` now, for a host
+/// copy that differs from title memory there (why the copy can be behind).
+/// The region's sets are read without its lock; its marks and the journal
+/// are only looked at if their locks can be had at once (the thread that
+/// reports may hold them, or another that stands). Windows is asked last,
+/// with no lock held.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn block_report(at: usize) -> String {
+    use std::fmt::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+    let block = at / BLOCK;
+    let b = bit(block);
+    let mut out = format!("block {:#x}: ", block * BLOCK);
+    match region(block / REGION) {
+        None => out.push_str("no region of the guards"),
+        Some(r) => {
+            let sets = [
+                ("protected", &r.protected),
+                ("clean", &r.clean),
+                ("absent", &r.absent),
+                ("aliased", &r.aliased),
+                ("views", &r.views),
+                ("partly", &r.partly),
+                ("apart", &r.apart),
+            ];
+            let on: Vec<&str> = sets.iter().filter(|(_, s)| s.has(b)).map(|(n, _)| *n).collect();
+            let _ = write!(out, "sets [{}], region openings {}", on.join(" "), r.openings.load(Relaxed));
+            match r.marks.try_lock() {
+                Ok(m) => {
+                    let i = block % REGION;
+                    let _ = write!(out, ", dirty {:#06x} opening {}", m.dirty[i], m.opening[i]);
+                }
+                Err(_) => out.push_str(", marks locked"),
+            }
+        }
+    }
+    let _ = write!(out, "; events of its 4 MiB {}", events(block * BLOCK, block * BLOCK + 1));
+    match JOURNAL.try_lock() {
+        Ok(j) => {
+            let entry = j.written.get(block);
+            let ahead = j.ahead.iter().any(|&(a, e)| a <= block && block < e);
+            let _ = write!(
+                out,
+                "; journal asked {} (ahead {} {}, kept {}, once {}), its entry {}",
+                j.asked,
+                j.ahead_asked,
+                if ahead { "holds it" } else { "not over it" },
+                j.kept,
+                j.once_id,
+                entry.map_or_else(|| "none".to_owned(), |w| format!("at {} before {} mask {:#06x}", w.at, w.before, w.mask))
+            );
+        }
+        Err(_) => out.push_str("; journal locked"),
+    }
+    match ABSENT_RUNS.try_lock() {
+        Ok(runs) => {
+            let run = runs.runs.range(..=block).next_back().filter(|r| *r.1 > block);
+            let _ = write!(
+                out,
+                "; absent runs: stretch {} (now {}), remaps {}, {}",
+                runs.stretch,
+                absent_stretch(),
+                runs.remaps,
+                run.map_or_else(|| "none over it".to_owned(), |(&f, &u)| format!("run {:#x}..{:#x}", f * BLOCK, u * BLOCK))
+            );
+        }
+        Err(_) => out.push_str("; absent runs locked"),
+    }
+    if let Ok(u) = UNGUARDABLE.try_lock()
+        && u.1.contains(&block)
+    {
+        let _ = write!(out, "; unguardable in submission {}", u.0);
+    }
+    if let Ok(h) = HISTORY.try_lock() {
+        let now = crate::host::now_us();
+        match h.as_ref().and_then(|m| m.get(&block)) {
+            Some(e) => {
+                let said: Vec<String> =
+                    e.iter().filter(|c| !c.1.is_empty()).map(|c| format!("{} {:.1} ms ago", c.1, now.saturating_sub(c.0) as f64 / 1000.0)).collect();
+                let _ = write!(out, "; its last changes: {}", said.join(", "));
+            }
+            None => out.push_str("; no changes followed"),
+        }
+    }
+    out
+}
+
+/// Diagnostics: what Windows says of the memory at `at` now (state,
+/// protection, type, and the region's extent).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn query_report(at: usize) -> String {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return "Windows: no answer".to_owned();
+    }
+    format!(
+        "Windows: state {:#x} protect {:#x} type {:#x}, region {:#x}+{:#x}",
+        info.State, info.Protect, info.Type, info.BaseAddress as usize, info.RegionSize
+    )
+}
+
+#[cfg(feature = "diagnostics")]
+impl Seen {
+    /// Diagnostics: the range remembered, its counts then and now, and the
+    /// absent stretch, with what [`Seen::quiet`] says now.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "seen {:#x}..{:#x} events then {} now {} absent {:?} (stretch now {}), quiet {}",
+            self.from,
+            self.to,
+            self.events,
+            events(self.from, self.to),
+            self.absent,
+            absent_stretch(),
+            self.quiet()
+        )
+    }
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked
@@ -3232,6 +3719,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         }
         for i in each_bit(want) {
             m.dirty[i] = 0;
+            if len <= 16 << 20 {
+                history(index * REGION + i, "remapped");
+            }
         }
     }
     // (And the counts of the spans the guards hold nothing of: nothing
@@ -3305,7 +3795,15 @@ fn install() {
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
                 Fault::Again => {}
-                Fault::No => break,
+                // Not the guards' to open, as far as those looks went: they
+                // were made one after the other, and another thread that
+                // opens the block makes it writable only after it has noted
+                // it open. Waited for, and looked at once more.
+                Fault::No => {
+                    if !opened_beside(at) {
+                        break;
+                    }
+                }
             }
         }
         // SAFETY: as above.
@@ -3341,6 +3839,68 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Since the start: faults on a block that another thread was opening
+/// ([`opened_beside`]) which waited for it; faults that found the block
+/// writable by the time they asked with its region locked; faults that
+/// waited [`BESIDE_WAIT`] in vain.
+pub(crate) static OPENED_BESIDE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The longest a fault waits for another thread's opening of its block.
+const BESIDE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// For a write that faulted at `at` and found no guard to open
+/// ([`open_tail`], [`reopen_stray`]) on memory that was not writable:
+/// whether the block is another thread's to open or opened by it, so that
+/// the write is to be looked at once more.
+///
+/// [`open`] and [`open_tail`] note a block open with its region locked,
+/// let the lock go and only then make it writable ([`Marks::opening`]). A
+/// second thread that writes into the block between the two faults on a
+/// block that is no guard's any more and still read-only: its looks found
+/// nothing to open, and the write went on as an access violation nobody
+/// answered (a thread of the runtime's that fills a read's destination
+/// beside another one's, in the loading: the process ended there). Such a
+/// fault waits here until the opening is said done.
+///
+/// With the region locked, a block that is not guarded and has no opening
+/// under way has no change of protection of the guards' pending: what the
+/// system says of it then stands (asked under the lock for that reason; it
+/// is one call, and this is no path a frame takes).
+fn opened_beside(at: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let block = at / BLOCK;
+    // (Nothing is made for an address the guards never held.)
+    if region(block / REGION).is_none() {
+        return false;
+    }
+    let mut began = None;
+    loop {
+        {
+            let mut l = Locked::blocks(Holder::Fault, [block]);
+            let Some((r, m, i)) = l.at(block) else {
+                return false;
+            };
+            if r.protected.has(1 << i) {
+                // Guarded again meanwhile: a fault of the guards'.
+                return true;
+            }
+            if m.opening[i] == 0 {
+                let open = writable(at);
+                if open {
+                    OPENED_BESIDE[usize::from(began.is_none())].fetch_add(1, Relaxed);
+                }
+                return open;
+            }
+        }
+        let began = *began.get_or_insert_with(std::time::Instant::now);
+        if began.elapsed() > BESIDE_WAIT {
+            OPENED_BESIDE[2].fetch_add(1, Relaxed);
+            return false;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -3838,20 +4398,20 @@ mod tests {
         let (start, end) = (p, p + 2 * PAGE);
         forget(start, end);
         let page = p / PAGE + 1;
-        writes_fine(start, end, false).expect("watched");
+        writes_fine(start, end, false, &[]).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 3 * KERNEL_PAGE + 8) as *mut u8).write_volatile(1) };
-        let (first, found) = writes_fine(start, end, false).expect("watched");
+        let (first, found) = writes_fine(start, end, false, &[]).expect("watched");
         assert_eq!(found, [(page, Written { at: first, before: 0, mask: 1 << 3 })]);
         // SAFETY: as above.
         unsafe {
             ((p + PAGE + 5 * KERNEL_PAGE) as *mut u8).write_volatile(1);
             ((p + PAGE + 6 * KERNEL_PAGE + 1) as *mut u8).write_volatile(1);
         }
-        let (second, found) = writes_fine(start, end, false).expect("watched");
+        let (second, found) = writes_fine(start, end, false, &[]).expect("watched");
         assert_eq!(found, [(page, Written { at: second, before: first, mask: 1 << 5 | 1 << 6 })]);
         // Nothing written since: the entry stays.
-        let (third, again) = writes_fine(start, end, false).expect("watched");
+        let (third, again) = writes_fine(start, end, false, &[]).expect("watched");
         assert!(third > second);
         assert_eq!(again, found);
         // SAFETY: our allocation.
@@ -3871,13 +4431,13 @@ mod tests {
         assert_ne!(p, 0);
         let (start, end) = (p, p + 2 * PAGE);
         forget(start, end);
-        let (first, found) = writes_fine(start, end, false).expect("watched");
+        let (first, found) = writes_fine(start, end, false, &[]).expect("watched");
         assert_eq!(found, []);
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
         forgot(p + PAGE + 8, 1);
         wrote(p + PAGE + 8, 1);
-        let (_, found) = writes_fine(start, end, false).expect("watched");
+        let (_, found) = writes_fine(start, end, false, &[]).expect("watched");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, p / PAGE + 1);
         assert!(found[0].1.at > first && found[0].1.mask == FULL);
@@ -3893,11 +4453,11 @@ mod tests {
         let mut written = Pages::new();
         note(&mut written, 9, 4, 1);
         note(&mut written, 9, 4, 2);
-        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 4, before: 0, mask: 3 }));
+        assert_eq!(written.get(9), Some(Written { at: 4, before: 0, mask: 3 }));
         note(&mut written, 9, 6, 8);
-        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 6, before: 4, mask: 8 }));
+        assert_eq!(written.get(9), Some(Written { at: 6, before: 4, mask: 8 }));
         note(&mut written, 9, 5, 1);
-        assert_eq!(written.get_mut(9).copied(), Some(Written { at: 6, before: 4, mask: FULL }));
+        assert_eq!(written.get(9), Some(Written { at: 6, before: 4, mask: FULL }));
     }
 
     /// The table answers as the map did: the noted pages of a range, in
@@ -3922,7 +4482,7 @@ mod tests {
             written.insert(page, w(i as u64 + 1));
             map.insert(page, w(i as u64 + 1));
         }
-        assert!(written.get_mut(1).is_none() && written.get_mut(NEAR_PAGES + 1).is_none());
+        assert!(written.get(1).is_none() && written.get(NEAR_PAGES + 1).is_none());
         let ranges = [
             (0, 1),
             (0, usize::MAX),
@@ -3938,16 +4498,210 @@ mod tests {
         ];
         for (first, last) in ranges {
             let mut got = Vec::new();
-            written.each(first, last, |page, w| got.push((page, *w)));
+            let _ = written.each_after(first, last, After::All(0), |page, w| got.push((page, *w)));
             let want: Vec<(usize, Written)> = if first < last { map.range(first..last).map(|(&p, &w)| (p, w)).collect() } else { Vec::new() };
             assert_eq!(got, want, "{first:#x}..{last:#x}");
         }
         // A page forgotten is not noted; noting it again is.
         written.remove(5);
         written.remove(NEAR_PAGES);
-        assert!(written.get_mut(5).is_none() && written.get_mut(NEAR_PAGES).is_none());
+        assert!(written.get(5).is_none() && written.get(NEAR_PAGES).is_none());
         note(&mut written, 5, 9, 2);
-        assert_eq!(written.get_mut(5).copied(), Some(Written { at: 9, before: 0, mask: 2 }));
+        assert_eq!(written.get(5), Some(Written { at: 9, before: 0, mask: 2 }));
+    }
+
+    /// The walk by summaries gives what a walk of every entry gives, for
+    /// every number asked after: ranges that begin and end inside a group,
+    /// cross chunks, cross chunks that were never made (a page noted in a
+    /// chunk whose chunks below do not exist), and reach the pages above
+    /// the table.
+    #[test]
+    fn the_summaries_pass_by_only_what_is_not_newer() {
+        let mut written = Pages::new();
+        // (page, numbers it is noted at, in turn)
+        let notes: &[(usize, &[u64])] = &[
+            (3, &[2]),
+            (GROUP_PAGES - 1, &[4, 9]),
+            (GROUP_PAGES, &[7]),
+            (2 * GROUP_PAGES + 5, &[1, 3, 12]),
+            (CHUNK_PAGES - 1, &[6]),
+            // Chunks 1 to 6 are never made.
+            (7 * CHUNK_PAGES + 3, &[5]),
+            (7 * CHUNK_PAGES + GROUP_PAGES + 1, &[11]),
+            (NEAR_PAGES - 1, &[8]),
+            (NEAR_PAGES + 2, &[10]),
+            (NEAR_PAGES + 40, &[3]),
+        ];
+        for &(page, ats) in notes {
+            for &at in ats {
+                note(&mut written, page, at, 1);
+            }
+        }
+        let ranges = [
+            (0, 1),
+            (0, 4),
+            (4, GROUP_PAGES - 1),
+            (5, GROUP_PAGES + 1),
+            (GROUP_PAGES - 1, 2 * GROUP_PAGES + 6),
+            (2 * GROUP_PAGES + 5, 2 * GROUP_PAGES + 6),
+            (2 * GROUP_PAGES + 6, CHUNK_PAGES),
+            (CHUNK_PAGES - 2, 7 * CHUNK_PAGES + 4),
+            (2 * CHUNK_PAGES + 7, 5 * CHUNK_PAGES),
+            (7 * CHUNK_PAGES + 4, 7 * CHUNK_PAGES + GROUP_PAGES + 2),
+            (7 * CHUNK_PAGES, 8 * CHUNK_PAGES),
+            (9 * CHUNK_PAGES, NEAR_PAGES),
+            (NEAR_PAGES - 1, NEAR_PAGES + 3),
+            (NEAR_PAGES + 3, NEAR_PAGES + 41),
+            (0, usize::MAX),
+            (9, 9),
+            (9, 3),
+        ];
+        for (first, last) in ranges {
+            for after in 0..=13 {
+                let mut got = Vec::new();
+                let _ = written.each_after(first, last, After::All(after), |page, w| got.push((page, *w)));
+                assert_eq!(check_answer(&written, first, last, After::All(after), &got), None, "{first:#x}..{last:#x} after {after}");
+                assert!(got.iter().all(|(page, w)| w.at > after && (first..last).contains(page)));
+            }
+            // A number for each page (some past the end of the numbers
+            // given: after 0), and the answer's number below some of them.
+            if first < last && last - first < 1 << 20 {
+                for (shift, cap) in [(0u64, 13u64), (3, 13), (5, 7), (1, 0)] {
+                    let known: Vec<u64> = (0..(last - first).saturating_sub(2) as u64).map(|i| (i * 7 + shift) % 14).collect();
+                    let after = After::Pages { first, known: &known, cap };
+                    let mut got = Vec::new();
+                    let _ = written.each_after(first, last, after, |page, w| got.push((page, *w)));
+                    assert_eq!(check_answer(&written, first, last, after, &got), None, "{first:#x}..{last:#x} {shift} {cap}");
+                    assert!(got.iter().all(|&(page, w)| {
+                        let n = known.get(page - first).map_or(0, |&n| n.min(cap));
+                        w.at > n
+                    }));
+                }
+            }
+        }
+        // Nothing newer anywhere: an empty answer, with every group looked
+        // at passed by.
+        let mut got = Vec::new();
+        let (looked, walked) = written.each_after(0, 8 * CHUNK_PAGES, After::All(12), |page, w| got.push((page, *w)));
+        assert!(got.is_empty());
+        assert_eq!(walked, 0);
+        // Chunks 0 and 7, each in groups (the others were never made).
+        assert_eq!(looked, 2 * (CHUNK_PAGES / GROUP_PAGES) as u64);
+        // Asked after 8: only the groups of pages noted at 9, 11 and 12.
+        let (_, walked) = written.each_after(0, 8 * CHUNK_PAGES, After::All(8), |_, _| {});
+        assert_eq!(walked, 3);
+        // By the caller's numbers: a group is walked if one of its pages
+        // has a number below the group's highest, and only its pages noted
+        // later than their own number are listed.
+        let mut known = vec![12u64; GROUP_PAGES];
+        known[GROUP_PAGES - 1] = 8;
+        let mut got = Vec::new();
+        let (_, walked) = written.each_after(0, GROUP_PAGES, After::Pages { first: 0, known: &known, cap: 13 }, |page, w| got.push((page, *w)));
+        assert_eq!((walked, got.len(), got[0].0), (1, 1, GROUP_PAGES - 1));
+        known[GROUP_PAGES - 1] = 9;
+        let (_, walked) = written.each_after(0, GROUP_PAGES, After::Pages { first: 0, known: &known, cap: 13 }, |_, _| panic!("nothing is newer"));
+        assert_eq!(walked, 0);
+        // The answer's own number is lower than the caller's: what is noted
+        // after it is listed.
+        let (_, walked) = written.each_after(0, GROUP_PAGES, After::Pages { first: 0, known: &known, cap: 8 }, |page, w| got.push((page, *w)));
+        assert_eq!((walked, got.len()), (1, 2));
+    }
+
+    /// An answer numbered before the last one noted leaves the entry at the
+    /// later number and its group newer than that number: a walk after the
+    /// earlier answer still finds it, with where it was written unknown.
+    #[test]
+    fn a_late_answer_keeps_its_group_newer() {
+        let mut written = Pages::new();
+        note(&mut written, 70, 6, 1);
+        note(&mut written, 70, 5, 2);
+        for after in [0, 4, 5] {
+            let mut got = Vec::new();
+            let _ = written.each_after(64, 128, After::All(after), |page, w| got.push((page, *w)));
+            assert_eq!(got, [(70, Written { at: 6, before: 0, mask: FULL })], "after {after}");
+        }
+        let (_, walked) = written.each_after(64, 128, After::All(6), |_, _| panic!("nothing is after 6"));
+        assert_eq!(walked, 0);
+    }
+
+    /// A summary left behind its entries is found by the check: in a group
+    /// of the table, and above it.
+    #[test]
+    fn the_check_finds_a_summary_gone_wrong() {
+        let mut written = Pages::new();
+        note(&mut written, 3 * GROUP_PAGES + 7, 4, 1);
+        note(&mut written, 3 * GROUP_PAGES + 9, 9, 1);
+        note(&mut written, NEAR_PAGES + 5, 9, 1);
+        let answer = |w: &Pages, first, last, after: u64| {
+            let mut got = Vec::new();
+            let _ = w.each_after(first, last, After::All(after), |page, w| got.push((page, *w)));
+            got
+        };
+        let all = After::All;
+        let (first, last) = (3 * GROUP_PAGES, 4 * GROUP_PAGES);
+        assert_eq!(check_answer(&written, first, last, all(5), &answer(&written, first, last, 5)), None);
+        written.stale_top(3 * GROUP_PAGES + 9);
+        let got = answer(&written, first, last, 5);
+        assert!(got.is_empty(), "the stale group is passed by");
+        assert_eq!(check_answer(&written, first, last, all(5), &got), Some(3 * GROUP_PAGES + 9));
+        // After 0 the group is still passed by (its summary says nothing
+        // was noted), and the first entry is the one missed.
+        assert_eq!(check_answer(&written, first, last, all(0), &answer(&written, first, last, 0)), Some(3 * GROUP_PAGES + 7));
+        let (first, last) = (NEAR_PAGES, NEAR_PAGES + 10);
+        assert_eq!(check_answer(&written, first, last, all(5), &answer(&written, first, last, 5)), None);
+        written.stale_top(NEAR_PAGES + 5);
+        assert_eq!(check_answer(&written, first, last, all(5), &answer(&written, first, last, 5)), Some(NEAR_PAGES + 5));
+        // A wrong answer of another kind: an entry too many.
+        let mut fresh = Pages::new();
+        note(&mut fresh, 3 * GROUP_PAGES + 7, 4, 1);
+        let mut more = answer(&fresh, 0, 4 * GROUP_PAGES, 0);
+        more.push((4 * GROUP_PAGES - 1, Written { at: 1, before: 0, mask: 1 }));
+        assert_eq!(check_answer(&fresh, 0, 4 * GROUP_PAGES, all(0), &more), Some(4 * GROUP_PAGES - 1));
+    }
+
+    /// Asked ahead, the journal answers from what it holds, and with what
+    /// the caller has it lists only what is newer: than that, or than the
+    /// answer's own number, which a page the caller takes is stamped with.
+    #[test]
+    fn an_answer_from_the_asking_ahead_lists_only_what_is_newer() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        forget(start, end);
+        writes(start, end, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((p + PAGE + 8) as *mut u8).write_volatile(1);
+            ((p + 3 * PAGE + 8) as *mut u8).write_volatile(1);
+        }
+        ask_ahead(&[(start, p + 2 * PAGE), (p + 2 * PAGE, end)]);
+        let (page1, page3) = (p / PAGE + 1, p / PAGE + 3);
+        let (now, all) = writes_fine_look(start, end, false, &[], &mut Look::default()).expect("asked ahead");
+        assert_eq!(all.iter().map(|e| e.0).collect::<Vec<_>>(), [page1, page3]);
+        assert!(all.iter().all(|e| e.1.at == now));
+        // The caller has everything up to the asking: nothing to list, and
+        // no other asking made (the same number).
+        let (again, none) = writes_fine_look(start, end, false, &[now; 4], &mut Look::default()).expect("asked ahead");
+        assert_eq!((again, none.len()), (now, 0));
+        // Up to the asking before: both.
+        let (_, both) = writes_fine_look(start, end, false, &[now - 1; 4], &mut Look::default()).expect("asked ahead");
+        assert_eq!(both, all);
+        // A write of ours noted after the asking ahead (no submission's
+        // asking stands, so the asking keeps its number): listed even to a
+        // caller that says it has everything, being newer than the answer.
+        wrote(p + 2 * PAGE + 8, 1);
+        let (still, newer) = writes_fine_look(start, end, false, &[u64::MAX; 4], &mut Look::default()).expect("asked ahead");
+        assert_eq!(still, now);
+        assert_eq!(newer.iter().map(|e| e.0).collect::<Vec<_>>(), [p / PAGE + 2]);
+        assert!(newer[0].1.at > now);
+        let (_, listed) = asked(start, end, &[u64::MAX; 4]).expect("asked ahead");
+        assert_eq!(listed, [(p / PAGE + 2, newer[0].1.at)]);
+        ask_ahead_done();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A remapping forgets the unmapped runs it touches and no others.
@@ -4085,6 +4839,110 @@ mod tests {
         drop_views(section, &[one, two], SIZE);
     }
 
+    /// A write into a block that another thread has noted open and not
+    /// yet made writable ([`open`] between its two steps) waits for that
+    /// thread and goes through; it is no access violation of the writer's.
+    #[test]
+    fn a_write_into_a_block_being_opened_waits_for_the_opening() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        install();
+        // SAFETY: private memory of our own, of two blocks.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        assert_eq!(p % BLOCK, 0);
+        let block = p / BLOCK;
+        let protect = |how: u32| {
+            let mut old = 0;
+            // SAFETY: a block of our allocation; only its protection changes.
+            assert_ne!(unsafe { VirtualProtect(p as *const _, BLOCK, how, &mut old) }, 0);
+        };
+        let opening = |begins: bool| {
+            let mut l = Locked::blocks(Holder::Opening, [block]);
+            let (r, m, i) = l.at(block).expect("its region");
+            if begins { opening_begins(r, m, i) } else { opening_ends(r, m, i) }
+        };
+        // As `open` leaves a guarded block when its locks are let go: no
+        // guard's, an opening under way, read-only still.
+        protect(PAGE_READONLY);
+        opening(true);
+        let before = OPENED_BESIDE[0].load(Relaxed);
+        let writer = std::thread::spawn(move || {
+            // SAFETY: inside our allocation; the write faults and waits.
+            unsafe { ((p + 3 * KERNEL_PAGE) as *mut u8).write_volatile(7) };
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!writer.is_finished(), "the write waits for the opening");
+        // The opening's second step.
+        protect(PAGE_READWRITE);
+        opening(false);
+        writer.join().expect("the write went through");
+        // SAFETY: inside our allocation.
+        assert_eq!(unsafe { ((p + 3 * KERNEL_PAGE) as *const u8).read_volatile() }, 7);
+        assert!(OPENED_BESIDE[0].load(Relaxed) > before, "counted as a fault that waited");
+        // Asked with nothing under way: what the system says stands.
+        assert!(opened_beside(p + 3 * KERNEL_PAGE), "writable, opened by another thread before the asking");
+        protect(PAGE_READONLY);
+        assert!(!opened_beside(p + 3 * KERNEL_PAGE), "read-only with no opening under way: not the guards'");
+        protect(PAGE_READWRITE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// An opening for a write of the kernel's does not return while another
+    /// thread is opening a block of its range: the kernel's write meets no
+    /// read-only page (it would fail there with no fault of ours).
+    #[test]
+    fn an_opening_waits_for_another_threads_opening_of_its_blocks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: private memory of our own, of two blocks.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let block = p / BLOCK;
+        let protect = |how: u32| {
+            let mut old = 0;
+            // SAFETY: a block of our allocation; only its protection changes.
+            assert_ne!(unsafe { VirtualProtect(p as *const _, BLOCK, how, &mut old) }, 0);
+        };
+        let opening = |begins: bool| {
+            let mut l = Locked::blocks(Holder::Opening, [block]);
+            let (r, m, i) = l.at(block).expect("its region");
+            if begins { opening_begins(r, m, i) } else { opening_ends(r, m, i) }
+        };
+        // As `open` leaves a guarded block when its locks are let go.
+        protect(PAGE_READONLY);
+        opening(true);
+        let before = OPENINGS_AWAITED[0].load(Relaxed);
+        let writer = std::thread::spawn(move || {
+            writing(p + 100, 3 * KERNEL_PAGE);
+            // The kernel's write, as a read of the title's into its memory
+            // makes it: no fault of ours, it fails on a read-only page.
+            let bytes = [7u8; 16];
+            let mut done = 0;
+            // SAFETY: inside our allocation, from a buffer of that length.
+            let ok = unsafe { WriteProcessMemory(GetCurrentProcess(), (p + 100) as *const _, bytes.as_ptr().cast(), bytes.len(), &mut done) };
+            ok != 0 && done == bytes.len()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!writer.is_finished(), "the opening waits for the other thread's");
+        // The other thread's second step.
+        protect(PAGE_READWRITE);
+        opening(false);
+        assert!(writer.join().expect("no panic"), "the kernel wrote");
+        // SAFETY: inside our allocation.
+        assert_eq!(unsafe { ((p + 100) as *const u8).read_volatile() }, 7);
+        assert!(OPENINGS_AWAITED[0].load(Relaxed) > before, "counted as an opening that waited");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// The bits of a range in a region are those of its blocks there, and
     /// a range is all clean only if every block of it is noted so, in
     /// every region it touches.
@@ -4102,7 +4960,7 @@ mod tests {
             let mut l = Locked::blocks(Holder::Check, b..b + 70);
             for block in b..b + 70 {
                 let (r, m, i) = l.at(block).expect("its region");
-                note_guarded(r, m, i);
+                note_guarded(r, m, i, block);
             }
         }
         assert!(all_clean(b, b + 70) && all_clean(b + 5, b + 6) && all_clean(b, b));
@@ -4748,7 +5606,7 @@ mod tests {
             Some(vec![(block(one, 1), FULL << 5 | 1), (block(one, 2), FULL << 9 | 1)])
         );
         // Every other asking learns of the pages taken from the journal.
-        let (_, pages) = writes_fine(one, one + SIZE, true).expect("view memory");
+        let (_, pages) = writes_fine(one, one + SIZE, true, &[]).expect("view memory");
         assert!(pages.iter().any(|&(page, w)| page == block(one, 0) && w.at == now && w.mask == 0b1100));
         // And the other view of the pages reports them at its own check.
         let other = guard_fine(two, two + SIZE, None, &mut Look::default()).expect("view memory");

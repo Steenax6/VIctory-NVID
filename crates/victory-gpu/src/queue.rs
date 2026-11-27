@@ -1442,12 +1442,42 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once, once the
-/// flights sent ahead whose shaders may write the pages have landed
-/// ([`crate::host::land_before_remap`]).
-/// shortcut: a submission a queue still holds behind a wait (`Held`) runs
-/// after the remap, where the console runs it before when it was sent to
-/// the same queue first (fxceless/victory-fork #1131).
+/// one constant page or of unmapped pages).
+///
+/// A command of a queue's: the console makes the mapping behind the work
+/// the title sent before it, to whichever queue. Here the mapping is one
+/// of the title's address space and is made at once, because the title's
+/// own code goes on to use the addresses. Before it, what the queues'
+/// lines hold and is free to run is run from the caller's thread
+/// ([`before_sync`]), so that it takes its bytes where the console's lists
+/// take theirs, and the flights sent ahead whose shaders may write the
+/// pages land ([`crate::host::land_before_remap`]).
+///
+/// Running the lines is what keeps the host device at the open world's
+/// entry, where the title maps pages by the thousand: without it the
+/// device was lost (removal reason: hung) in 34 of 115 entries on
+/// 2026-11-27, with it in none of 28. Why it does is not known. It is not
+/// the order of the reads and the remap: with the lines run behind the
+/// remap none of 13 entries was lost, and with the submissions that stood
+/// reading the pages mapped before by their physical place (no read through
+/// a remapped address was left) 4 of 18 were. Nor is it the remap falling
+/// into a preparation: kept out of one, 1 of 14 was lost. Nor the host
+/// copies of textures let go in that second: with none let go, 1 of 4.
+/// What the forms that hold have in common is that the caller does not go
+/// on until the lines are empty.
+///
+/// Its cost, two runs a side (an indication): none in the median of a
+/// whole run; about 10 ms a frame in the first 15 s of the world, 2 to
+/// 8 ms where the opening cutscene loads, none where nothing is loaded.
+///
+/// Tried and not kept: the copy standing in a line and made in its place
+/// while the title's thread goes on. In its own queue's line it changed
+/// nothing (5 of 14 entries lost: that line is empty, the lists stand in
+/// another queue's); placed among the submissions of every queue by the
+/// order the title made them in, 4 of 7 were lost.
+/// shortcut: a submission a queue still holds behind a wait that is not
+/// met runs after the remap, where the console runs it before when it was
+/// sent first (fxceless/victory-fork #1131).
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1466,9 +1496,12 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    // The console maps the pages behind the work sent before: what that
-    // work's shaders write must land in the pages mapped now, not in those
-    // mapped next (flights sent ahead land after their submission returned).
+    // What the title sent before runs first (see above).
+    #[cfg(windows)]
+    before_sync();
+    // And what that work's shaders write must land in the pages mapped
+    // now, not in those mapped next (flights sent ahead land after their
+    // submission returned).
     #[cfg(windows)]
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
