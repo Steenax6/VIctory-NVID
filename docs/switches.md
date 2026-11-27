@@ -706,6 +706,24 @@ room's single wrong frames were still there with this (3 pictures in
 
 ## Tried and not kept
 
+- The landing in the order of the flights for copies of the same pages
+  (2026-11-27; branch `cpu/landfix`, merged and taken out again the same
+  night). `VICTORY_LAND_SAMPLE=1` set alone reads a few stretches apart:
+  63 of 278,218 in 125 s of the prologue. The title maps one buffer at
+  several addresses and binds it by more than one; each address has a
+  host copy of its own; two flights that wrote the buffer by two of its
+  addresses and land together are merged into title memory in the order
+  of the addresses, so the earlier flight's bytes can end over the later
+  one's. With the landing's pieces placed by the pages they lie in and a
+  copy merged behind the copies of every earlier flight the sample read 0
+  (of 644,220 stretches in the prologue, of 419,030 at the world's entry)
+  and the frame was as long as before (56.2 against 57.4 ms), but the
+  first room again showed single frames with objects in another's
+  material data: in both runs with it that were watched, in none without.
+  Why is not known (the order was by a copy's last flight; a copy two
+  flights wrote stood behind as a whole). Whether the bytes the sample
+  finds apart ever show, in the picture or in what the title does, is not
+  known either: nothing has been traced to them. Not pursued.
 - `VICTORY_ASYNC_PRESENT=1` (opt-in; the title records the next frame
   while the last is sent): its first form passed every wait the queues
   held at the present call, and the title faulted within two minutes. A
