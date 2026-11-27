@@ -164,66 +164,68 @@ fn overlap(range: (usize, usize), from: usize, to: usize) -> Option<(usize, usiz
     (a < b).then_some((a, b))
 }
 
-/// Every step of `lists` (the steps of each run, in order) that
-/// `blocked_by` would stop at, if it were asked again after each of them
-/// had been let go, up to a step that runs ours (it stops there). `late`
-/// are this submission's own copies left to its landing.
+/// Every step of one run's `steps` that `blocked_by` would stop at, if it
+/// were asked again after each of them had been let go, added to `hits`;
+/// the place of a step that runs ours, if one is reached (`blocked_by`
+/// stops there). `late` are this submission's own copies left to its
+/// landing, those not met yet. One run at a time, as `blocked_by` walks
+/// them: a list may stand twice in a submission, and its steps are behind
+/// its own lock.
 fn walk(
     written: &[(usize, usize)],
     copied: &[(usize, usize)],
-    mut late: Vec<(usize, usize, usize)>,
-    lists: &[&[Step]],
-) -> (Vec<Hit>, Option<(usize, usize)>) {
+    late: &mut Vec<(usize, usize, usize)>,
+    run: usize,
+    steps: &[Step],
+    hits: &mut Vec<Hit>,
+) -> Option<(usize, usize)> {
     let waits = |at: usize, len: usize| late_order() && touches(copied, at, at.saturating_add(len));
-    let mut hits = Vec::new();
-    for (run, steps) in lists.iter().enumerate() {
-        for (index, step) in steps.iter().enumerate() {
-            let mut hit = |kind: usize, ranges: Vec<(usize, usize)>, host: Option<(u64, u64)>| {
-                hits.push(Hit { kind, run, index, ranges, host });
-            };
-            match step {
-                &Step::Copy(dst, src, len) => {
-                    if let Some(at) = late.iter().position(|c| *c == (dst, src, len)) {
-                        late.swap_remove(at);
-                        continue;
-                    }
-                    let (by_src, by_dst) = (touches(written, src, src + len), touches(written, dst, dst + len));
-                    let reads = waits(src, len);
-                    let writes = (by_src || by_dst) && (by_dst || !fill_ahead::ahead(src, len));
-                    if reads || writes {
-                        let mut ranges = Vec::new();
-                        if reads || by_src {
-                            ranges.push((src, len));
-                        }
-                        if by_dst {
-                            ranges.push((dst, len));
-                        }
-                        hit(if reads { 0 } else { 3 }, ranges, None);
-                    }
+    for (index, step) in steps.iter().enumerate() {
+        let mut hit = |kind: usize, ranges: Vec<(usize, usize)>, host: Option<(u64, u64)>| {
+            hits.push(Hit { kind, run, index, ranges, host });
+        };
+        match step {
+            &Step::Copy(dst, src, len) => {
+                if let Some(at) = late.iter().position(|c| *c == (dst, src, len)) {
+                    late.swap_remove(at);
+                    continue;
                 }
-                &Step::Fill(_, src, len) => {
-                    let reads = waits(src, len);
-                    if reads || (touches(written, src, src + len) && !fill_ahead::ahead(src, len)) {
-                        hit(if reads { 1 } else { 4 }, vec![(src, len)], None);
+                let (by_src, by_dst) = (touches(written, src, src + len), touches(written, dst, dst + len));
+                let reads = waits(src, len);
+                let writes = (by_src || by_dst) && (by_dst || !fill_ahead::ahead(src, len));
+                if reads || writes {
+                    let mut ranges = Vec::new();
+                    if reads || by_src {
+                        ranges.push((src, len));
                     }
-                }
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
-                        hit(5, vec![(at, len)], None);
+                    if by_dst {
+                        ranges.push((dst, len));
                     }
+                    hit(if reads { 0 } else { 3 }, ranges, None);
                 }
-                Step::Run(_) => return (hits, Some((run, index))),
-                Step::Refresh(shadow, address, len) => {
-                    if waits(*address, *len) {
-                        hit(2, vec![(*address, *len)], Some(shadow.span()));
-                    }
-                }
-                Step::GpuWrite(..) | Step::Host(_) => {}
             }
+            &Step::Fill(_, src, len) => {
+                let reads = waits(src, len);
+                if reads || (touches(written, src, src + len) && !fill_ahead::ahead(src, len)) {
+                    hit(if reads { 1 } else { 4 }, vec![(src, len)], None);
+                }
+            }
+            Step::Texture(staging) => {
+                let (at, len) = staging.memory();
+                if touches(written, at, at + len) {
+                    hit(5, vec![(at, len)], None);
+                }
+            }
+            Step::Run(_) => return Some((run, index)),
+            Step::Refresh(shadow, address, len) => {
+                if waits(*address, *len) {
+                    hit(2, vec![(*address, *len)], Some(shadow.span()));
+                }
+            }
+            Step::GpuWrite(..) | Step::Host(_) => {}
         }
     }
-    (hits, None)
+    None
 }
 
 /// The pairs of the steps that would wait and the ranges flights leave
@@ -285,11 +287,14 @@ pub(super) fn begin(runs: &[&HostList]) {
         }
         (line.written.clone(), late_copied(&line), flights, place)
     };
-    let late = late_copies(&written, runs);
-    let guards: Vec<_> = runs.iter().map(|r| r.deferred()).collect();
-    let lists: Vec<&[Step]> = guards.iter().map(|g| g.copies.as_slice()).collect();
-    let (hits, run) = walk(&written, &copied, late, &lists);
-    drop(guards);
+    let mut late = late_copies(&written, runs);
+    let (mut hits, mut run) = (Vec::new(), None);
+    for (k, list) in runs.iter().enumerate() {
+        run = walk(&written, &copied, &mut late, k, &list.deferred().copies, &mut hits);
+        if run.is_some() {
+            break;
+        }
+    }
     let (mut pairs, dropped) = pairs(&hits, &flights);
     let (mut budget, mut capped) = (WAIT_CAP, dropped > 0);
     for pair in &mut pairs {
@@ -627,24 +632,22 @@ mod tests {
             Step::Run(Box::new(|| {})),
             Step::Fill(at(0x70_0000), at(0x30_0000), 0x40),
         ];
-        let (hits, run) = walk(&written, &copied, Vec::new(), &[&steps]);
+        let mut hits = Vec::new();
+        let run = walk(&written, &copied, &mut Vec::new(), 0, &steps, &mut hits);
         let kinds: Vec<(usize, usize)> = hits.iter().map(|h| (h.kind, h.index)).collect();
         assert_eq!(kinds, [(0, 0), (1, 2), (3, 3)]);
         assert_eq!(run, Some((0, 4)));
         assert_eq!(hits[2].ranges, [(0x10_0100, 0x40)]);
         // Its own copy left to its landing is skipped.
-        let (hits, _) = walk(&written, &copied, vec![(0x50_0000, 0x30_0080, 0x40)], &[&steps[..1]]);
-        assert!(hits.is_empty());
+        let mut own = Vec::new();
+        walk(&written, &copied, &mut vec![(0x50_0000, 0x30_0080, 0x40)], 0, &steps[..1], &mut own);
+        assert!(own.is_empty());
         // Pairs: a copy's destination, and for a step of the written kind the shaders' range.
         let flights = [FlightInfo { number: 7, place: 1, copies: vec![(0x30_0000, 0x50_0000, 0x100)], shaders: vec![(0x10_0000, 0x11_0000)] }];
-        let (found, dropped) = pairs(&hits_of(&written, &copied, &steps), &flights);
+        let (found, dropped) = pairs(&hits, &flights);
         assert_eq!(dropped, 0);
         let ov: Vec<(usize, usize, usize)> = found.iter().map(|p| (p.hit, p.from, p.to)).collect();
         assert_eq!(ov, [(0, 0x30_0080, 0x30_00c0), (1, 0x30_00ff, 0x30_0100), (2, 0x10_0100, 0x10_0140)]);
         assert!(found.iter().all(|p| p.place == 2));
-    }
-
-    fn hits_of(written: &[(usize, usize)], copied: &[(usize, usize)], steps: &[Step]) -> Vec<Hit> {
-        walk(written, copied, Vec::new(), &[steps]).0
     }
 }
