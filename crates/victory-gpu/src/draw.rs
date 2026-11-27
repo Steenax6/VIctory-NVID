@@ -715,17 +715,19 @@ pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`); the buffer slots
-/// the pass over buffer views looked at ([`Picked`]); the microseconds
-/// submissions waited for that pass, and those the pass took on its own
-/// thread; since the last frame line.
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// the passes over buffer views looked at ([`picked_pass`]); the
+/// microseconds submissions waited for their pass, and those the passes
+/// took on their own thread; the passes that found slots to look at; since
+/// the last frame line.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Per host heap, by its address: the host copy and range each slot's
 /// buffer view reads, kept from pass to pass by the pass over the heap's
-/// buffer views (`heap_buffers`), and the passes made over that heap.
+/// buffer views ([`picked_pass`]), with the frames a pass over that heap
+/// ran in and the last of them.
 type HeapRanges = crate::descriptor::slots::SlotMap<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-static HEAP_RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, HeapRanges)>>> =
-    std::sync::Mutex::new(None);
+type HeapKept = (u64, u64, HeapRanges);
+static HEAP_RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapKept>>> = std::sync::Mutex::new(None);
 /// The host heaps that went since the pass last looked ([`forget_heap_ranges`]).
 static HEAPS_GONE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
@@ -737,8 +739,8 @@ static HEAPS_GONE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new
 /// own until the pass next looked at every slot (each sixteenth)
 /// (fxceless/victory-fork pull request 1276 found it there).
 ///
-/// The pass holds the table for its whole length, on a recording thread
-/// (some 20 ms a frame), and this is called wherever the title lets the
+/// The pass holds the table for its whole length, on its own thread, and
+/// this is called wherever the title lets the
 /// heap go: the heap is noted, and taken out here only if the table is
 /// free; else by the pass, before it looks the next heap up.
 pub(crate) fn forget_heap_ranges(heap: &crate::descriptor::host::HostHeap) {
@@ -754,12 +756,12 @@ pub(crate) fn forget_heap_ranges(heap: &crate::descriptor::host::HostHeap) {
 }
 
 /// Takes what is kept for the heaps that went out of `kept`.
-fn heaps_gone(kept: &mut Option<std::collections::HashMap<usize, (u64, HeapRanges)>>) -> Vec<HeapRanges> {
+fn heaps_gone(kept: &mut Option<std::collections::HashMap<usize, HeapKept>>) -> Vec<HeapRanges> {
     let gone = std::mem::take(&mut *HEAPS_GONE.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(kept) = kept.as_mut() else {
         return Vec::new();
     };
-    let ranges: Vec<HeapRanges> = gone.iter().filter_map(|heap| kept.remove(heap)).map(|(_, ranges)| ranges).collect();
+    let ranges: Vec<HeapRanges> = gone.iter().filter_map(|heap| kept.remove(heap)).map(|(_, _, ranges)| ranges).collect();
     let views: usize = ranges.iter().map(|r| r.len()).sum();
     if views > 0 {
         tracing::info!(
@@ -769,130 +771,272 @@ fn heaps_gone(kept: &mut Option<std::collections::HashMap<usize, (u64, HeapRange
     }
     ranges
 }
-/// The pass over the view heap's buffer views for shaders that pick them by
-/// an index they compute ([`State::heap_buffers`]), made beside the
-/// recording: the list that started it goes on at once, and takes what the
-/// pass found when it is submitted ([`HostList::defer_picked`]).
-///
-/// The pass ran where it was started, on the title's thread, inside the
-/// first list call after a frame began that bound such a shader: 12 to 45 ms
-/// of that call (50,000 slots the title had written since the pass before,
-/// their host views made and their copies found). In the first room that
-/// call fell, in every other frame, into the one list the title's render
-/// thread waits for before it submits the rest of the frame: 30 ms of that
-/// list against 15 (the timeline of 2026-11-26).
-///
-/// What the pass does and when it counts is unchanged. Its slots are made
-/// from the moment it is started, as before; it is done before the list
-/// that started it is submitted, where before it was done before that list
-/// recorded its next command (other lists never waited for it: they were
-/// recorded and submitted beside it, as now); and the ranges it brings up
-/// to date are steps of that list, at the place among its steps where the
-/// pass was started. Passes run one after the other, in the order started.
-pub(crate) struct Picked {
-    /// The host copies' ranges to bring up to date (copy, title address,
-    /// bytes), once the pass has found them.
-    found: std::sync::Mutex<Option<Vec<PickedRange>>>,
-    done: std::sync::Condvar,
-}
-
-/// A range of a host copy the pass found picked views to read.
+/// A range of a host copy the pass over a view heap's buffer views found
+/// picked views to read (copy, title address, bytes).
 pub(crate) type PickedRange = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
 
-/// Passes started and not yet done, and the word that one is.
-static PICKED_RUNNING: (std::sync::Mutex<u32>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+/// The passes over the view heaps' buffer views, for shaders that pick a
+/// buffer from the heap by an index they compute ([`State::heap_buffers`]).
+/// A pass looks at what the title copied into its heaps, makes the host
+/// slots of the buffer views written since the pass before
+/// ([`picked_pass`]), and finds the ranges of the copies they read, which a
+/// submission brings up to date ahead of its lists.
+///
+/// The rule. The card reads a picked slot when the list runs, and nothing
+/// says which slots a computed index names. So a list may go to the card
+/// only with every buffer view the title wrote before it submitted the list
+/// made and the bytes behind it brought up to date; and a view must not be
+/// made under a list that is prepared or on the card already, unless that
+/// list cannot name it.
+///
+/// How it is kept. Every submit call of the title's whose lists bind such a
+/// shader asks for a pass of its own, in the call ([`picked_asked`]), and
+/// its submission waits for that pass where it is prepared and takes what
+/// the passes found for it ([`picked_found`]): the refreshes become steps
+/// of its first such list, and a submission's steps all run before its
+/// lists go to the card, the bytes of copies in the card's memory in the
+/// same submission ahead of them. Passes run one after the other on a
+/// thread of their own, so the title's thread does not wait and the
+/// submitting thread only where it catches up with the pass. A pass makes
+/// the views written since the pass before it looked: whatever a pass
+/// makes was written after every earlier submit call's own pass looked,
+/// which that call asked for when the title made it, so no list of an
+/// earlier submit call names it (the title, as on the console, does not
+/// write a descriptor a list it has submitted still reads). That holds for
+/// a pass asked for at any time, so one is also started ahead wherever a
+/// list first binds such a shader and where such a list is closed
+/// ([`picked_ahead`]): it makes, beside the recording, what the title has
+/// written so far, and leaves less to the passes submissions wait for.
+/// What a pass found is taken by the first submission prepared whose
+/// submit call came after every submit call's pass that ran before it: the
+/// bytes are copied no earlier than the first list that can name the view
+/// is prepared.
+///
+/// What it was. The pass ran once a frame, started by the frame's first
+/// bind of such a shader: inside that list call first (12 to 45 ms of it,
+/// in the first room every other frame in the one list the title's render
+/// thread waits for: the timeline of 2026-11-26), then beside the recording
+/// with its refreshes steps of the list that started it. Either way it made
+/// the views written up to its start, which were mostly those of the frame
+/// before (the title's copies into its heap were only seen where a
+/// submission was prepared), while that frame's lists stood in the line or
+/// were on the card: they had read nothing there, and from then on a view
+/// over bytes the pass's own list had yet to copy. And a list of the pass's
+/// own frame submitted before the one that started it went to the card
+/// without its refreshes. One entry into the open world, 150 s: 945 lists
+/// of the second kind, 19,609 of the first, and every one of the 50,669
+/// lists with such binds came up with views written and not made.
+/// (Made where the submission is prepared instead, on the submitting
+/// thread, the passes took 18 to 23 ms of it a frame in the open world and
+/// the frame 88 to 96 ms against 72.)
+struct Passes {
+    /// The passes submit calls asked for: the last one's number, and the
+    /// last one done.
+    asked: u64,
+    done: u64,
+    /// What passes found and no submission has taken, each with the number
+    /// of the first submit call whose lists can name what the pass made.
+    found: Vec<(u64, Vec<PickedRange>)>,
+}
 
-impl Picked {
-    /// Starts the pass over `heap`'s buffer views (its host side `host`) of
-    /// frame `frame` on the thread kept for it.
-    fn start(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> std::sync::Arc<Picked> {
-        let pass = std::sync::Arc::new(Picked { found: std::sync::Mutex::new(None), done: std::sync::Condvar::new() });
-        let (heap_at, host_at) = (std::ptr::from_ref(heap) as usize, std::ptr::from_ref(host) as usize);
-        *PICKED_RUNNING.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        let for_thread = pass.clone();
-        let run = move || {
-            // SAFETY: the heap and its host side outlive the pass: a heap
-            // that goes waits for the passes started ([`picked_settled`]).
-            let (heap, host) = unsafe {
-                (&*(heap_at as *const crate::descriptor::Heap), &*(host_at as *const crate::descriptor::host::HostHeap))
-            };
-            let found = picked_pass(heap, host, frame);
-            *for_thread.found.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
-            for_thread.done.notify_all();
-            *PICKED_RUNNING.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-            PICKED_RUNNING.1.notify_all();
-        };
-        // The thread takes the passes in the order they are started. Without
-        // it (it could not be made) the pass runs here, as it did.
-        type Pass = Box<dyn FnOnce() + Send>;
-        static THREAD: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<Pass>>>> = std::sync::OnceLock::new();
-        let thread = THREAD.get_or_init(|| {
-            let (to, from) = std::sync::mpsc::channel::<Pass>();
-            std::thread::Builder::new()
-                .name("victory-picked".into())
-                .spawn(move || {
-                    for pass in from {
-                        pass();
-                    }
-                })
-                .ok()
-                .map(|_| std::sync::Mutex::new(to))
-        });
-        let run: Pass = Box::new(run);
-        match thread {
-            Some(to) => {
-                if let Err(back) = to.lock().unwrap_or_else(|e| e.into_inner()).send(run) {
-                    (back.0)();
+static PASSES: (std::sync::Mutex<Passes>, std::sync::Condvar) =
+    (std::sync::Mutex::new(Passes { asked: 0, done: 0, found: Vec::new() }), std::sync::Condvar::new());
+/// A pass started ahead ([`picked_ahead`]) waits for its turn.
+static PASS_AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One pass over every view heap, for submit call `call` (0: started
+/// ahead), on the thread that runs them.
+fn picked_run(call: u64) {
+    if call == 0 {
+        PASS_AHEAD.store(false, Ordering::Release);
+        // A submit call's own pass waits behind this one: that one looks
+        // at everything this one would.
+        let passes = PASSES.0.lock().unwrap_or_else(|e| e.into_inner());
+        if passes.asked > passes.done {
+            return;
+        }
+    }
+    // What the title copied into its heaps since they were last looked at.
+    crate::descriptor::sync_heaps();
+    let frame = crate::frame::current();
+    let mut found = Vec::new();
+    crate::descriptor::each_view_heap(|heap, host| found.append(&mut picked_pass(heap, host, frame)));
+    let mut passes = PASSES.0.lock().unwrap_or_else(|e| e.into_inner());
+    // (Passes run in the order asked for: every submit call's pass up to
+    // `done` looked before this one, and none after it.)
+    let of = if call == 0 { passes.done + 1 } else { call };
+    if !found.is_empty() {
+        passes.found.push((of, found));
+    }
+    if call != 0 {
+        passes.done = call;
+        PASSES.1.notify_all();
+    }
+}
+
+/// Asks for a pass on the thread kept for the passes, which runs them in
+/// the order asked: one of a submit call's own (`own`: its number comes
+/// back) or one ahead (0). Without the thread (it could not be made) the
+/// pass runs here.
+fn picked_send(own: bool) -> u64 {
+    static THREAD: std::sync::OnceLock<Option<std::sync::mpsc::Sender<u64>>> = std::sync::OnceLock::new();
+    // (Numbered and sent as one: the passes run in the order of their
+    // numbers, whichever threads submit.)
+    static ORDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    let thread = THREAD.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<u64>();
+        std::thread::Builder::new()
+            .name("victory-picked".into())
+            .spawn(move || {
+                for call in from {
+                    picked_run(call);
                 }
-            }
-            None => run(),
-        }
-        pass
+            })
+            .ok()
+            .map(|_| to)
+    });
+    let call = if own {
+        let mut passes = PASSES.0.lock().unwrap_or_else(|e| e.into_inner());
+        passes.asked += 1;
+        passes.asked
+    } else {
+        0
+    };
+    if !thread.as_ref().is_some_and(|to| to.send(call).is_ok()) {
+        picked_run(call);
     }
+    call
+}
 
-    /// A pass that has found `found` already (tests).
-    #[cfg(test)]
-    pub(crate) fn done(found: Vec<PickedRange>) -> std::sync::Arc<Picked> {
-        std::sync::Arc::new(Picked { found: std::sync::Mutex::new(Some(found)), done: std::sync::Condvar::new() })
-    }
-
-    /// What the pass found, waited for; taken, so a second asking finds
-    /// nothing more.
-    pub(crate) fn found(&self) -> Vec<PickedRange> {
-        let mut found = self.found.lock().unwrap_or_else(|e| e.into_inner());
-        if found.is_none() {
-            let began = std::time::Instant::now();
-            let _span = crate::timeline::span("pwait>", "pwait<", 0, 0);
-            while found.is_none() {
-                found = self.done.wait(found).unwrap_or_else(|e| e.into_inner());
-            }
-            HEAP_PASS_PARTS[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
-        found.as_mut().map(std::mem::take).unwrap_or_default()
+/// A list binds a shader that picks buffers by index for the first time,
+/// or such a list is closed: a pass is started ahead of the submit calls
+/// ([`Passes`]), unless one already waits for its turn.
+pub(crate) fn picked_ahead() {
+    if !PASS_AHEAD.swap(true, Ordering::AcqRel) {
+        picked_send(false);
     }
 }
 
-/// Returns when no pass over a heap's buffer views is running or waiting to
-/// run ([`Picked`]): for a view heap that goes, whose slots a pass may still
-/// be making.
-pub(crate) fn picked_settled() {
-    let mut running = PICKED_RUNNING.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *running > 0 {
-        running = PICKED_RUNNING.1.wait(running).unwrap_or_else(|e| e.into_inner());
+/// The title submits lists that bind a shader picking buffers by index: a
+/// pass of this submit call's own is asked for ([`Passes`]). Its number,
+/// by which the submission waits for it ([`picked_found`]).
+pub(crate) fn picked_asked() -> u64 {
+    picked_send(true)
+}
+
+/// Where a submission is prepared: waits for the pass its submit call
+/// asked for ([`picked_asked`]), and takes what the passes found for that
+/// call and the ones before it: the ranges to bring up to date ahead of
+/// the submission's lists.
+pub(crate) fn picked_found(call: u64) -> Vec<PickedRange> {
+    let mut passes = PASSES.0.lock().unwrap_or_else(|e| e.into_inner());
+    if passes.done < call {
+        let began = std::time::Instant::now();
+        let _span = crate::timeline::span("pwait>", "pwait<", call, 0);
+        while passes.done < call {
+            passes = PASSES.1.wait(passes).unwrap_or_else(|e| e.into_inner());
+        }
+        HEAP_PASS_PARTS[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    let mut found = Vec::new();
+    passes.found.retain_mut(|(of, ranges)| {
+        let take = *of <= call;
+        if take {
+            found.append(ranges);
+        }
+        !take
+    });
+    found
+}
+
+/// Diagnostics: the submissions with a list that binds a shader picking
+/// buffers by index, said with the frame line ([`picked_counts::line`]):
+/// how many, with how many such lists and binds; those whose submit call
+/// had asked for no pass (prepared with one asked for there and waited
+/// for); the buffer views written and not made when the submission had
+/// its passes' refreshes: they were written after its submit call; and
+/// the buffer views a pass looked at that read title memory and for which
+/// it found no host copy, which is what a list can still name and read
+/// nothing of.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod picked_counts {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Since the last line: such submissions (0), their lists (1) and binds
+    /// (2); those that asked for their pass where they were prepared (3);
+    /// the views written and not made then (4); the submissions that stood
+    /// in a line not begun (5) and those in the air (6) then, and the most
+    /// in the air (7); the buffer views passes found no copy for (8).
+    static COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    /// Since the start: 0, 3 and 8 of [`COUNTS`].
+    static EVER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+    /// A pass found no host copy for a buffer view that reads title memory.
+    pub(super) fn left() {
+        COUNTS[8].fetch_add(1, Relaxed);
+        EVER[2].fetch_add(1, Relaxed);
+    }
+
+    /// A submission with `lists` such lists (`binds` binds) is prepared and
+    /// has its passes' refreshes (`late`: its pass was asked for only
+    /// there): `unmade` buffer views are written and not made now.
+    pub(crate) fn prepared(lists: u64, binds: u64, late: bool, unmade: u64) {
+        let (standing, air) = (crate::queue::standing(), crate::host::submissions_in_flight());
+        for (i, n) in [(0, 1), (1, lists), (2, binds), (3, u64::from(late)), (4, unmade), (5, standing), (6, air)] {
+            COUNTS[i].fetch_add(n, Relaxed);
+        }
+        COUNTS[7].fetch_max(air, Relaxed);
+        EVER[0].fetch_add(1, Relaxed);
+        EVER[1].fetch_add(u64::from(late), Relaxed);
+    }
+
+    /// The counts' line, where anything was counted.
+    pub(crate) fn line() {
+        let c: [u64; 9] = std::array::from_fn(|i| COUNTS[i].swap(0, Relaxed));
+        if c[0] == 0 {
+            return;
+        }
+        let each = c[0] as f64;
+        tracing::info!(
+            "shaders that pick buffers by index, since the last line: {} submissions with {} lists that bind one ({} binds) \
+             were prepared, each behind the pass its submit call asked for, with what the passes found brought up to date \
+             ahead of its lists; {} of them had no pass asked for and waited for one asked for there; {:.0} buffer views \
+             a submission were written and not made by then (written after its submit call: its lists do not name them); \
+             {:.1} submissions stood in a line not begun and {:.1} were in the air on average then (at most {} in the air: \
+             none of them names a view a later pass makes); the passes found no host copy for {} buffer views that read \
+             title memory (a list that names one reads nothing there); since the start: {} such submissions, {} without \
+             a pass asked for, {} views without a copy",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4] as f64 / each,
+            c[5] as f64 / each,
+            c[6] as f64 / each,
+            c[7],
+            c[8],
+            EVER[0].load(Relaxed),
+            EVER[1].load(Relaxed),
+            EVER[2].load(Relaxed),
+        );
     }
 }
 
-/// One pass over the buffer views of `heap` ([`Picked`]): the host slots of
-/// the views written since the pass before are made, and the ranges of the
-/// host copies the heap's buffer views read are returned, to be brought up
-/// to date by the list that started the pass.
+/// One pass over the buffer views of `heap` ([`Passes`]): the host slots
+/// of the views written since the pass before are made, and the
+/// ranges of host copies to bring up to date are returned: in the first
+/// pass of frame `frame`, those every buffer view of the heap reads (the
+/// title's writes into them are looked for once a frame, as before); in a
+/// later one, those the views made now read.
+/// shortcut: what the title writes into the buffers of views made earlier,
+/// between the submissions of one frame, is seen a frame late.
 fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<PickedRange> {
     let started = std::time::Instant::now();
-    let _span = crate::timeline::span("pass>", "pass<", 0, 0);
     // Per host heap: the host copy and range each slot's buffer view
     // reads, kept from pass to pass. Only the slots written since the
     // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-    // at best); all of them every 16 passes, because a view of a
+    // at best); all of them every 16 frames, because a view of a
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     // (By slot with a multiply for a hash, not SipHash: the pass looks
@@ -902,18 +1046,28 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
     let _gone: Vec<HeapRanges>;
     let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
     _gone = heaps_gone(&mut kept);
-    let (passes, ranges) = kept
+    let (frames, last, ranges) = kept
         .get_or_insert_with(Default::default)
         .entry(std::ptr::from_ref(host) as usize)
-        .or_insert_with(|| (0, HeapRanges::default()));
+        .or_insert_with(|| (0, u64::MAX, HeapRanges::default()));
+    // The frame's first pass over this heap.
+    let first = std::mem::replace(last, frame) != frame;
     let changed = host.buffer_changes();
-    let slots = if *passes % 16 == 0 {
+    let slots = if first && *frames % 16 == 0 {
         ranges.clear();
         host.buffer_slots()
     } else {
         changed
     };
-    *passes += 1;
+    if first {
+        *frames += 1;
+    } else if slots.is_empty() {
+        return Vec::new();
+    }
+    let _span = crate::timeline::span("pass>", "pass<", slots.len() as u64, u64::from(first));
+    if !slots.is_empty() {
+        HEAP_PASS_PARTS[4].fetch_add(1, Ordering::Relaxed);
+    }
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -921,9 +1075,8 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
     HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
     // The slots' views are made and their copies found on the threads
     // kept for wide work, a part of the slots each, where there are
-    // many (`heap_pass_wide`): the list that started the pass waits for
-    // it at its submission (48,000 slots a pass in the intro, 30 ms on
-    // one thread).
+    // many (`heap_pass_wide`): a submission waits for its pass (48,000
+    // slots a frame in the intro, 30 ms on one thread).
     // Each slot is its own work (`HostHeap::mirror` locks by slot, the
     // copies' table is read); what they find is put into `ranges` here.
     if heap_pass_wide() && slots.len() >= 2048 {
@@ -948,11 +1101,15 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
                     let mut out: Found = Vec::with_capacity(chunk.len());
                     let _together = crate::descriptor::host::Together::begin();
                     for index in chunk {
-                        let range = heap
-                            .handle(index)
-                            .and_then(|handle| host.mirror_passed(index, handle))
-                            .and_then(|view| crate::descriptor::host::buffer_copy(&view))
+                        let view = heap.handle(index).and_then(|handle| host.mirror_passed(index, handle));
+                        let range = view
+                            .as_ref()
+                            .and_then(crate::descriptor::host::buffer_copy)
                             .map(|(shadow, address, len)| (shadow, address, address + len));
+                        #[cfg(feature = "diagnostics")]
+                        if range.is_none() && view.as_ref().is_some_and(crate::descriptor::host::buffer_reads) {
+                            picked_counts::left();
+                        }
                         out.push((index, range));
                     }
                     *found[part].lock().unwrap_or_else(|e| e.into_inner()) = out;
@@ -1005,6 +1162,10 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                #[cfg(feature = "diagnostics")]
+                if crate::descriptor::host::buffer_reads(&view) {
+                    picked_counts::left();
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1015,15 +1176,18 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
         }
     }
     let views = ranges.len() as u32;
-    // Per host copy, the span its picked views cover. (Borrowed from
-    // `ranges`, whose lock is held to the end of the pass: only this pass
-    // takes it, once a frame.)
+    // Per host copy, the span its picked views cover: of all of them in
+    // the frame's first pass, of those looked at now in a later one.
+    // (Borrowed from `ranges`, whose lock is held to the end of the pass:
+    // only this pass takes it.)
     let mut spans: std::collections::HashMap<
         usize,
         (&std::sync::Arc<crate::shadow::Shadow>, u64, u64),
         std::hash::BuildHasherDefault<crate::descriptor::slots::SlotHasher>,
     > = Default::default();
-    for (shadow, from, to) in ranges.values() {
+    let viewed: Box<dyn Iterator<Item = &(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> + '_> =
+        if first { Box::new(ranges.values()) } else { Box::new(slots.iter().filter_map(|index| ranges.get(index))) };
+    for (shadow, from, to) in viewed {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         let span = spans.entry(key).or_insert((shadow, *from, *to));
         span.1 = span.1.min(*from);
@@ -1066,7 +1230,7 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
     static LOGGED: AtomicU64 = AtomicU64::new(0);
     // The first pass and every growth of the set by half.
     let seen = LOGGED.load(Ordering::Relaxed);
-    if u64::from(views) > seen + seen / 2 {
+    if first && u64::from(views) > seen + seen / 2 {
         LOGGED.store(u64::from(views), Ordering::Relaxed);
         tracing::info!(
             slots = slots.len(),
@@ -2264,7 +2428,8 @@ impl State {
     /// its host slot and its memory brought up to date when `list` is
     /// submitted. Tables tell us which views a draw reads; nothing tells
     /// us which of the heap's a computed index names, so all of them are
-    /// made ready, once per list.
+    /// made ready by the passes beside the recording, the last of them
+    /// asked for where the title submits the list ([`Passes`]).
     /// shortcut: the buffers are read, not written: what such a shader
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
@@ -2280,6 +2445,8 @@ impl State {
         let gpu = host.strides_gpu()?;
         // One key per list, as textures have: no title resource is there.
         const ONCE: usize = usize::MAX - 0x5e;
+        #[cfg(feature = "diagnostics")]
+        list.picked_bind();
         if !list.first_use(ONCE) {
             return Some(gpu);
         }
@@ -2287,21 +2454,23 @@ impl State {
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
-        // The pass itself once per frame: per list it ran up to 51 times a
+        // (Not a pass over every view per list: that ran up to 51 times a
         // frame over 81,000 views and 4,100 host copies, 18 s of every
-        // frame (2026-11-24, run 11).
-        // shortcut: what the title writes into such buffers between lists
-        // of one frame is seen a frame late.
+        // frame, 2026-11-24, run 11.)
+        // The passes over the buffer views run beside the recording
+        // ([`Passes`]): one is started ahead here, and the ranges the passes
+        // find are brought up to date from where the list stands now in
+        // its steps, where its submission is prepared.
+        list.defer_picked();
+        picked_ahead();
+        // The pass over the textures once per frame, at the frame's first
+        // such bind.
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
-        // The pass over the buffer views runs beside the recording
-        // ([`Picked`]): this list takes the ranges it finds where it stands
-        // now in the list's steps, when the list is submitted.
-        list.defer_picked(Picked::start(heap, host, frame));
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -4969,7 +5138,7 @@ mod tests {
         let table = || HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let mut ranges = HeapRanges::default();
         ranges.insert(0, (copy.clone(), start, start + 4096));
-        table().get_or_insert_with(Default::default).insert(key, (1, ranges));
+        table().get_or_insert_with(Default::default).insert(key, (1, 0, ranges));
         let held = std::sync::Arc::strong_count(&copy);
         drop(heap);
         // (Had a pass of another test held the table just then, the heap
@@ -5035,27 +5204,6 @@ mod tests {
         let mut other = heap;
         other.swap(1, 6);
         assert_ne!(print, table_print(at(&other), 8, plain));
-    }
-
-    /// What a pass over the heap's picked views found, a list takes once:
-    /// a second asking finds nothing more ([`Picked::found`]).
-    #[test]
-    fn what_a_pass_found_is_taken_once() {
-        let memory = crate::resource::Memory::zeroed(4096, 4096).expect("a test buffer");
-        let start = memory.address();
-        if crate::host::host().is_none() {
-            return;
-        }
-        crate::shadow::register(start as usize, start, 4096);
-        let copy = crate::shadow::find(start, 4096).expect("a host copy");
-        let pass = Picked::done(vec![(copy.clone(), start, 256)]);
-        let found = pass.found();
-        assert_eq!(found.len(), 1);
-        assert!(std::sync::Arc::ptr_eq(&found[0].0, &copy));
-        assert_eq!((found[0].1, found[0].2), (start, 256));
-        assert!(pass.found().is_empty());
-        picked_settled();
-        crate::shadow::unregister(start as usize, start);
     }
 
     /// An acceleration structure's view address is the location in its

@@ -272,6 +272,38 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Calls `each` with every shader-visible view heap that has a host side and
+/// a table of strides (its buffer views can be picked by index,
+/// `crate::draw::picked_now`), the heaps' table held: none goes meanwhile.
+#[cfg(windows)]
+pub(crate) fn each_view_heap(mut each: impl FnMut(&Heap, &host::HostHeap)) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get()
+            && !heap.samplers()
+            && host.strides_gpu().is_some()
+        {
+            each(heap, host);
+        }
+    }
+}
+
+/// Diagnostics: over the shader-visible heaps, the buffer views the title
+/// has written that no pass over picked buffer views has made
+/// (`HostHeap::buffer_views_unmade`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn buffer_views_unmade() -> u64 {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        // SAFETY: registered heaps are live (removed when dropped).
+        .filter_map(|&(_, _, at)| unsafe { &*(at as *const Heap) }.host.get().and_then(|host| host.as_ref()))
+        .map(|host| host.buffer_views_unmade())
+        .sum()
+}
+
 /// Whether [`sync_heaps`] takes a page's records at once and mirrors the
 /// buffer views among them in runs (`HostHeap::mirror_picked`);
 /// `VICTORY_HEAP_SYNC_FAST=0`: one record at a time, as before.
@@ -490,11 +522,8 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
-        // A pass over a view heap's buffer views that runs beside the
-        // recording holds the heap by address (`crate::draw::Picked`).
-        if self.host.get().is_some_and(Option::is_some) && !self.samplers() {
-            crate::draw::picked_settled();
-        }
+        // (A pass over the view heaps' buffer views holds the table while
+        // it runs, `each_view_heap`: the heap goes after it.)
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);

@@ -604,8 +604,8 @@ a machine other work ran on: indications, to be timed side by side):
   pass ran inside the first list call that bound a shader picking by
   index after a frame began, 12 to 45 ms of that call, and in every
   other frame that call was in the chain of 19 lists the title's render
-  thread waits for. The pass runs on a thread of its own now; the list
-  that starts it takes what it found at its submission.
+  thread waits for. The passes run on a thread of their own now (what
+  waits for them: below).
 - A draw made ready again what its list had made ready before: 140,000
   views a frame asked for, 122,000 of them known. A list remembers
   (`Seen` in `draw.rs`; `VICTORY_SEEN_CHECK=1` makes everything ready
@@ -628,10 +628,81 @@ profile running, against 65 to 68): the title's present now stands
 through most of the frame, and the submitting thread is on a processor
 78 % of it. What the recording still waits for: the guards' lock in the
 title's own write faults (18 ms a frame of the recording threads in
-those runs, 8 in the profile of the afternoon), and the pass over
-picked buffer views, which the title's submit waited 5 ms a frame for
-once the recording was that quick (it takes 21 to 36 ms for the slots of
-two frames, on five threads that share three locks a slot).
+those runs, 8 in the profile of the afternoon).
+
+### Shaders that pick buffers by index: when their views are made
+
+A shader that picks a buffer from the view heap by an index it computes
+reads the slot when its list runs on the card, and nothing says which
+slots it names. So a list may go to the card only with every buffer view
+the title wrote before it submitted the list made, and the bytes behind
+it brought up to date; and no view may be made under a list that is
+prepared or on the card, unless that list cannot name it.
+
+The pass that makes those views ran once a frame, started by the frame's
+first bind of such a shader, its refreshes steps of the list that
+started it. Counted at one entry into the open world (150 s, 2026-11-27):
+945 lists with such binds were prepared before the list that carried
+their pass's refreshes; 19,609 while the next frame's pass was making
+the views their own frame had written (a slot they had read as nothing
+became a view over bytes not copied yet, under a list in the line or on
+the card); and every one of 50,669 came up with views written and not
+made. The evening before, one world entry in 16 had lost the device with
+the card standing in a draw; that this was the cause is not shown. What
+is shown is the first room: one frame every few seconds drew single
+objects with another's material data (hair light grey, the bedding with
+the window's wire fence): 6 such pictures in 66 s on the tree of
+2026-11-26 (none before that day's work), 3 with every list of a pass's
+own frame behind its refreshes and the change of the next section, none
+in 1,988 pictures with what follows. One run each.
+
+Now every submit call of the title's whose lists bind such a shader asks
+for a pass of its own, its submission waits for that pass where it is
+prepared, and what the passes found is brought up to date ahead of its
+lists. Passes are also started ahead, where a list first binds such a
+shader and where such a list is closed; they run one after the other on
+their own thread. Why no list in the line or on the card can name a view
+a later pass makes is written at `Passes` in `draw.rs`. A diagnostics
+build says with the frame line how many submissions stood for their
+pass, whether any came with no pass asked for, how many buffer views
+were written and not made by then (those written after the submit call),
+and how many buffer views that read title memory a pass found no host
+copy for (what a list can still name and read nothing of).
+
+What it costs, in the open world (single runs of 150 s from one save):
+some 30 passes a frame take 25 to 30 ms of their thread, submissions
+wait 3 to 9 ms a frame for them, and the frame was 67 to 76 ms (72 on
+average) where it was 69 to 79 (mostly 72) with the pass once a frame;
+73 to 78 in two runs a build ran beside. In the first room: 10 to 20
+passes, 22 to 27 ms of their thread, 4 to 8 ms waited, the frame 59 to
+66 ms as before. In 22,797 submissions of one world run none came with
+no pass asked for, and the passes found a host copy for every buffer
+view that reads title memory. With the passes made on the submitting
+thread itself, where a submission is prepared, they took 18 to 23 ms of
+it and the frame in the open world was 88 to 96 ms: not kept.
+
+What stays as it was: the bytes behind views made earlier are looked at
+once a frame, so what the title writes into such a buffer between two
+submissions of one frame is seen a frame late; and a view whose memory
+had no host copy when its pass looked is made when all slots are looked
+at again, every 16 frames.
+
+### What is let go while a submission stands in a line
+
+`retire` kept a host object for the submissions started when it was let
+go, and dropped it at once if none was running. With
+`VICTORY_ASYNC_SUBMIT=1` a submission the title has made stands in its
+queue's line until the submitting thread takes it, and has no number
+until then: what was let go meanwhile did not wait for it. Such an
+object now waits until every submission that stood has begun, and then
+for the submissions started by that moment (`AWAITED` in `host.rs`). In
+the first room that is, per 5 s, some 90,000 objects that were dropped
+at once before and 600,000 that were kept only for the submissions
+begun (about one a draw: by that number, a draw's table slots letting go
+of what they showed last), and 15 to 50 let go by the idle sweeps.
+Whether a list that stood ever named one of them is not known; the first
+room's single wrong frames were still there with this (3 pictures in
+66 s; see above for what took them away).
 
 ## Tried and not kept
 

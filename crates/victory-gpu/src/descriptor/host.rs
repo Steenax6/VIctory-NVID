@@ -2438,6 +2438,18 @@ impl HostHeap {
         self.changed.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
+    /// Diagnostics: the title slots on the list of [`HostHeap::buffer_changes`]
+    /// that hold a buffer view and are not made: written, and waiting for
+    /// the pass that takes the list (a draw that reads one through a table
+    /// makes it before that).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn buffer_views_unmade(&self) -> u64 {
+        // (The order the pass's making takes them in.)
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+        changed.noted().iter().filter(|&&index| buffers.contains(index) && self.made_key(index) == Some(0)).count() as u64
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.
@@ -3860,6 +3872,14 @@ pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
 fn view_extent() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_EXTENT").is_none_or(|v| v != "0"))
+}
+
+/// Diagnostics: whether `view` is a buffer view that reads title memory
+/// (its range is not empty): one [`buffer_copy`] finds a copy for, unless
+/// the memory has none.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn buffer_reads(view: &View) -> bool {
+    buffer_range(view).is_some_and(|(_, len)| len > 0)
 }
 
 /// The host copy buffer view `view` reads, and the title range (address,

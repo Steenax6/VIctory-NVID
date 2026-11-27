@@ -259,12 +259,14 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
-/// `lists` are about to be submitted: each takes the refreshes of the pass
-/// over picked buffer views its recording started, if it started one
-/// (`crate::host::HostList::picked_in`), in every part of a list cut at
-/// waits.
+/// The title submits `lists`: if any of them binds a shader that picks
+/// buffers from the view heap by index, a pass over the heaps' buffer views
+/// is asked for (`crate::draw::picked_asked`), and the first such list (in
+/// every part of a list cut at waits) stands for it where the submission
+/// is prepared (`crate::host::HostList::picked_stands`).
 #[cfg(windows)]
-pub(crate) fn picked_in(lists: &[This]) {
+pub(crate) fn picked_asked(lists: &[This]) {
+    let mut call = None;
     for &this in lists {
         if this.is_null() {
             continue;
@@ -272,7 +274,9 @@ pub(crate) fn picked_in(lists: &[This]) {
         // SAFETY: the title passes our lists.
         let list = unsafe { &*this.cast::<List>() };
         for host in list.earlier.iter().map(|part| &part.host).chain(&list.host) {
-            host.picked_in();
+            if host.picks() {
+                host.picked_stands(if call.is_none() { *call.insert(crate::draw::picked_asked()) } else { 0 });
+            }
         }
     }
 }
@@ -781,6 +785,11 @@ extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
+        // What the title wrote while the list was recorded is made ahead
+        // of its submit call (`crate::draw::Passes`).
+        if host.picks() {
+            crate::draw::picked_ahead();
+        }
     }
     S_OK
 }

@@ -38,7 +38,7 @@ impl SlotSet {
         was
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn contains(&self, slot: u32) -> bool {
         self.words
             .get(slot as usize / 64)
@@ -81,6 +81,12 @@ impl SlotList {
         if self.set.insert(slot) {
             self.list.push(slot);
         }
+    }
+
+    /// The slots noted, left noted (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn noted(&self) -> &[u32] {
+        &self.list
     }
 
     /// The slots noted, and none from now on.
