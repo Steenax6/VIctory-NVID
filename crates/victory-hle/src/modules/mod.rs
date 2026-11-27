@@ -39,6 +39,8 @@ pub mod xgameui;
 pub mod xmem;
 pub mod xnetworking;
 pub mod xpackage;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod waits;
 pub mod xstore;
 pub mod xsystem;
 pub mod xuser;
@@ -71,5 +73,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // Only with `VICTORY_TIMELINE`: the title's waits in the frame timeline.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    all.extend(waits::module());
     all
 }

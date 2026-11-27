@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# The console build of a title is compiled for a processor with AVX2, BMI and FMA, so every
+# machine that runs one has them: the layer is built for the same level (x86-64-v3).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

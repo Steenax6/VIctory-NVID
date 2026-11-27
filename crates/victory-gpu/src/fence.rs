@@ -147,6 +147,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(windows)]
+    crate::timeline::ev("fence=", this as u64, value);
     fence.value.store(value, Ordering::Release);
     waiters.retain(|&(wanted, event, asked)| {
         let reached = wanted <= value;

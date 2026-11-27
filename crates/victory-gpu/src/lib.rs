@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
 #[cfg(windows)]
 mod adapter;
 #[cfg(windows)]
@@ -56,6 +58,8 @@ mod placed;
 mod primitive;
 #[cfg(windows)]
 mod rawrange;
+#[cfg(windows)]
+mod read_census;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
@@ -77,12 +81,16 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod switch;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+pub mod timeline;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

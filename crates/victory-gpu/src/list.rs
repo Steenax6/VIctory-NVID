@@ -134,7 +134,16 @@ struct List {
     tally: Tally,
     #[cfg(windows)]
     after: std::sync::Mutex<Option<crate::resubmit::Summary>>,
+    /// With calls only written down (`VICTORY_THIN=1`, [`thin`]): the
+    /// recording being written and its words not handed over yet.
+    #[cfg(windows)]
+    thin: thin::Front,
 }
+
+/// List calls written down and translated by threads of ours
+/// (`VICTORY_THIN=1`).
+#[cfg(windows)]
+pub(crate) mod thin;
 
 /// Indices into [`Tally::counts`].
 #[cfg(windows)]
@@ -246,6 +255,28 @@ pub(crate) fn tables_done(lists: &[This]) {
         let list = unsafe { &*this.cast::<List>() };
         if list.earlier.is_empty() {
             list.state.lock().unwrap_or_else(|e| e.into_inner()).tables_done();
+        }
+    }
+}
+
+/// The title submits `lists`: if any of them binds a shader that picks
+/// buffers from the view heap by index, a pass over the heaps' buffer views
+/// is asked for (`crate::draw::picked_asked`), and the first such list (in
+/// every part of a list cut at waits) stands for it where the submission
+/// is prepared (`crate::host::HostList::picked_stands`).
+#[cfg(windows)]
+pub(crate) fn picked_asked(lists: &[This]) {
+    let mut call = None;
+    for &this in lists {
+        if this.is_null() {
+            continue;
+        }
+        // SAFETY: the title passes our lists.
+        let list = unsafe { &*this.cast::<List>() };
+        for host in list.earlier.iter().map(|part| &part.host).chain(&list.host) {
+            if host.picks() {
+                host.picked_stands(if call.is_none() { *call.insert(crate::draw::picked_asked()) } else { 0 });
+            }
         }
     }
 }
@@ -644,6 +675,30 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(windows)]
+    if thin::on() {
+        // The title's list only writes its calls down; a list of ours does
+        // them ([`thin`]), and it needs no host list of its own.
+        let mut list = boxed(kind, pipeline, false);
+        list.object = if crate::device::newer() {
+            Object::new(&thin::NEWER_FUNCTIONS)
+        } else {
+            Object::new(&thin::FUNCTIONS)
+        };
+        // Lists start open: what the title records before its first reset
+        // is a recording too.
+        let title = std::ptr::from_ref::<List>(&*list) as usize;
+        list.thin.begin(kind, pipeline, title);
+        return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    }
+    object::hand_out(LIST, boxed(kind, pipeline, true), iid, &LIST_IIDS, out)
+}
+
+/// A list of `kind` with `pipeline` bound, open, with a host list if
+/// `host` and there is a host GPU.
+fn boxed(kind: u32, pipeline: This, host: bool) -> Box<List> {
+    #[cfg(not(windows))]
+    let _ = host;
     let list = Box::new(List {
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
@@ -659,7 +714,7 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| host).and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -680,10 +735,12 @@ fn new_list(
         tally: Tally::default(),
         #[cfg(windows)]
         after: Default::default(),
+        #[cfg(windows)]
+        thin: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    list
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -714,9 +771,25 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    // With what the recording holds: draws, indexed draws, indirect
+    // executions and dispatches, sixteen bits each.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        let counts = unsafe { &(*this.cast::<List>()).tally.counts };
+        let held = [KIND_DRAW, KIND_INDEXED, KIND_INDIRECT, KIND_DISPATCH].iter().enumerate().fold(0u64, |all, (at, &kind)| {
+            all | u64::from(counts[kind].load(std::sync::atomic::Ordering::Relaxed).min(0xffff)) << (16 * at)
+        });
+        crate::timeline::ev("close", this as u64, held);
+    }
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
+        // What the title wrote while the list was recorded is made ahead
+        // of its submit call (`crate::draw::Passes`).
+        if host.picks() {
+            crate::draw::picked_ahead();
+        }
     }
     S_OK
 }
@@ -724,6 +797,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    crate::timeline::ev("reset", this as u64, 0);
     // What is recorded next is not the recording submitted before.
     #[cfg(windows)]
     crate::resubmit::forget(this);
