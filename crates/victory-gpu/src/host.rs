@@ -3536,6 +3536,8 @@ mod land_jobs;
 /// flights, and whether the wait was needed ([`fill_check`]).
 #[cfg(feature = "diagnostics")]
 mod fill_check;
+#[cfg(feature = "diagnostics")]
+mod read_wait;
 
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
@@ -3942,6 +3944,8 @@ fn late_line(frames: f64) {
     }
     #[cfg(feature = "diagnostics")]
     fill_check::line();
+    #[cfg(feature = "diagnostics")]
+    read_wait::line_for(frames);
     fill_ahead::line(frames);
     crate::read_census::line(frames);
     {
@@ -6485,7 +6489,11 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
+                #[cfg(feature = "diagnostics")]
+                read_wait::begin(runs);
                 relay_wait(why, |line| blocked_by(&line.written, &late_copied(line), runs, false).is_none());
+                #[cfg(feature = "diagnostics")]
+                read_wait::end();
             } else {
                 self.settle(&mut submitted, why);
             }
