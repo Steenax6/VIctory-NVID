@@ -1189,8 +1189,6 @@ impl Written {
         };
         #[cfg(windows)]
         crate::timeline::ev("bop", at as u64, value);
-        #[cfg(windows)]
-        crate::land_trace::wrote(b'p', at as usize, bytes);
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {

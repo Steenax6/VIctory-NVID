@@ -3045,7 +3045,6 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     let mode = page_writes();
     let end = at.saturating_add(len);
-    crate::land_trace::wrote(if pages { b'd' } else { b'r' }, at, len);
     if pages {
         WRITTEN[0].fetch_add(1, Relaxed);
         WRITTEN[1].fetch_add(len as u64, Relaxed);
