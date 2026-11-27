@@ -349,7 +349,7 @@ impl Pass<'_> {
         const KERNEL: usize = 4096;
         let mut out = [0u64; 5];
         let (start, end, step) = (self.start as usize, self.end as usize, self.step as usize);
-        let Some((_, written)) = crate::watch::writes_fine(start, end, true) else {
+        let Some((_, written)) = crate::watch::writes_fine(start, end, true, &[]) else {
             return out;
         };
         // Where the slots with host counterparts end.

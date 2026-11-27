@@ -2906,6 +2906,57 @@ mod plan_tests {
     }
 }
 
+/// The asking up to which a refresh needs nothing of the journal for a
+/// page of a copy (`taken`, `held`: the stamps of the whole page and of a
+/// part of it, as [`Shadow::copy_stale_fine`] reads them): an entry
+/// numbered at or below it changes neither what the refresh copies nor
+/// the stamps it leaves, as long as it is also at or below the answer's
+/// own number (which a page the refresh takes is stamped with). A page
+/// taken whole needs entries after that; one never taken but held in part,
+/// entries after the part was taken; one never taken at all is copied as
+/// asked whatever the journal says (`u64::MAX`). The check of
+/// [`land_taken`] looks at the entry of every page it reads, so with it a
+/// page not taken whole needs all of them (0).
+fn page_known(taken: u64, held: Option<u64>, landed_check: bool) -> u64 {
+    match (taken, held) {
+        (0, _) if landed_check => 0,
+        (0, Some(at)) => at,
+        (0, None) => u64::MAX,
+        (taken, _) => taken,
+    }
+}
+
+/// [`page_known`] of each page `first..=last` of a copy whose first page
+/// is `base`, in page order, into `known`: what the copy tells the journal
+/// it has (`crate::watch::writes_fine_look`). `partial`: the parts held,
+/// if a refresh goes by them. Stamps only rise, so the numbers stay good
+/// while the journal is asked. (Ends at the copy's end; a range that
+/// begins before it gets no numbers, and the journal lists all.)
+fn pages_known(
+    copied: &[u64],
+    partial: Option<&std::collections::HashMap<usize, (u64, Vec<(u32, u32)>)>>,
+    base: usize,
+    (first, last): (usize, usize),
+    landed_check: bool,
+    known: &mut Vec<u64>,
+) {
+    known.clear();
+    if first < base {
+        return;
+    }
+    let (lo, hi) = (first - base, (last + 1 - base).min(copied.len()));
+    known.extend(copied.get(lo..hi).unwrap_or_default().iter().enumerate().map(|(k, &taken)| {
+        let held = if taken == 0 { partial.and_then(|p| p.get(&(lo + k))).map(|h| h.0) } else { None };
+        page_known(taken, held, landed_check)
+    }));
+}
+
+thread_local! {
+    /// Room for [`pages_known`], kept between refreshes (a refresh's range
+    /// is up to some thousands of pages, and there are 5,000 a frame).
+    static KNOWN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// [`stale_pages_in`] with what the journal knows of where in each page:
 /// for each page of `[a, e)` the copy must take, the runs of it (offsets in
 /// the page, inside `[a, e)` and the copy `bounds`) not known to be the
@@ -2991,6 +3042,132 @@ mod stale_tests {
         let same: Vec<usize> = pages(true).into_iter().map(|(p, _)| p).collect();
         let pairs: Vec<(usize, u64)> = written.iter().map(|&(p, x)| (p, x.at)).collect();
         assert_eq!(same, stale_pages_in(base, &copied, at(0x100), at(0x104), &pairs));
+    }
+
+    /// The journal lists only the entries numbered after what the copy has
+    /// of their pages ([`pages_known`]) or after the answer's number: with
+    /// those alone, a refresh copies the same bytes and leaves the same
+    /// stamps as with every entry, and so do the merge's and the settling's
+    /// decisions. Over many made-up copies, parts held and journals.
+    #[test]
+    fn the_entries_left_out_change_nothing_a_refresh_does() {
+        use crate::watch::{FULL, Written};
+        use std::collections::HashMap;
+        let base = 0x100;
+        let at = |page: usize| page * PAGE;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % n
+        };
+        // One page of `copy_stale_fine`: what is copied, what the page holds
+        // after, its stamp, and what the check of the landings' takings is
+        // handed of the entry (`None`: passed by).
+        let decide = |taken: u64, held: Option<(u64, &[(u32, u32)])>, entry: Option<Written>, now: u64, inside, seg| {
+            let (last, before, mask) = entry.map_or((0, 0, FULL), |w| (w.at, w.before, w.mask));
+            if taken != 0 && last <= taken {
+                return None;
+            }
+            let (need, after) = page_plan(inside, seg, taken, held, last, before, mask);
+            Some((need, after, now.max(last), (last, entry.map_or(0, |w| w.mask))))
+        };
+        // What the journal lists of `written` for the pages `range`.
+        let listed = |written: &[(usize, Written)], range: std::ops::Range<usize>, known: &[u64], now: u64| -> Vec<(usize, Written)> {
+            written
+                .iter()
+                .copied()
+                .filter(|&(p, w)| range.contains(&p) && w.at > known.get(p - range.start).map_or(0, |&n| n.min(now)))
+                .collect()
+        };
+        let mut known = Vec::new();
+        for case in 0..20_000 {
+            let pages = 1 + next(6) as usize;
+            let copied: Vec<u64> = (0..pages).map(|_| [0, 0, 3, 5, 8][next(5) as usize]).collect();
+            let mut partial: HashMap<usize, (u64, Vec<(u32, u32)>)> = HashMap::new();
+            for i in 0..pages {
+                if next(3) == 0 {
+                    let lo = 4096 * next(8) as u32;
+                    partial.insert(i, ([2, 4, 6, 9][next(4) as usize], vec![(lo, lo + 4096 * (1 + next(4) as u32))]));
+                }
+            }
+            let now = [5, 7, 10][next(3) as usize];
+            let mut written: Vec<(usize, Written)> = Vec::new();
+            for i in 0..pages {
+                if next(3) != 0 {
+                    let at = 1 + next(11);
+                    let before = [0, 2, 4][next(3) as usize].min(at - 1);
+                    let mask = if next(2) == 0 { FULL } else { 1 << next(16) };
+                    written.push((base + i, Written { at, before, mask }));
+                }
+            }
+            // A range of the copy, beginning and ending anywhere in pages.
+            let first = next(pages as u64) as usize;
+            let last = first + next((pages - first) as u64) as usize;
+            let (a, e) = (at(base + first) + 100 * next(3) as usize, at(base + last + 1) - 100 * next(3) as usize);
+            let bounds = (at(base), at(base + pages));
+            for (parts, check) in [(false, false), (true, false), (false, true), (true, true)] {
+                pages_known(&copied, parts.then_some(&partial), base, (a / PAGE, (e - 1) / PAGE), check, &mut known);
+                let listed = listed(&written, a / PAGE..e.div_ceil(PAGE), &known, now);
+                for page in a / PAGE..e.div_ceil(PAGE) {
+                    let i = page - base;
+                    let entry = |list: &[(usize, Written)]| list.iter().find(|(p, _)| *p == page).map(|(_, w)| *w);
+                    let held = if parts { partial.get(&i).map(|(p, r)| (*p, r.as_slice())) } else { None };
+                    let p0 = page * PAGE;
+                    let inside = ((p0.max(bounds.0) - p0) as u32, ((p0 + PAGE).min(bounds.1) - p0) as u32);
+                    let seg = ((p0.max(a) - p0) as u32, ((p0 + PAGE).min(e) - p0) as u32);
+                    let (full, left) = (decide(copied[i], held, entry(&written), now, inside, seg), decide(copied[i], held, entry(&listed), now, inside, seg));
+                    let without_check = |d: Option<(Runs, Runs, u64, (u64, u16))>| d.map(|d| (d.0, d.1, d.2));
+                    if check {
+                        assert_eq!(full, left, "case {case}, page {page:#x}, parts {parts}, with the check");
+                    } else {
+                        assert_eq!(without_check(full), without_check(left), "case {case}, page {page:#x}, parts {parts}");
+                    }
+                }
+            }
+            // The merge's and the settling's: no part held, no check.
+            pages_known(&copied, None, base, (a / PAGE, (e - 1) / PAGE), false, &mut known);
+            let listed = listed(&written, a / PAGE..e.div_ceil(PAGE), &known, now);
+            for kernel_pages in [false, true] {
+                assert_eq!(
+                    stale_runs_in(base, &copied, bounds, a, e, &written, kernel_pages),
+                    stale_runs_in(base, &copied, bounds, a, e, &listed, kernel_pages),
+                    "case {case}"
+                );
+            }
+            let pairs = |list: &[(usize, Written)]| list.iter().map(|&(p, w)| (p, w.at)).collect::<Vec<_>>();
+            assert_eq!(
+                stale_pages_in(base, &copied, a, e, &pairs(&written)),
+                stale_pages_in(base, &copied, a, e, &pairs(&listed)),
+                "case {case}"
+            );
+        }
+    }
+
+    /// What a copy has of each page: its stamp, a part's where the page was
+    /// only taken in part, nothing to ask where it was never taken, and
+    /// everything to ask for the check of the landings' takings.
+    #[test]
+    fn what_a_copy_has_of_each_page() {
+        use std::collections::HashMap;
+        let mut partial = HashMap::new();
+        let mut known = Vec::new();
+        let mut of = |copied: &[u64], partial: Option<&HashMap<usize, (u64, Vec<(u32, u32)>)>>, range, check| {
+            pages_known(copied, partial, 0x100, range, check, &mut known);
+            known.clone()
+        };
+        assert_eq!(of(&[5, 8, 6], Some(&partial), (0x100, 0x102), false), [5, 8, 6]);
+        assert_eq!(of(&[5, 8, 6], Some(&partial), (0x101, 0x102), false), [8, 6]);
+        assert_eq!(of(&[0, 8], Some(&partial), (0x100, 0x101), false), [u64::MAX, 8]);
+        assert_eq!(of(&[0, 8], Some(&partial), (0x100, 0x101), true), [0, 8]);
+        partial.insert(0, (3, vec![(0, 4096)]));
+        partial.insert(1, (9, vec![(0, 4096)]));
+        assert_eq!(of(&[0, 8], Some(&partial), (0x100, 0x101), false), [3, 8]);
+        assert_eq!(of(&[0, 8], Some(&partial), (0x100, 0x101), true), [0, 8]);
+        assert_eq!(of(&[0, 8], None, (0x100, 0x101), false), [u64::MAX, 8]);
+        // Pages past the copy's end are not its own; a range before its
+        // first page gets nothing.
+        assert_eq!(of(&[7], Some(&partial), (0x100, 0x105), false), [7]);
+        assert!(of(&[7], Some(&partial), (0xff, 0x100), false).is_empty());
     }
 }
 
@@ -3833,9 +4010,16 @@ impl Shadow {
         }
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
-            None => true,
+        KNOWN.with(|known| {
+            let known = &mut known.borrow_mut();
+            busy.into_iter().any(|(a, e)| {
+                // What the copy has: the journal lists only what is newer.
+                pages_known(&copied, None, base, (a / PAGE, (e - 1) / PAGE), false, known);
+                match crate::watch::asked(a, e, known) {
+                    Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+                    None => true,
+                }
+            })
         })
     }
 
@@ -3899,7 +4083,13 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes_fine(a, e, true) else {
+            // What the copy has: the journal lists only what is newer.
+            let answer = KNOWN.with(|known| {
+                let known = &mut known.borrow_mut();
+                pages_known(&self.copied.lock().unwrap_or_else(|e| e.into_inner()), None, base, (a / PAGE, (e - 1) / PAGE), false, known);
+                crate::watch::writes_fine(a, e, true, known)
+            });
+            let Some((now, written)) = answer else {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::buffers::gave_up(crate::copystat::buffers::NO_JOURNAL, self.start, self.len, a, 0, *runs_left);
                 return true;
@@ -4096,13 +4286,26 @@ impl Shadow {
             let mut look = Look { seen: looked.map(|l| l.0), ..Look::default() };
             // (The asking's number, for the diagnostics' record.)
             let mut asking = 0u64;
-            let copied = if refresh_parts() || refresh_kernel_pages() {
-                crate::watch::writes_fine_look(from, to, true, &mut look).map(|(now, written)| {
+            let fine = refresh_parts() || refresh_kernel_pages();
+            // What the copy has of the range: the journal lists only what
+            // is newer (the pages it acts on are among those).
+            let answer = KNOWN.with(|known| {
+                let known = &mut known.borrow_mut();
+                {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    let partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+                    let parts = (fine && refresh_parts()).then_some(&*partial);
+                    pages_known(&copied, parts, self.start as usize / PAGE, (from / PAGE, (to - 1) / PAGE), fine && land_taken() == 2, known);
+                }
+                crate::watch::writes_fine_look(from, to, true, known, &mut look)
+            });
+            let copied = if fine {
+                answer.map(|(now, written)| {
                     asking = now;
                     self.copy_stale_fine(from, to, now, &written)
                 })
             } else {
-                crate::watch::writes_fine_look(from, to, true, &mut look)
+                answer
                     .map(|(now, written)| (now, written.into_iter().map(|(p, w)| (p, w.at)).collect::<Vec<_>>()))
                     .map(|(now, written)| {
                         asking = now;
@@ -4447,6 +4650,18 @@ impl Shadow {
         let landed_check = land_taken() == 2;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        {
+            let used = written
+                .iter()
+                .filter(|&&(page, w)| {
+                    let i = page - base;
+                    let held = if parts { partial.get(&i).map(|h| h.0) } else { None };
+                    w.at > page_known(copied[i], held, landed_check).min(now)
+                })
+                .count();
+            crate::watch::answered(written.len(), used);
+        }
         let mut writes = written.iter().peekable();
         // What to copy, as title addresses, joined where they touch.
         let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -6473,7 +6688,7 @@ mod card_merge_tests {
             }
         };
         // The copy has taken everything, as of an asking that found nothing.
-        let (taken, found) = crate::watch::writes_fine(title, title + LEN, false).expect("watched");
+        let (taken, found) = crate::watch::writes_fine(title, title + LEN, false, &[]).expect("watched");
         assert_eq!(found, []);
         shadow.copied.lock().unwrap().fill(taken);
         // A landing writes pages 1 and 2; the title writes page 2 beside
@@ -6492,7 +6707,7 @@ mod card_merge_tests {
         assert_eq!(*shadow.copied.lock().unwrap(), [taken, now, taken, taken], "page 1 alone holds the copy's bytes");
         // Every other asker finds the landing's pages in the journal, and
         // the title's page 3 by the kernel's bit, which nobody took.
-        let (later, found) = crate::watch::writes_fine(title, title + LEN, false).expect("watched");
+        let (later, found) = crate::watch::writes_fine(title, title + LEN, false, &[]).expect("watched");
         assert_eq!(found.iter().map(|f| (f.0, f.1.at)).collect::<Vec<_>>(), [(page(1), now), (page(2), now), (page(3), later)]);
         // The check: nothing is marked, the page is kept to be looked at.
         put(PAGE + 8, 12, true);

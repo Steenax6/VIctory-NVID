@@ -199,6 +199,23 @@ VICTORY_REFRESH_CHECK=1`; the lines "refreshes by event", "landings'
 written bits taken" and "refresh check, since the start" must count no
 finds.
 
+The journal's answers by the copy's stamps (2026-11-27; the way, no
+switch; `VICTORY_JOURNAL_CHECK=1` is its check, diagnostics builds only):
+a refresh asked the journal for every noted page of its range and threw
+away nearly all of them: in the first room 103,000 entries a frame, 1,500
+acted on, and 4,400 of 5,100 answers with nothing to act on (the open
+world's entry alike). The copy now hands the journal what it has of each
+page (its stamp, a part's, or nothing to ask for a page it never took),
+and the journal lists only the pages noted later than that or than the
+answer's own number; each group of 64 pages (4 MiB) of its table keeps
+the highest number noted there, and a group none of whose pages is newer
+for the copy is passed by. An answer with nothing newer allocates
+nothing. The check walks every entry of each answer's range as before and
+counts the answers that differ (line "journal answers to refreshes", "0
+differed" is what it needs): 0 in 11.2 million answers of the prologue,
+10.6 million of the opening cutscene and 4.0 million at the open world's
+entry.
+
 The landing's merge as jobs (2026-11-26; the way; `VICTORY_WIDE_MERGE` and
 the merge one run after the other are gone; `VICTORY_LAND_SAMPLE=1` is
 its check): what shaders wrote to copies in the card's memory is merged
