@@ -47,6 +47,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod land_trace;
 pub mod list;
 pub mod object;
 #[cfg(windows)]

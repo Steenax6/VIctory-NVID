@@ -2885,8 +2885,16 @@ fn fine_runs(plans: &[(u64, &CardPlan)], differs: &[u32], noted: Option<&crate::
             if runs.is_empty() {
                 continue;
             }
-            match out.runs.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &r.shadow)) {
-                Some((_, all)) => all.extend(runs),
+            // In the order of the flights: a copy a later flight wrote
+            // stands behind the copies of the flights before it, so that
+            // where two copies hold the same pages (`land_jobs`) the later
+            // flight's bytes are merged over the earlier one's.
+            match out.runs.iter().position(|(s, _)| Arc::ptr_eq(s, &r.shadow)) {
+                Some(i) => {
+                    let mut entry = out.runs.remove(i);
+                    entry.1.extend(runs);
+                    out.runs.push(entry);
+                }
                 None => out.runs.push((r.shadow.clone(), runs)),
             }
         }
@@ -8890,6 +8898,7 @@ fn copy_mapped_as(dst: *mut u8, src: *const u8, len: usize, title: Option<crate:
         return;
     }
     if let Some(cause) = title {
+        crate::land_trace::wrote(b'c', dst as usize, len);
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing_as(dst as usize, len, cause);
     }
@@ -9077,6 +9086,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
+    crate::land_trace::wrote(b'k', dst as usize, len);
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
