@@ -1234,6 +1234,7 @@ extern "system" fn present(
     crate::copystat::present_begins();
     #[cfg(windows)]
     crate::timeline::present(FRAMES.load(Ordering::Relaxed) + 1);
+    crate::pagemap::presenting();
     #[cfg(windows)]
     let _span = crate::timeline::span("present.", "present<", 0, 0);
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1496,9 +1497,13 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    #[cfg(windows)]
+    let _span = crate::timeline::span("pmap>", "pmap<", u64::from(count), 0);
+    let mut stat = crate::pagemap::Call::begin();
     // What the title sent before runs first (see above).
     #[cfg(windows)]
     before_sync();
+    stat.took(crate::pagemap::Part::Sync);
     // And what that work's shaders write must land in the pages mapped
     // now, not in those mapped next (flights sent ahead land after their
     // submission returned).
@@ -1512,16 +1517,19 @@ extern "system" fn copy_page_mappings(
         let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
         crate::host::land_before_remap(b.destination, len);
     }
+    stat.took(crate::pagemap::Part::Land);
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
         }
+        stat.batch();
         // SAFETY: each batch holds `count` ranges.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
+            stat.range(r.kind, r.count);
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
             ok &= match r.kind {
@@ -1534,6 +1542,7 @@ extern "system" fn copy_page_mappings(
             at += len;
         }
     }
+    stat.took(crate::pagemap::Part::Remap);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
