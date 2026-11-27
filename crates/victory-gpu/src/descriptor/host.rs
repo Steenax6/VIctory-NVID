@@ -2426,6 +2426,13 @@ impl HostHeap {
         changed.noted().iter().filter(|&&index| buffers.contains(index) && self.made_key(index) == Some(0)).count() as u64
     }
 
+    /// Diagnostics: how many of `slots` hold a buffer view.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn buffer_views_among(&self, slots: &[u32]) -> u64 {
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        slots.iter().filter(|&&index| buffers.contains(index)).count() as u64
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.

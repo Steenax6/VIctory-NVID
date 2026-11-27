@@ -726,6 +726,10 @@ fn release_held_now(all: bool) {
                         held.insert(0, Held::Running);
                         drop(held);
                         let backs = crate::list::thin::backs(&recordings);
+                        // As at the title's submit call for lists recorded
+                        // in the call: the pass over picked buffer views
+                        // they stand behind is asked for.
+                        crate::list::picked_asked(&backs);
                         let parts = crate::list::detach_parts(&backs);
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
@@ -972,6 +976,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let _span = crate::timeline::span("exec>", "exec<", this as u64, u64::from(count));
+        // The pass over picked buffer views that the lists stand behind
+        // where they are prepared starts now (`crate::draw::Passes`).
+        crate::list::picked_asked(lists);
         crate::resubmit::submitted(this, lists);
         if crate::list::thin::on() && !this.is_null() {
             submit_thin(this, lists);

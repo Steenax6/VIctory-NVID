@@ -1009,13 +1009,13 @@ mod tests {
 
     use super::*;
 
-    /// The refreshes of a pass a recording started beside it are put among
-    /// the list's steps where the pass was started, in front of what was
-    /// recorded after it, and only once ([`HostList::picked_in`]); the
-    /// declared writes taken out before them by a quarantine move the place
-    /// with them.
+    /// The refreshes of the pass over picked buffer views are put among the
+    /// list's steps where it first bound a shader that picks buffers by
+    /// index, in front of what was recorded after it
+    /// ([`HostList::picked_in`]); the declared writes taken out before them
+    /// by a quarantine move the place with them.
     #[test]
-    fn a_pass_beside_the_recording_refreshes_where_it_was_started() {
+    fn a_pass_over_picked_views_refreshes_where_the_list_first_picked() {
         let Some(host) = host() else { return };
         let Ok(list) = host.new_list() else { return };
         let memory = crate::resource::Memory::zeroed(1 << 16, 4096).expect("a test buffer");
@@ -1037,14 +1037,15 @@ mod tests {
         for quarantined in [false, true] {
             list.defer_gpu_write(&copy, start as usize + 0x100, 16);
             list.defer_refresh(&copy, start as usize + 0x200, 16);
-            list.defer_picked(crate::draw::Picked::done(vec![(copy.clone(), start + 0x1000, 64), (copy.clone(), start + 0x2000, 1 << 20)]), true);
+            list.defer_picked();
             list.defer_refresh(&copy, start as usize + 0x300, 16);
             if quarantined {
                 list.quarantine();
             }
             list.defer_refresh(&copy, start as usize + 0x400, 16);
             let before = steps(&list);
-            list.picked_in();
+            assert!(list.picks());
+            list.picked_in(vec![(copy.clone(), start + 0x1000, 64), (copy.clone(), start + 0x2000, 1 << 20)]);
             let mut expected = before.clone();
             let at = if quarantined { 1 } else { 2 };
             expected.splice(at..at, [('r', 0x1000), ('r', 0x2000)]);
@@ -1052,24 +1053,9 @@ mod tests {
             // (Cut at the copy's end, as a refresh asked of the copy is.)
             let cut = list.deferred().copies.iter().any(|step| matches!(step, Step::Refresh(_, address, len) if *address == start as usize + 0x2000 && *len == (1 << 16) - 0x2000));
             assert!(cut);
-            list.picked_in();
-            assert_eq!(steps(&list), expected, "taken once");
             list.close();
             list.reset();
-        }
-        // Two lists one pass covers: the first to come up in the line
-        // carries its refreshes, whichever of them started the pass; the
-        // other only stands behind it.
-        if let Ok(other) = host.new_list() {
-            let pass = crate::draw::Picked::done(vec![(copy.clone(), start + 0x1000, 64)]);
-            list.defer_picked(pass.clone(), true);
-            other.defer_refresh(&copy, start as usize + 0x200, 16);
-            other.defer_picked(pass, false);
-            other.picked_in();
-            list.picked_in();
-            assert_eq!(steps(&other), [('r', 0x200), ('r', 0x1000)]);
-            assert_eq!(steps(&list), []);
-            other.close();
+            assert!(!list.picks());
         }
         list.close();
         drop(copy);
@@ -2370,18 +2356,21 @@ struct Deferred {
     /// structure builder, so nothing its shaders write is copied back into
     /// title memory ([`HostList::quarantine`]).
     quarantined: bool,
-    /// The pass over the view heap's picked buffer views that covers this
-    /// recording (`crate::draw::Picked`), with how many steps and how many
-    /// read-backs were recorded before its first bind of a shader that
-    /// picks buffers by index: the list waits for the pass where its
-    /// submission is prepared, and the refreshes of what the pass found are
-    /// put among `copies` there if no list before it took them
+    /// The recording binds a shader that picks buffers from the view heap
+    /// by index: how many steps and how many read-backs were recorded
+    /// before its first such bind. The refreshes of what the passes over
+    /// the heaps' buffer views found (`crate::draw::picked_found`) are put
+    /// among `copies` there where the submission is prepared
     /// ([`HostList::picked_in`]).
-    picked: Option<(usize, usize, std::sync::Arc<crate::draw::Picked>)>,
-    /// Diagnostics (`crate::draw::picked_counts`): whether this recording
-    /// started that pass, and its binds of such shaders.
+    picked: Option<(usize, usize)>,
+    /// The title has submitted the list: the pass its submit call asked
+    /// for, by its number, if this is the first such list of the call (0:
+    /// a list before it in the call stands for the pass).
+    picked_call: Option<u64>,
+    /// Diagnostics (`crate::draw::picked_counts`): its binds of such
+    /// shaders.
     #[cfg(feature = "diagnostics")]
-    picked_seen: (bool, u32),
+    picked_binds: u32,
 }
 
 impl Deferred {
@@ -6426,20 +6415,44 @@ impl Host {
         crate::copystat::submission_begins();
         #[cfg(feature = "diagnostics")]
         crate::profile::seen(crate::profile::Seen::Submit);
-        // Before anything looks at the lists' steps: each list that binds a
-        // shader picking buffers by index stands for the pass over the
-        // heap's buffer views that covers it (`crate::draw::Picked`), here
-        // in the line, where the title's thread does not wait.
+        // Before anything looks at the lists' steps: a list that binds a
+        // shader picking buffers from the view heap by index waits for the
+        // pass over the heaps' buffer views its submit call asked for, and
+        // the ranges the passes found become refreshes among its steps
+        // (`crate::draw::Passes`). A list that comes here with no pass
+        // asked for (not through a submit call of the title's) asks for
+        // one now.
         // (One submission with such lists at a time from here until it is
-        // sent: the one that takes a pass's refreshes is prepared before
-        // the next one the pass covers, whichever threads submit them.)
+        // sent: what the passes found for one is brought up to date before
+        // the next is prepared, whichever threads submit them.)
         static PICKING: Mutex<()> = Mutex::new(());
-        let _picking = runs.iter().any(|r| r.deferred().picked.is_some()).then(|| PICKING.lock().unwrap_or_else(|e| e.into_inner()));
-        #[cfg(feature = "diagnostics")]
-        crate::draw::picked_counts::coming(&runs.iter().filter_map(|r| r.picked_coming()).collect::<Vec<_>>());
-        for run in runs {
-            run.picked_in();
-        }
+        let _picking = runs.iter().any(|r| r.picks()).then(|| {
+            let picking = PICKING.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut late, mut stood) = (false, false);
+            for run in runs {
+                // (The list's own lock is let go before it is asked again.)
+                let stands = run.deferred().picked_call.replace(0);
+                let call = match stands {
+                    Some(0) => continue,
+                    Some(call) => call,
+                    None if run.picks() && !stood => {
+                        late = true;
+                        crate::draw::picked_asked()
+                    }
+                    None => continue,
+                };
+                stood = true;
+                run.picked_in(crate::draw::picked_found(call));
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                let binds = runs.iter().map(|r| r.deferred().picked_binds).filter(|&n| n > 0);
+                let (lists, binds) = binds.fold((0, 0), |a, n| (a.0 + 1, a.1 + u64::from(n)));
+                crate::draw::picked_counts::prepared(lists, binds, late, crate::descriptor::buffer_views_unmade());
+            }
+            let _ = late;
+            picking
+        });
         // A quarantined builder stage in one list keeps the whole
         // submission's shader writes from the title: the copy-back compares
         // every list's declared ranges after all of them ran, so a range of
@@ -6480,13 +6493,6 @@ impl Host {
         // command lists that index those slots are submitted.
         crate::timeline::ev("sub.", 2, runs.len() as u64);
         crate::descriptor::sync_heaps();
-        #[cfg(feature = "diagnostics")]
-        {
-            let (lists, binds) = runs.iter().map(|r| r.deferred().picked_seen.1).filter(|&n| n > 0).fold((0, 0), |a, n| (a.0 + 1, a.1 + u64::from(n)));
-            if lists > 0 {
-                crate::draw::picked_counts::unmade(lists, binds, crate::descriptor::buffer_views_unmade());
-            }
-        }
         steps.mark("p.heap", 0);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -7902,52 +7908,51 @@ impl HostList {
         }
     }
 
-    /// The recording binds a shader that picks buffers by index here, for
-    /// the first time: `pass` over the view heap's picked buffer views
-    /// covers it (`crate::draw::Picked`; `started`: this bind started it).
-    /// The refreshes of the ranges the pass finds are steps of this list
-    /// from this place on, if it is the first the pass covers to come up
-    /// in the line ([`HostList::picked_in`]).
-    pub(crate) fn defer_picked(&self, pass: std::sync::Arc<crate::draw::Picked>, started: bool) {
+    /// The recording binds a shader that picks buffers from the view heap
+    /// by index here, for the first time: the refreshes of the ranges the
+    /// pass over the heaps' buffer views finds where the list's submission
+    /// is prepared are steps of the list from this place on
+    /// ([`HostList::picked_in`]).
+    pub(crate) fn defer_picked(&self) {
         let mut deferred = self.deferred();
-        deferred.picked = Some((deferred.copies.len(), deferred.backs.len(), pass));
-        #[cfg(feature = "diagnostics")]
-        {
-            deferred.picked_seen.0 = started;
-        }
-        let _ = started;
+        deferred.picked = Some((deferred.copies.len(), deferred.backs.len()));
     }
 
     /// Diagnostics: the recording binds a shader that picks buffers by index.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn picked_bind(&self) {
-        self.deferred().picked_seen.1 += 1;
+        self.deferred().picked_binds += 1;
     }
 
-    /// Diagnostics: the pass that covers the recording, if it has not come
-    /// up in the line yet, with whether it started the pass and its binds.
-    #[cfg(feature = "diagnostics")]
-    fn picked_coming(&self) -> Option<(std::sync::Arc<crate::draw::Picked>, bool, u32)> {
-        let deferred = self.deferred();
-        deferred.picked.as_ref().map(|picked| (picked.2.clone(), deferred.picked_seen.0, deferred.picked_seen.1))
+    /// Whether the recording binds a shader that picks buffers from the
+    /// view heap by index ([`HostList::defer_picked`]).
+    pub(crate) fn picks(&self) -> bool {
+        self.deferred().picked.is_some()
+    }
+
+    /// The title submits the list, which binds such a shader: `call` is
+    /// the number of the pass its submit call asked for
+    /// (`crate::draw::picked_asked`) if this is the first such list of the
+    /// call, 0 if one before it stands for the pass.
+    pub(crate) fn picked_stands(&self, call: u64) {
+        self.deferred().picked_call = Some(call);
     }
 
     /// Where the list's submission is prepared, before anything looks at
-    /// its steps: waits for the pass that covers the recording
-    /// ([`HostList::defer_picked`]), and if no list before it in the line
-    /// took the pass's refreshes they become its steps, at the place it
-    /// first bound a shader that picks buffers by index, as
-    /// [`HostList::defer_refresh`] recorded them where the pass ran in the
-    /// recording. A submission's steps all run before any of its lists
-    /// goes to the card, and submissions are prepared one at a time: every
-    /// list the pass covers runs behind those refreshes. (Not noted in
-    /// `refreshed`: an ask for the same range of the same copy later in the
-    /// list is then a second step, which a submission joins with the first.)
-    pub(crate) fn picked_in(&self) {
-        let Some((at, backs, pass)) = self.deferred().picked.take() else {
+    /// its steps: the ranges `found` by the passes over the heaps' buffer
+    /// views (`crate::draw::picked_found`) become refreshes among its
+    /// steps, at the place it first bound a shader that picks buffers by
+    /// index, as [`HostList::defer_refresh`] recorded them there when the
+    /// pass ran in the recording. For the first such list of the submit
+    /// call: a submission's steps all run before any of its lists goes to
+    /// the card.
+    /// (Not noted in `refreshed`: an ask for the same range of the same
+    /// copy later in the list is then a second step, which a submission
+    /// joins with the first.)
+    fn picked_in(&self, found: Vec<crate::draw::PickedRange>) {
+        let Some((at, backs)) = self.deferred().picked else {
             return;
         };
-        let found = pass.found();
         let mut deferred = self.deferred();
         let mut steps = Vec::with_capacity(found.len());
         for (shadow, address, len) in found {
@@ -9344,14 +9349,16 @@ impl Meter {
             }
         }
         {
-            let [texture_us, slots, waited_us, beside_us] =
-                [0, 1, 2, 3].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            let [texture_us, slots, waited_us, beside_us, passes] =
+                [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is what the recording thread that \
-                 starts it spends): {:.1} ms in its pass over textures picked by index; {:.0} buffer slots looked at by its pass \
-                 over buffer views, {:.1} ms on that pass's own thread, {:.1} ms submissions waited for it",
+                "the passes over the heap per frame (the frame line's \"heap buffers ... ms\" is what the recording thread \
+                 that starts the one over textures spends): {:.1} ms in the pass over textures picked by index; {:.0} buffer \
+                 slots looked at by {:.1} passes over buffer views, {:.1} ms on their own thread, {:.1} ms submissions \
+                 waited for them",
                 texture_us as f64 / 1e3 / frames,
                 slots as f64 / frames,
+                passes as f64 / frames,
                 beside_us as f64 / 1e3 / frames,
                 waited_us as f64 / 1e3 / frames
             );
