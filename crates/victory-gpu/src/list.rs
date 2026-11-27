@@ -995,7 +995,9 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Buffer to buffer: both are host memory, copied at submission; or, out of
+/// memory shaders write, between the two host copies on the card, in the
+/// list's order (`crate::host::card_copy`).
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -1010,6 +1012,7 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !crate::host::card_copy::record(list, to as usize, from as usize, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }

@@ -2293,6 +2293,10 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// A title buffer copy the list makes on the card ([`card_copy`]):
+    /// destination, source, bytes. Nothing on the CPU, unless a later step
+    /// of the submission reads its destination there ([`card_copy::cpu_too`]).
+    Card(usize, usize, usize),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2374,6 +2378,9 @@ struct Deferred {
     /// shaders.
     #[cfg(feature = "diagnostics")]
     picked_binds: u32,
+    /// The host copies (by number) the recording's card copies read from
+    /// ([`card_copy`]): left in the copy-source state.
+    card_sources: Vec<u64>,
 }
 
 impl Deferred {
@@ -3252,6 +3259,9 @@ enum Touch {
     Any,
     /// Nothing of the title's memory.
     Nothing,
+    /// A buffer copy of the title's made on the card ([`card_copy`]): never
+    /// left to the landing itself, but it reads and writes as a copy does.
+    Card(usize, usize, usize),
 }
 
 fn touch(step: &Step) -> Touch {
@@ -3265,6 +3275,7 @@ fn touch(step: &Step) -> Touch {
         }
         Step::Run(_) => Touch::Any,
         Step::Host(_) => Touch::Nothing,
+        &Step::Card(dst, src, len) => Touch::Card(dst, src, len),
     }
 }
 
@@ -3291,7 +3302,7 @@ fn late_among(steps: &[Touch], goes: impl Fn(usize, usize, usize) -> bool) -> Ve
         let end = dst.saturating_add(len);
         let over = |a: usize, b: usize| a < end && dst < b;
         let touched = steps.get(i + 1..).unwrap_or(&[]).iter().any(|later| match *later {
-            Touch::Copy(d, s, n) => over(d, d.saturating_add(n)) || over(s, s.saturating_add(n)),
+            Touch::Copy(d, s, n) | Touch::Card(d, s, n) => over(d, d.saturating_add(n)) || over(s, s.saturating_add(n)),
             Touch::Range(a, b) => over(a, b),
             Touch::Any => true,
             Touch::Nothing => false,
@@ -3371,6 +3382,7 @@ fn blocked_by(written: &[(usize, usize)], copied: &[(usize, usize)], runs: &[&Ho
     // own (`copied`): there the bytes are known to be the ones from
     // before, so nothing reads them ahead.
     let mut late = late_copies(written, runs);
+    let cpu_too = card_copy::cpu_too(runs, false);
     let waits = |at: usize, len: usize| {
         let waits = late_order() && touches(copied, at, at.saturating_add(len));
         if waits && count {
@@ -3381,8 +3393,21 @@ fn blocked_by(written: &[(usize, usize)], copied: &[(usize, usize)], runs: &[&Ho
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                &Step::Copy(dst, src, len) => {
-                    if let Some(at) = late.iter().position(|c| *c == (dst, src, len)) {
+                // Made on the card in the lists' order: it reads the
+                // source's host copy, which the refresh before the lists
+                // brings up to date, so only bytes a flight's copy is still
+                // to put into the source wait. Its destination counts as
+                // written by this submission's shaders.
+                &Step::Card(dst, src, len) if !cpu_too.contains(&(dst, src, len)) => {
+                    if waits(src, len) {
+                        return Some(WHY_READ);
+                    }
+                }
+                // (Made on the CPU as well: as a copy at the submission.)
+                &Step::Copy(dst, src, len) | &Step::Card(dst, src, len) => {
+                    if matches!(step, Step::Copy(..))
+                        && let Some(at) = late.iter().position(|c| *c == (dst, src, len))
+                    {
                         late.swap_remove(at);
                         continue;
                     }
@@ -3488,6 +3513,8 @@ pub(crate) fn fill_hot(address: usize, len: usize) -> bool {
 /// is there before anything tells the title that its submission is done;
 /// until then its destination counts as written by the flight.
 /// `VICTORY_LATE_COPY=0`: copied at the submission, after the wait.
+/// (Such a copy between two host copies is made on the card where the title
+/// records it, [`card_copy`], and does not come here.)
 fn copy_goes_late(written: &[(usize, usize)], dst: usize, src: usize, len: usize) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_COPY").is_none_or(|v| v != "0"))
@@ -3531,6 +3558,9 @@ fn late_copy(dst: usize, src: usize, len: usize) {
 /// shaders, counted and looked at ([`copy_order`]).
 mod copy_order;
 mod land_jobs;
+/// Title buffer copies out of memory shaders write, made on the card in the
+/// lists' order (`VICTORY_CARD_COPY=0`: on the CPU, as above).
+pub(crate) mod card_copy;
 
 /// Diagnostics: the fills of upload memory that made a submission wait for
 /// flights, and whether the wait was needed ([`fill_check`]).
@@ -3970,6 +4000,8 @@ fn late_line(frames: f64) {
             );
         }
     }
+    #[cfg(feature = "diagnostics")]
+    card_copy::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -5914,6 +5946,8 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
+                    #[cfg(feature = "diagnostics")]
+                    card_copy::check::landed(&flight);
                     for &(dst, src, len) in &flight.copies {
                         late_copy(dst, src, len);
                     }
@@ -6376,6 +6410,8 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
+                        #[cfg(feature = "diagnostics")]
+                        card_copy::check::landed(&flight);
                         for &(dst, src, len) in &flight.copies {
                             late_copy(dst, src, len);
                         }
@@ -6585,6 +6621,7 @@ impl Host {
                 batch.late = late_copies(&written, runs);
             }
         }
+        batch.card_cpu = card_copy::cpu_too(runs, true);
         // The lists run so far: a list run again records a prelude of its
         // own (`HostList::prelude`).
         crate::timeline::ev("sub.", 4, runs.len() as u64);
@@ -8006,13 +8043,21 @@ impl HostList {
             deferred.quarantined = true;
             // (The steps a pass's refreshes go behind are fewer by the ones
             // taken out before them: `defer_picked`.)
-            let before = deferred.picked.as_ref().map_or(0, |picked| {
-                deferred.copies.iter().take(picked.0).filter(|step| matches!(step, Step::GpuWrite(..))).count()
-            });
+            // (A card copy's destination, declared just before it, still
+            // goes back: no shader wrote it, `card_copy`.)
+            let copies = &deferred.copies;
+            let gone: Vec<bool> = (0..copies.len())
+                .map(|i| matches!(copies[i], Step::GpuWrite(..)) && !matches!(copies.get(i + 1), Some(Step::Card(..))))
+                .collect();
+            let before = deferred.picked.as_ref().map_or(0, |picked| gone.iter().take(picked.0).filter(|g| **g).count());
             if let Some(picked) = &mut deferred.picked {
                 picked.0 -= before;
             }
-            deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
+            let mut at = 0;
+            deferred.copies.retain(|_| {
+                at += 1;
+                !gone[at - 1]
+            });
         }
     }
 
@@ -8559,9 +8604,14 @@ impl HostList {
                 end_stretch(&mut stretch);
             }
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                // Made on the card ([`card_copy`]), and on the CPU as well
+                // when a later step reads its destination there.
+                &Step::Card(dst, src, len) if !batch.card_cpu.contains(&(dst, src, len)) => continue,
+                &Step::Copy(dst, src, len) | &Step::Card(dst, src, len) => {
                     // Left to the submission's landing (`copy_goes_late`).
-                    if let Some(at) = batch.late.iter().position(|c| *c == (dst, src, len)) {
+                    if matches!(step, Step::Copy(..))
+                        && let Some(at) = batch.late.iter().position(|c| *c == (dst, src, len))
+                    {
                         batch.late.swap_remove(at);
                         batch.went_late.push((dst, src, len));
                         continue;
@@ -8704,6 +8754,8 @@ struct Batch {
     /// the lists' steps have come to.
     late: Vec<(usize, usize, usize)>,
     went_late: Vec<(usize, usize, usize)>,
+    /// Its card copies made on the CPU as well ([`card_copy::cpu_too`]).
+    card_cpu: Vec<(usize, usize, usize)>,
     /// The title memory the submission's shaders are declared to write by
     /// the steps run so far (address, end): for the count of copies made
     /// behind such a step ([`copy_order`]).
