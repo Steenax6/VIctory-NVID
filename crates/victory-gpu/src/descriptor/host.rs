@@ -5086,15 +5086,25 @@ fn kin(old: &View, new: &View) -> u8 {
 /// Whether a slot that showed a texture, written with a view of another
 /// (in other memory, or of another size), goes on showing the old one until
 /// the new is made, instead of nothing: `VICTORY_KEEP_SHOWN`, the most
-/// distant [`kin`] kept (0: none, as before; 1: the same texture moved; 2:
-/// and the same in another size; 3: any texture of the same dimension).
+/// distant [`kin`] kept (3, any texture of the same dimension; 2: the same
+/// texture moved or in another size; 1: moved only; 0: none, as before).
 /// The new view is made by the texture pass or a draw, as before, with its
 /// upload in the same submission. Until then the shaders that pick the
 /// slot by index read zeros where the title, which wrote a texture whose
-/// texels are there, has them read texels.
+/// texels are there, has them read texels: in motion in the open world
+/// 1,000 to 4,000 slots a second went null so, half of them for one frame
+/// (the pass runs once a frame, at the first list that picks by index, and
+/// the title writes views after it), and a glass case in a house flipped
+/// between white and its contents from frame to frame. Three picture runs
+/// a side with scripted movement: 13, 5 and 14 pictures that differ from
+/// both neighbours for one picture without it, 2, 1 and 3 with it, none
+/// of those an object's look.
+/// shortcut: the old texture stands in for the new until the new is made,
+/// a frame or more; the title's own state would be the new texture at once
+/// (the pass run again before each submission for the slots written since).
 pub(crate) fn keep_shown() -> u8 {
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3))
 }
 
 /// Since the start: slots that showed a texture and were written with a
@@ -5104,13 +5114,14 @@ pub(crate) fn keep_shown() -> u8 {
 pub(crate) static REWRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// How long a made slot whose texture's memory is found unmapped goes on
-/// showing it before it is made null (`VICTORY_TEXTURE_AWAY_MS`; 0: at
-/// once, as before): a title that moves a texture in its memory unmaps it
-/// and maps it again a moment later, and the slot's texture read as nothing
-/// in between.
+/// showing it before it is made null (`VICTORY_TEXTURE_AWAY_MS`, 3,000; 0:
+/// at once, as before): a title that moves a texture in its memory unmaps
+/// it and maps it again a moment later, and the slot's texture read as
+/// nothing in between. (Rare here: 0 to 8 slots a second in motion. The
+/// slot holds its host copy meanwhile, as it does while it shows it.)
 fn away_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *MS.get_or_init(|| std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000))
 }
 
 /// Made slots found unmapped and not made null yet ([`away_ms`]), by heap
