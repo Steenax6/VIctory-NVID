@@ -1663,6 +1663,12 @@ fn guard_line(submission: u64) {
          not sent up (VICTORY_SEND_CHANGED=0 sends them)",
         c[10], c[9], c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[11], c[12], c[13], c[14], c[15], c[16], same[0], same[1] / 1e6
     );
+    let [waited, found, vain] = [0, 1, 2].map(|i| OPENED_BESIDE[i].load(Relaxed));
+    if waited + found + vain > 0 {
+        tracing::info!(
+            "guards, since the start: {waited} faults on a block another thread was opening waited for it, {found} found it              opened by the time they asked, {vain} waited in vain"
+        );
+    }
 }
 
 /// Who takes locks of the guards: a hold is an event of `crate::timeline`
@@ -3305,7 +3311,15 @@ fn install() {
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
                 Fault::Again => {}
-                Fault::No => break,
+                // Not the guards' to open, as far as those looks went: they
+                // were made one after the other, and another thread that
+                // opens the block makes it writable only after it has noted
+                // it open. Waited for, and looked at once more.
+                Fault::No => {
+                    if !opened_beside(at) {
+                        break;
+                    }
+                }
             }
         }
         // SAFETY: as above.
@@ -3341,6 +3355,68 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Since the start: faults on a block that another thread was opening
+/// ([`opened_beside`]) which waited for it; faults that found the block
+/// writable by the time they asked with its region locked; faults that
+/// waited [`BESIDE_WAIT`] in vain.
+pub(crate) static OPENED_BESIDE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The longest a fault waits for another thread's opening of its block.
+const BESIDE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// For a write that faulted at `at` and found no guard to open
+/// ([`open_tail`], [`reopen_stray`]) on memory that was not writable:
+/// whether the block is another thread's to open or opened by it, so that
+/// the write is to be looked at once more.
+///
+/// [`open`] and [`open_tail`] note a block open with its region locked,
+/// let the lock go and only then make it writable ([`Marks::opening`]). A
+/// second thread that writes into the block between the two faults on a
+/// block that is no guard's any more and still read-only: its looks found
+/// nothing to open, and the write went on as an access violation nobody
+/// answered (a thread of the runtime's that fills a read's destination
+/// beside another one's, in the loading: the process ended there). Such a
+/// fault waits here until the opening is said done.
+///
+/// With the region locked, a block that is not guarded and has no opening
+/// under way has no change of protection of the guards' pending: what the
+/// system says of it then stands (asked under the lock for that reason; it
+/// is one call, and this is no path a frame takes).
+fn opened_beside(at: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let block = at / BLOCK;
+    // (Nothing is made for an address the guards never held.)
+    if region(block / REGION).is_none() {
+        return false;
+    }
+    let mut began = None;
+    loop {
+        {
+            let mut l = Locked::blocks(Holder::Fault, [block]);
+            let Some((r, m, i)) = l.at(block) else {
+                return false;
+            };
+            if r.protected.has(1 << i) {
+                // Guarded again meanwhile: a fault of the guards'.
+                return true;
+            }
+            if m.opening[i] == 0 {
+                let open = writable(at);
+                if open {
+                    OPENED_BESIDE[usize::from(began.is_none())].fetch_add(1, Relaxed);
+                }
+                return open;
+            }
+        }
+        let began = *began.get_or_insert_with(std::time::Instant::now);
+        if began.elapsed() > BESIDE_WAIT {
+            OPENED_BESIDE[2].fetch_add(1, Relaxed);
+            return false;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -4083,6 +4159,58 @@ mod tests {
         let written = guard(one, one + SIZE, None).expect("view memory");
         assert!(written.contains(&block), "reported written");
         drop_views(section, &[one, two], SIZE);
+    }
+
+    /// A write into a block that another thread has noted open and not
+    /// yet made writable ([`open`] between its two steps) waits for that
+    /// thread and goes through; it is no access violation of the writer's.
+    #[test]
+    fn a_write_into_a_block_being_opened_waits_for_the_opening() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        install();
+        // SAFETY: private memory of our own, of two blocks.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        assert_eq!(p % BLOCK, 0);
+        let block = p / BLOCK;
+        let protect = |how: u32| {
+            let mut old = 0;
+            // SAFETY: a block of our allocation; only its protection changes.
+            assert_ne!(unsafe { VirtualProtect(p as *const _, BLOCK, how, &mut old) }, 0);
+        };
+        let opening = |by: i8| {
+            let mut l = Locked::blocks(Holder::Opening, [block]);
+            let (_, m, i) = l.at(block).expect("its region");
+            m.opening[i] = m.opening[i].saturating_add_signed(by);
+        };
+        // As `open` leaves a guarded block when its locks are let go: no
+        // guard's, an opening under way, read-only still.
+        protect(PAGE_READONLY);
+        opening(1);
+        let before = OPENED_BESIDE[0].load(Relaxed);
+        let writer = std::thread::spawn(move || {
+            // SAFETY: inside our allocation; the write faults and waits.
+            unsafe { ((p + 3 * KERNEL_PAGE) as *mut u8).write_volatile(7) };
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!writer.is_finished(), "the write waits for the opening");
+        // The opening's second step.
+        protect(PAGE_READWRITE);
+        opening(-1);
+        writer.join().expect("the write went through");
+        // SAFETY: inside our allocation.
+        assert_eq!(unsafe { ((p + 3 * KERNEL_PAGE) as *const u8).read_volatile() }, 7);
+        assert!(OPENED_BESIDE[0].load(Relaxed) > before, "counted as a fault that waited");
+        // Asked with nothing under way: what the system says stands.
+        assert!(opened_beside(p + 3 * KERNEL_PAGE), "writable, opened by another thread before the asking");
+        protect(PAGE_READONLY);
+        assert!(!opened_beside(p + 3 * KERNEL_PAGE), "read-only with no opening under way: not the guards'");
+        protect(PAGE_READWRITE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// The bits of a range in a region are those of its blocks there, and
