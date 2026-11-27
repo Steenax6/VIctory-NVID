@@ -2002,7 +2002,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
                     // Known as view memory (made read-only or noted absent
                     // since the runtime last mapped or unmapped it): no
                     // question to Windows.
-                    note_guarded(r, m, i);
+                    note_guarded(r, m, i, block);
                     later.runs.push(block);
                     together.push(block);
                 } else {
@@ -2082,7 +2082,7 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
             let b = 1u64 << i;
             if !(r.protected.has(b) || r.absent.has(b) || m.opening[i] != 0) {
                 r.views.set(b);
-                note_guarded(r, m, i);
+                note_guarded(r, m, i, block);
                 later.runs.push(block);
             }
         }
@@ -2140,12 +2140,16 @@ fn guard_fine(start: usize, end: usize, epoch: Option<Epoch>, look: &mut Look) -
         }
     }
     written.sort_unstable();
+    #[cfg(feature = "diagnostics")]
+    for &(block, _) in &written {
+        history(block, "reported");
+    }
     Some(written)
 }
 
 /// Notes the block at `i` of `r` guarded and clean (a check's, which makes
 /// it read-only before its copy reads it).
-fn note_guarded(r: &Region, m: &mut Marks, i: usize) {
+fn note_guarded(r: &Region, m: &mut Marks, i: usize, block: usize) {
     let b = 1u64 << i;
     r.protected.set(b);
     r.views.set(b);
@@ -2153,6 +2157,7 @@ fn note_guarded(r: &Region, m: &mut Marks, i: usize) {
     r.apart.clear(b);
     m.dirty[i] = 0;
     r.clean.set(b);
+    history(block, "guarded");
 }
 
 /// The changes of protection a check decided, made with no lock of the
@@ -2284,6 +2289,7 @@ fn settle(failed: &Failed, epoch: Option<Epoch>) {
                 r.absent.set(1 << i);
                 ABSENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            history(block, "noted absent");
         } else {
             r.views.clear(1 << i);
             if let Some(e) = epoch.filter(|_| absent_once()) {
@@ -2336,6 +2342,7 @@ fn unguard(r: &Region, m: &mut Marks, i: usize, block: usize) {
     r.apart.clear(b);
     m.dirty[i] = 0;
     event(block.wrapping_mul(BLOCK));
+    history(block, "unguarded");
 }
 
 /// What became of a write's fault ([`open_tail`], [`reopen_stray`]).
@@ -2725,6 +2732,7 @@ fn note_dirty(r: &Region, m: &mut Marks, i: usize, block: usize, mask: u16) {
         r.clean.clear(b);
         event(block.wrapping_mul(BLOCK));
         m.dirty[i] = mask;
+        history(block, "counted written");
     } else if m.dirty[i] != 0 {
         // Not clean with pages noted: written there before; with none:
         // written anywhere already.
@@ -3188,6 +3196,160 @@ pub(crate) fn guard_state(at: usize) -> String {
     out
 }
 
+/// Diagnostics: what last happened to a block, for [`block_report`]: the
+/// last few changes of each block (microseconds since the start, and what),
+/// newest last. A lock of its own, taken last and alone; at most
+/// [`HISTORY_BLOCKS`] blocks are followed, the first ones met.
+#[cfg(feature = "diagnostics")]
+static HISTORY: Mutex<Option<std::collections::HashMap<usize, [(u64, &'static str); 6]>>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+const HISTORY_BLOCKS: usize = 1 << 20;
+
+/// Notes in [`HISTORY`] that `what` happened to `block`.
+#[cfg(feature = "diagnostics")]
+fn history(block: usize, what: &'static str) {
+    let at = crate::host::now_us();
+    let mut h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    let map = h.get_or_insert_with(std::collections::HashMap::new);
+    let full = map.len() >= HISTORY_BLOCKS;
+    let entry = match map.get_mut(&block) {
+        Some(e) => e,
+        None if full => return,
+        None => map.entry(block).or_insert([(0, ""); 6]),
+    };
+    entry.rotate_left(1);
+    entry[5] = (at, what);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn history(_: usize, _: &'static str) {}
+
+/// Diagnostics, for the report of a removed device: what the guards, the
+/// journal and Windows hold of the 64 KiB block at `at` now, for a host
+/// copy that differs from title memory there (why the copy can be behind).
+/// The region's sets are read without its lock; its marks and the journal
+/// are only looked at if their locks can be had at once (the thread that
+/// reports may hold them, or another that stands). Windows is asked last,
+/// with no lock held.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn block_report(at: usize) -> String {
+    use std::fmt::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+    let block = at / BLOCK;
+    let b = bit(block);
+    let mut out = format!("block {:#x}: ", block * BLOCK);
+    match region(block / REGION) {
+        None => out.push_str("no region of the guards"),
+        Some(r) => {
+            let sets = [
+                ("protected", &r.protected),
+                ("clean", &r.clean),
+                ("absent", &r.absent),
+                ("aliased", &r.aliased),
+                ("views", &r.views),
+                ("partly", &r.partly),
+                ("apart", &r.apart),
+            ];
+            let on: Vec<&str> = sets.iter().filter(|(_, s)| s.has(b)).map(|(n, _)| *n).collect();
+            let _ = write!(out, "sets [{}], region openings {}", on.join(" "), r.openings.load(Relaxed));
+            match r.marks.try_lock() {
+                Ok(m) => {
+                    let i = block % REGION;
+                    let _ = write!(out, ", dirty {:#06x} opening {}", m.dirty[i], m.opening[i]);
+                }
+                Err(_) => out.push_str(", marks locked"),
+            }
+        }
+    }
+    let _ = write!(out, "; events of its 4 MiB {}", events(block * BLOCK, block * BLOCK + 1));
+    match JOURNAL.try_lock() {
+        Ok(j) => {
+            let mut entry = None;
+            j.written.each(block, block + 1, |_, w| entry = Some(*w));
+            let ahead = j.ahead.iter().any(|&(a, e)| a <= block && block < e);
+            let _ = write!(
+                out,
+                "; journal asked {} (ahead {} {}, kept {}, once {}), its entry {}",
+                j.asked,
+                j.ahead_asked,
+                if ahead { "holds it" } else { "not over it" },
+                j.kept,
+                j.once_id,
+                entry.map_or_else(|| "none".to_owned(), |w| format!("at {} before {} mask {:#06x}", w.at, w.before, w.mask))
+            );
+        }
+        Err(_) => out.push_str("; journal locked"),
+    }
+    match ABSENT_RUNS.try_lock() {
+        Ok(runs) => {
+            let run = runs.runs.range(..=block).next_back().filter(|r| *r.1 > block);
+            let _ = write!(
+                out,
+                "; absent runs: stretch {} (now {}), remaps {}, {}",
+                runs.stretch,
+                absent_stretch(),
+                runs.remaps,
+                run.map_or_else(|| "none over it".to_owned(), |(&f, &u)| format!("run {:#x}..{:#x}", f * BLOCK, u * BLOCK))
+            );
+        }
+        Err(_) => out.push_str("; absent runs locked"),
+    }
+    if let Ok(u) = UNGUARDABLE.try_lock()
+        && u.1.contains(&block)
+    {
+        let _ = write!(out, "; unguardable in submission {}", u.0);
+    }
+    if let Ok(h) = HISTORY.try_lock() {
+        let now = crate::host::now_us();
+        match h.as_ref().and_then(|m| m.get(&block)) {
+            Some(e) => {
+                let said: Vec<String> =
+                    e.iter().filter(|c| !c.1.is_empty()).map(|c| format!("{} {:.1} ms ago", c.1, now.saturating_sub(c.0) as f64 / 1000.0)).collect();
+                let _ = write!(out, "; its last changes: {}", said.join(", "));
+            }
+            None => out.push_str("; no changes followed"),
+        }
+    }
+    out
+}
+
+/// Diagnostics: what Windows says of the memory at `at` now (state,
+/// protection, type, and the region's extent).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn query_report(at: usize) -> String {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return "Windows: no answer".to_owned();
+    }
+    format!(
+        "Windows: state {:#x} protect {:#x} type {:#x}, region {:#x}+{:#x}",
+        info.State, info.Protect, info.Type, info.BaseAddress as usize, info.RegionSize
+    )
+}
+
+#[cfg(feature = "diagnostics")]
+impl Seen {
+    /// Diagnostics: the range remembered, its counts then and now, and the
+    /// absent stretch, with what [`Seen::quiet`] says now.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "seen {:#x}..{:#x} events then {} now {} absent {:?} (stretch now {}), quiet {}",
+            self.from,
+            self.to,
+            self.events,
+            events(self.from, self.to),
+            self.absent,
+            absent_stretch(),
+            self.quiet()
+        )
+    }
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked
@@ -3319,6 +3481,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         }
         for i in each_bit(want) {
             m.dirty[i] = 0;
+            if len <= 16 << 20 {
+                history(index * REGION + i, "remapped");
+            }
         }
     }
     // (And the counts of the spans the guards hold nothing of: nothing
@@ -4363,7 +4528,7 @@ mod tests {
             let mut l = Locked::blocks(Holder::Check, b..b + 70);
             for block in b..b + 70 {
                 let (r, m, i) = l.at(block).expect("its region");
-                note_guarded(r, m, i);
+                note_guarded(r, m, i, block);
             }
         }
         assert!(all_clean(b, b + 70) && all_clean(b + 5, b + 6) && all_clean(b, b));
