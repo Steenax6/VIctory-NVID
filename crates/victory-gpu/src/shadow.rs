@@ -5034,6 +5034,8 @@ impl Shadow {
             let mut any = false;
             write.clear();
             let mut races: Vec<Vec<u8>> = Vec::new();
+            // (The stretches as read are kept for the sample too.)
+            let keep_read = merge_race_on() || SAMPLE_NEXT.get();
             for &(a, b) in stretches.iter() {
                 let (o, n) = (a - at, b - a);
                 let t = &mut title[put..put + n];
@@ -5042,7 +5044,7 @@ impl Shadow {
                     // the merge puts the card's byte there.
                     t.copy_from_slice(&gpu[o..o + n]);
                     held[o..o + n].copy_from_slice(&gpu[o..o + n]);
-                    if merge_race_on() {
+                    if keep_read {
                         races.push(Vec::new());
                     }
                     write.push(true);
@@ -5051,7 +5053,7 @@ impl Shadow {
                     continue;
                 }
                 let mapped = crate::host::read_into((start + a) as *const u8, t);
-                if merge_race_on() {
+                if keep_read {
                     races.push(if mapped { t.to_vec() } else { Vec::new() });
                 }
                 // Title memory that is not mapped: the CPU's side keeps
@@ -5087,6 +5089,10 @@ impl Shadow {
             let mut put = 0;
             // Which of the stretches written this one is.
             let mut nth = 0;
+            // (For the sample: when the writing began, and the last
+            // stretch written as it was read.)
+            let began = crate::land_trace::now();
+            let mut last_read: Vec<u8> = Vec::new();
             let mut race = races.into_iter();
             for (&(a, b), &write) in stretches.iter().zip(write.iter()) {
                 let n = b - a;
@@ -5095,6 +5101,10 @@ impl Shadow {
                 let as_read = race.next();
                 if !write {
                     continue;
+                }
+                if keep_read && let Some(read) = &as_read {
+                    last_read.clear();
+                    last_read.extend_from_slice(&read[..read.len().min(256)]);
                 }
                 crate::host::shaders_write(start + a, t);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + a, t, "card relay");
@@ -5135,7 +5145,13 @@ impl Shadow {
                     put += b - a;
                 }
                 if let Some((a, put, m)) = last {
-                    LAST_MERGED.set(Some((a, title[put..put + m].to_vec(), gpu[a - at..a - at + m].to_vec())));
+                    LAST_MERGED.set(Some(Merged {
+                        at: a,
+                        written: title[put..put + m].to_vec(),
+                        card: gpu[a - at..a - at + m].to_vec(),
+                        read: last_read,
+                        began,
+                    }));
                 }
             }
             written
@@ -5150,19 +5166,54 @@ impl Shadow {
     /// of their pieces. The stretch's other bytes are the title's as the
     /// merge read them, which the CPU side takes only with a refresh: not
     /// looked at. (Title memory that is not there: 0.)
-    pub(crate) fn landed_apart(&self, at: usize, merged: &[u8], card: &[u8]) -> usize {
+    ///
+    /// With the count, for a stretch that is apart, what tells why: of the
+    /// bytes apart, how many the CPU side still holds as written (title
+    /// memory changed, not the copy), how many title memory holds as the
+    /// merge read them before it wrote (the write is not there, or was
+    /// undone), how many are zero; whether a view of our own of the same
+    /// pages shows what the title's address shows, and what was written;
+    /// the layer's own writes over the stretch since the merge's began
+    /// (`crate::land_trace`); and what the guards hold of its block and of
+    /// the other views of its pages.
+    pub(crate) fn landed_apart(&self, m: &Merged) -> (usize, String) {
+        let (at, merged, card) = (m.at, &m.written, &m.card);
         let n = merged.len().min(card.len());
         if n == 0 || at + n > self.len as usize {
-            return 0;
+            return (0, String::new());
         }
+        let address = self.start as usize + at;
         let _side = self.side_of(at, at + n);
         let mut read = vec![0u8; n];
-        if !crate::host::read_into((self.start as usize + at) as *const u8, &mut read) {
-            return 0;
+        if !crate::host::read_into(address as *const u8, &mut read) {
+            return (0, String::new());
         }
         // SAFETY: inside the copy's mapping (checked above).
         let held = unsafe { std::slice::from_raw_parts(self.data.add(at).cast_const(), n) };
-        (0..n).filter(|&i| merged[i] == card[i] && read[i] != held[i]).count()
+        let apart: Vec<usize> = (0..n).filter(|&i| merged[i] == card[i] && read[i] != held[i]).collect();
+        if apart.is_empty() {
+            return (0, String::new());
+        }
+        let count = |f: &dyn Fn(usize) -> bool| apart.iter().filter(|&&i| f(i)).count();
+        let ours = crate::beside::read_ours(address, n);
+        let said = format!(
+            "side as written {}, title as read before the merge {}, title zero {}; a view of ours shows the title's bytes {}, the bytes \
+             written {}; the layer's writes there since the merge's began ({} us before this look): {}; guards: {}; first byte apart \
+             +{}: written {:#04x}, title {:#04x}{}",
+            count(&|i| held[i] == merged[i]),
+            if m.read.len() >= n { count(&|i| read[i] == m.read[i]).to_string() } else { "(not read)".to_owned() },
+            count(&|i| read[i] == 0),
+            ours.as_ref().map_or_else(|| "(no view)".to_owned(), |o| count(&|i| o[i] == read[i]).to_string()),
+            ours.as_ref().map_or_else(|| "(no view)".to_owned(), |o| count(&|i| o[i] == merged[i]).to_string()),
+            crate::land_trace::now().saturating_sub(m.began),
+            crate::land_trace::since(address, n, m.began),
+            crate::watch::guard_state(address),
+            apart[0],
+            merged[apart[0]],
+            read[apart[0]],
+            if m.read.len() >= n { format!(", read before {:#04x}", m.read[apart[0]]) } else { String::new() },
+        );
+        (apart.len(), said)
     }
 }
 
@@ -5403,7 +5454,20 @@ thread_local! {
     /// thread when asked to keep it (offset in its copy, up to 256 bytes as
     /// written, the same bytes as the card held them): for the sample at a
     /// landing's telling ([`last_merged`]).
-    static LAST_MERGED: std::cell::Cell<Option<(usize, Vec<u8>, Vec<u8>)>> = const { std::cell::Cell::new(None) };
+    static LAST_MERGED: std::cell::Cell<Option<Merged>> = const { std::cell::Cell::new(None) };
+}
+
+/// A stretch a merge wrote, kept for the sample at the telling: its offset
+/// in the copy, up to 256 bytes of it as written and as the card held
+/// them, the same bytes as the merge read them from title memory first
+/// (none where it wrote without reading), and when its writing began
+/// (`crate::land_trace::now`).
+pub(crate) struct Merged {
+    pub(crate) at: usize,
+    pub(crate) written: Vec<u8>,
+    pub(crate) card: Vec<u8>,
+    pub(crate) read: Vec<u8>,
+    pub(crate) began: u64,
 }
 
 /// The next merge on this thread keeps the last stretch it writes.
@@ -5412,7 +5476,7 @@ pub(crate) fn sample_next() {
 }
 
 /// The stretch kept ([`LAST_MERGED`]), taken; and no more is kept.
-pub(crate) fn last_merged() -> Option<(usize, Vec<u8>, Vec<u8>)> {
+pub(crate) fn last_merged() -> Option<Merged> {
     SAMPLE_NEXT.set(false);
     LAST_MERGED.take()
 }
@@ -5430,6 +5494,7 @@ thread_local! {
 /// not mapped alone). The caller opened the guards (`crate::watch::writing`).
 fn write_title(at: usize, bytes: &[u8]) {
     let n = bytes.len();
+    crate::land_trace::wrote(b'w', at, n);
     if crate::watch::user_copies() {
         // SAFETY: the destination is title memory whose guards are open
         // and which the copy's handler survives where it is not there; the

@@ -119,6 +119,21 @@ fn place(at: usize, len: usize) -> Result<(usize, usize), usize> {
     Ok((own.checked_add(from as usize).ok_or(3usize)?, n))
 }
 
+/// Title memory `[at, at + len)` as a view of our own shows it, if one
+/// title view holds all of it and a view of ours shows it (for the sample
+/// at a landing's telling: whether the title's address shows the pages our
+/// view does).
+pub(crate) fn read_ours(at: usize, len: usize) -> Option<Vec<u8>> {
+    let (ours, held) = place(at, len).ok()?;
+    if held < len {
+        return None;
+    }
+    let mut bytes = vec![0u8; len];
+    // SAFETY: inside our view of the section, read into a buffer of ours;
+    // the copy survives a page that is not there.
+    (unsafe { crate::watch::copy_title(bytes.as_mut_ptr(), ours as *const u8, len) } == len).then_some(bytes)
+}
+
 /// A stretch of title memory one title view holds, and where it lies in a
 /// view of our own: looked up once for the several writes of a landing
 /// into it ([`find`]).
@@ -216,6 +231,7 @@ impl Place {
 /// check does not find them, fewer).
 fn put(to: usize, at: usize, part: &[u8]) -> usize {
     let n = part.len();
+    crate::land_trace::wrote(b'b', at, n);
     // SAFETY: inside our view of the section, which nothing of ours reads;
     // the source is the caller's buffer, apart from it; the copy survives
     // a page that is not there.
