@@ -2292,11 +2292,33 @@ impl HostHeap {
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
+    ///
+    /// With [`away_ms`], not at the first look: only once the slot, made
+    /// from the same record, has been found so for that long.
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
         let _slot = self.locks.slot(index);
-        if self.made_key(index).is_none_or(|key| key == 0) {
+        let Some(key) = self.made_key(index).filter(|&key| key != 0) else {
             return false;
+        };
+        let wait = away_ms();
+        if wait > 0 {
+            let now = crate::host::now_ms();
+            let mut away = AWAY.lock().unwrap_or_else(|e| e.into_inner());
+            let away = away.get_or_insert_with(std::collections::HashMap::new);
+            let at = (std::ptr::from_ref(self) as usize, index);
+            match away.get(&at) {
+                Some(&(was, since)) if was == key && now.saturating_sub(since) < wait => return false,
+                Some(&(was, _)) if was == key => {
+                    away.remove(&at);
+                }
+                _ => {
+                    // (One of another record was made since: found anew.)
+                    away.insert(at, (key, now));
+                    return false;
+                }
+            }
         }
+        self.shown_null(index, key, NULL_GONE);
         self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
@@ -3314,6 +3336,7 @@ impl HostHeap {
             // lock: without it, the write comes back first.)
             for stale in self.note_buffer_in(index, Some(&view), for_draw, all, listed)? {
                 if stale != index {
+                    self.shown_null(stale, made(stale), NULL_STALE);
                     self.unmake(stale);
                 }
             }
@@ -3340,6 +3363,34 @@ impl HostHeap {
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Some(view));
+            }
+            // A view of another texture, or of this one in other memory or
+            // another size: shown in its place until the new one is made,
+            // where a shader could read it so ([`keep_shown`]).
+            if later
+                && !self.sampler
+                && let Some(old) = view_at(made(index) as u32, (made(index) >> 32) as u32)
+                && is_texture_view(&old)
+            {
+                let kin = kin(&old, &view);
+                let kept = kin <= keep_shown();
+                REWRITTEN[usize::from(kin.min(4) - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if kept {
+                    REWRITTEN[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Some(view));
+                }
+            }
+            if later {
+                self.shown_null(index, made(index), NULL_WRITTEN);
+            } else {
+                self.shown_again(index);
+                #[cfg(feature = "diagnostics")]
+                if !self.sampler && is_texture_view(&view) {
+                    SHOWN_COUNTS[8].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let [started, finished] = crate::host::submissions_numbered();
+                    // (The one being prepared has begun: those before it.)
+                    SHOWN_COUNTS[9].fetch_add(u64::from(started > finished + 1), std::sync::atomic::Ordering::Relaxed);
+                }
             }
             self.set_made(index, if later { 0 } else { key });
             let kept = if later {
@@ -4995,6 +5046,191 @@ pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 fn keep_views() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// What a texture view a slot is written with has to do with the one the
+/// slot shows, for [`keep_shown`]: 1, the same texture placed elsewhere (the
+/// same resource description: the title moved it); 2, one of the same
+/// format and dimension in another size (the title streams a texture in or
+/// out with more or fewer levels); 3, another texture of the same
+/// dimension; `u8::MAX`, one a shader that reads the other cannot read in
+/// its place (a buffer, another dimension, a view of the texture object's
+/// own description).
+fn kin(old: &View, new: &View) -> u8 {
+    const BUFFER: u32 = 1;
+    let dimension = |view: &View| match view {
+        View::Placed(false, resource, desc) if resource[0] != BUFFER => Some(desc[1]),
+        View::Shader(r, Some(words)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => Some(words[1]),
+        _ => None,
+    };
+    let (Some(a), Some(b)) = (dimension(old), dimension(new)) else {
+        return u8::MAX;
+    };
+    if a != b {
+        return u8::MAX;
+    }
+    if let (View::Placed(false, from, old_words), View::Placed(false, to, new_words)) = (old, new) {
+        if from == to {
+            return 1;
+        }
+        // (Words 4 and 6 of a description: width and height; word 0 of the
+        // view: its format.)
+        let (wide, high) = ([from[4], to[4]].map(u64::from), [from[6], to[6]].map(u64::from));
+        if from[0] == to[0] && old_words[0] == new_words[0] && wide[0] * high[1] == wide[1] * high[0] {
+            return 2;
+        }
+    }
+    3
+}
+
+/// Whether a slot that showed a texture, written with a view of another
+/// (in other memory, or of another size), goes on showing the old one until
+/// the new is made, instead of nothing: `VICTORY_KEEP_SHOWN`, the most
+/// distant [`kin`] kept (3, any texture of the same dimension; 2: the same
+/// texture moved or in another size; 1: moved only; 0: none, as before).
+/// The new view is made by the texture pass or a draw, as before, with its
+/// upload in the same submission. Until then the shaders that pick the
+/// slot by index read zeros where the title, which wrote a texture whose
+/// texels are there, has them read texels: in motion in the open world
+/// 1,000 to 4,000 slots a second went null so, half of them for one frame
+/// (the pass runs once a frame, at the first list that picks by index, and
+/// the title writes views after it), and a glass case in a house flipped
+/// between white and its contents from frame to frame. Three picture runs
+/// a side with scripted movement: 13, 5 and 14 pictures that differ from
+/// both neighbours for one picture without it, 2, 1 and 3 with it, none
+/// of those an object's look.
+/// shortcut: the old texture stands in for the new until the new is made,
+/// a frame or more; the title's own state would be the new texture at once
+/// (the pass run again before each submission for the slots written since).
+pub(crate) fn keep_shown() -> u8 {
+    static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3))
+}
+
+/// Since the start: slots that showed a texture and were written with a
+/// view of another by [`kin`] (moved, another size, another texture, none a
+/// shader could read in its place), and those of them that kept showing
+/// the old one ([`keep_shown`]).
+pub(crate) static REWRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// How long a made slot whose texture's memory is found unmapped goes on
+/// showing it before it is made null (`VICTORY_TEXTURE_AWAY_MS`, 3,000; 0:
+/// at once, as before): a title that moves a texture in its memory unmaps
+/// it and maps it again a moment later, and the slot's texture read as
+/// nothing in between. (Rare here: 0 to 8 slots a second in motion. The
+/// slot holds its host copy meanwhile, as it does while it shows it.)
+fn away_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000))
+}
+
+/// Made slots found unmapped and not made null yet ([`away_ms`]), by heap
+/// and slot: the record they were made from and when they were first found
+/// so (`crate::host::now_ms`).
+static AWAY: Mutex<Option<std::collections::HashMap<(usize, u32), (u64, u64)>>> = Mutex::new(None);
+
+/// Diagnostics: host slots that showed a texture and were made to show
+/// nothing, so that the shaders that pick them by index read zeros, until a
+/// draw or the texture pass makes them again. By heap and slot: the frame
+/// each was made null in, and why (a write of the title's with a view not
+/// made yet, the view made stale by a newer one of other memory there, its
+/// memory found unmapped).
+#[cfg(feature = "diagnostics")]
+static SHOWN_NULL: Mutex<Option<std::collections::HashMap<(usize, u32), (u64, u8)>>> = Mutex::new(None);
+
+/// Diagnostics, since the last line: slots made null by why (as
+/// [`SHOWN_NULL`]); of the slots made again, those made in the frame they
+/// went null in, 1 frame later, 2-3, 4-15, 16 or more; texture views made
+/// in a slot that was made from another record or none, and those of them
+/// made while submissions sent before had not finished (their lists that
+/// pick the slot read the new view, whose upload is in a later prelude).
+#[cfg(feature = "diagnostics")]
+static SHOWN_COUNTS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Why a slot that showed a texture was made null ([`SHOWN_NULL`]).
+const NULL_WRITTEN: u8 = 0;
+const NULL_STALE: u8 = 1;
+const NULL_GONE: u8 = 2;
+
+impl HostHeap {
+    /// Diagnostics: slot `index`, made from `key`, is made null now for
+    /// `why`, if it showed a texture.
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    fn shown_null(&self, index: u32, key: u64, why: u8) {
+        #[cfg(feature = "diagnostics")]
+        if key != 0
+            && !self.sampler
+            && view_at(key as u32, (key >> 32) as u32).is_some_and(|view| is_texture_view(&view))
+        {
+            SHOWN_COUNTS[usize::from(why)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SHOWN_NULL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert((std::ptr::from_ref(self) as usize, index), (crate::frame::current(), why));
+        }
+    }
+
+    /// Diagnostics: slot `index` shows a view again.
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    fn shown_again(&self, index: u32) {
+        #[cfg(feature = "diagnostics")]
+        if !self.sampler {
+            let mut null = SHOWN_NULL.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((frame, _)) = null.as_mut().and_then(|m| m.remove(&(std::ptr::from_ref(self) as usize, index))) {
+                let frames = crate::frame::current().saturating_sub(frame);
+                let bucket = match frames {
+                    0 => 3,
+                    1 => 4,
+                    2..=3 => 5,
+                    4..=15 => 6,
+                    _ => 7,
+                };
+                SHOWN_COUNTS[bucket].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Diagnostics: the line of [`SHOWN_COUNTS`], with the slots null now and
+/// how many of them went null over a frame ago, and [`REWRITTEN`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shown_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = std::array::from_fn::<u64, 10, _>(|i| SHOWN_COUNTS[i].swap(0, Relaxed));
+    let frame = crate::frame::current();
+    let (now, old) = SHOWN_NULL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or((0, 0), |m| (m.len(), m.values().filter(|(at, _)| frame > at + 1).count()));
+    let r = std::array::from_fn::<u64, 5, _>(|i| REWRITTEN[i].load(Relaxed));
+    tracing::info!(
+        "slots that showed a texture made to show nothing, since the last line: {} by a write of the title's with a view \
+         not made yet, {} made stale by a newer view of other memory, {} with their memory unmapped; made again in the \
+         frame they went null in {}, 1 frame later {}, 2-3 {}, 4-15 {}, later {}; null now {} ({} for over a frame); \
+         {} texture views made anew in a slot, {} of them with submissions sent before not finished; \
+         since the start, slots that showed a texture written with another: {} the same moved, {} in another size, {} \
+         another texture, {} none to stand for it; {} of them kept showing the old one (VICTORY_KEEP_SHOWN={})",
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+        c[6],
+        c[7],
+        now,
+        old,
+        c[8],
+        c[9],
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        keep_shown()
+    );
 }
 
 /// Whether both are shader views of one texture the title placed in

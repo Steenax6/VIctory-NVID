@@ -137,6 +137,10 @@ pub(crate) struct Staging {
     /// The number of the write journal's asking the last read of title
     /// memory came after (`crate::watch::asked_now`; 0 until a read).
     asked: Arc<std::sync::atomic::AtomicU64>,
+    /// Diagnostics: the number of the last submission that decided a copy
+    /// out of the buffer (crate::host::submissions_numbered; 0: none).
+    #[cfg(feature = "diagnostics")]
+    copy_in: std::sync::atomic::AtomicU64,
 }
 
 /// What a title texture's host copy holds of each part of the texture's
@@ -805,6 +809,26 @@ pub(crate) static FIRST_WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// second count rising where nothing streams is the fault of xmem's notice
 /// after the unmap (textures with holes, other ones each run).
 pub(crate) static PAGES_MISSING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Diagnostics, since the last line: detilings into a staging buffer; of
+/// them, those while a copy out of the buffer that a submission decided had
+/// not run (the submission had not finished); of those, the ones whose copy
+/// is the submission's being prepared (a list of it refreshed the texture
+/// again after one that copies it); and those that wrote zeros for a part
+/// whose pages are not there.
+#[cfg(feature = "diagnostics")]
+static STAGING_UNDER: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Diagnostics: the line of [`STAGING_UNDER`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staging_line() {
+    let [all, under, own, zeros] = [0, 1, 2, 3].map(|i| STAGING_UNDER[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "staging buffers detiled into, since the last line: {all}; {under} while a copy out of the buffer a submission \
+         decided had not run (it takes these bytes), {own} of them the copy of the submission being prepared, {zeros} \
+         with zeros for pages not there"
+    );
+}
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -1624,6 +1648,8 @@ pub(crate) fn decide_uploads(uploads: &[TextureUpload]) -> Vec<Copies> {
             by_level[crate::census::L_SOME].fetch_add(1, Relaxed);
             by_level[crate::census::L_COPIED].fetch_add(staging.bytes_of(subs), Relaxed);
             staging.mark_sent(sent, subs);
+            #[cfg(feature = "diagnostics")]
+            staging.copy_in.store(crate::host::submissions_numbered()[0], Relaxed);
             copies.push((upload.copy.clone(), staging.clone(), subs));
         }
         // What a view may show of the texture and the host copy holds
@@ -2675,6 +2701,20 @@ impl Staging {
     /// not there.
     fn detile_levels(&self, tiled: &[u8], levels: u32, is: &[PartIs; crate::census::PARTS]) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Diagnostics: the buffer is written now, on the CPU, while a copy
+        // out of it that a submission decided may not have run yet: that
+        // copy takes these bytes, not those of its own moment.
+        #[cfg(feature = "diagnostics")]
+        {
+            let [started, finished] = crate::host::submissions_numbered();
+            let copy = self.copy_in.load(Relaxed);
+            STAGING_UNDER[0].fetch_add(1, Relaxed);
+            if copy > finished {
+                STAGING_UNDER[1].fetch_add(1, Relaxed);
+                STAGING_UNDER[2].fetch_add(u64::from(copy == started), Relaxed);
+                STAGING_UNDER[3].fetch_add(u64::from(is.contains(&PartIs::Zeros)), Relaxed);
+            }
+        }
         let by_level = &crate::census::BY_LEVEL;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let sub = self.first + i as u32;
@@ -3846,6 +3886,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         copied: std::sync::atomic::AtomicU32::new(0),
         first,
         stale: std::sync::atomic::AtomicBool::new(stale),
+        #[cfg(feature = "diagnostics")]
+        copy_in: std::sync::atomic::AtomicU64::new(0),
         pooled,
     });
     map.insert(resource as usize, s.clone());
