@@ -674,6 +674,9 @@ fn written(at: usize, len: usize, by: Cause) -> u64 {
     PAGE_WRITES[0].fetch_add(1, Relaxed);
     crate::census::tell(by, crate::census::T_RANGES, 1);
     let number = crate::writes::next();
+    crate::writes::told(start, end, number);
+    #[cfg(feature = "diagnostics")]
+    crate::census::told_at(start, end, by, number);
     // Joined with the one before of the same kind: the whole range carries
     // the newer number (an upload that read between the two is uploaded
     // again either way).
@@ -763,6 +766,9 @@ pub(crate) fn remapped(at: usize, len: usize, cause: Cause) {
     STALE[1].fetch_add(1, Relaxed);
     crate::census::tell(cause, crate::census::T_RANGES, 1);
     let number = crate::writes::next();
+    crate::writes::told(start, end, number);
+    #[cfg(feature = "diagnostics")]
+    crate::census::told_at(start, end, cause, number);
     // Pages are mapped one after the other.
     if let Some(last) = ranges.last_mut()
         && last.1 == start

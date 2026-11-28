@@ -1667,3 +1667,144 @@ fn the_allocation_idiom_takes_each_host_wave_on_its_own_before_the_forms_that_me
         }
     }
 }
+// ---- a thread group's LDS set up by its first thread (`VICTORY_LDS_FIRST_INIT`) ----
+
+/// The group's first thread setting up LDS dwords 0 and 1 (to 0 and 7) as the water's
+/// transmission volumetrics do: `v_cmpx_eq_u32 exec, 0, v0`, the address and the data moved in,
+/// `ds_write2_b32`.
+const SETUP: [u32; 5] = [
+    vopc(0xD2, k(0), 0),   // v_cmpx_eq_u32 exec, 0, v0
+    vop1(0x01, 1, k(0)),   // v_mov_b32 v1, 0
+    vop1(0x01, 2, k(7)),   // v_mov_b32 v2, 7
+    0xD800_0000 | 0x0E << 18 | 0x100, // ds_write2_b32 v1, v1, v2 offset1:1
+    2 << 16 | 1 << 8 | 1,
+];
+
+/// A wave64 program of one console wave (`threads` in its group, 256 bytes of LDS) whose
+/// threads below s0 (by x) leave first; then `setup` under EXEC saved in s[14:15] and restored
+/// after; then every lane left takes its x into dword 0 with `ds_max_u32` and adds 1 to dword
+/// 1 with `ds_add_u32`, reads both back and stores them, with its x.
+fn setup_program(setup: &[u32], threads: [u32; 3]) -> NativeProgram {
+    let mut w = vec![
+        vopc(0xC3, 0, 0),     // v_cmp_le_u32 vcc, s0, v0: the threads from s0 on
+        sop1(0x24, 12, VCC),  // s_and_saveexec_b64 s[12:13], vcc
+        sopp(0x08, 0),        // s_cbranch_execz to the end (set below)
+        sop1(0x04, 14, EXEC), // s_mov_b64 s[14:15], exec
+    ];
+    w.extend_from_slice(setup);
+    w.extend([
+        sop1(0x04, EXEC, 14), // s_mov_b64 exec, s[14:15]
+        vop1(0x01, 3, k(0)),  // v_mov_b32 v3, 0
+        vop1(0x01, 6, k(1)),  // v_mov_b32 v6, 1
+    ]);
+    w.extend(ds(0x08, 0, 3, 0, 0)); // ds_max_u32 v3, v0
+    w.extend(ds(0x00, 0, 3, 6, 4)); // ds_add_u32 v3, v6 offset:4
+    w.extend([0xD800_0000 | 0x37 << 18 | 0x100, 4 << 24 | 3]); // ds_read2_b32 v[4:5], v3 offset1:1
+    w.extend(stores([4, 5, 0, 0]));
+    w[2] = sopp(0x08, (w.len() - 3) as i16);
+    let mut native = native_with(&w, true, threads.iter().product(), 256);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.threads = threads;
+        // (thread ids in v0 and v1 for a group of rows)
+        cs.rsrc2 |= u32::from(threads[1] > 1) << 11;
+    }
+    native
+}
+
+/// `native` in the paired form with the first thread's set-up on or off, validated by
+/// `dxil.dll` when present; with the set-ups written by the first thread alone.
+fn paired_setups(native: &NativeProgram, on: bool) -> (HostShader, u32) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let (host, first) = (lower::TEST_HOST_WAVE.replace(Some(32)), super::lds_setup::TEST_ON.replace(Some(on)));
+    super::lds_setup::TEST_SETUPS.set(0);
+    let shader = super::paired(&c, native, &p, &io, &res);
+    let setups = super::lds_setup::TEST_SETUPS.get();
+    lower::TEST_HOST_WAVE.set(host);
+    super::lds_setup::TEST_ON.set(first);
+    let (shader, wave) = shader.expect("the paired form");
+    assert_eq!(wave, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    (shader, setups)
+}
+
+/// The first thread's set-up is written once (in the lower lane's pass), by the first thread
+/// whether its lane has left or not: on the card the lanes left read the dwords as set up and
+/// as they took theirs into them, also where thread 0 and others left first. With
+/// `VICTORY_LDS_FIRST_INIT=0` the write stays the lane's, as before.
+#[test]
+fn the_groups_first_thread_sets_its_lds_up_also_where_its_lane_has_left() {
+    let native = setup_program(&SETUP, [64, 1, 1]);
+    let (on, setups) = paired_setups(&native, true);
+    assert_eq!(setups, 1, "one set-up, by the first thread");
+    let (off, none) = paired_setups(&native, false);
+    assert_eq!(none, 0, "switched off: the lane's write");
+    assert!(on.dxil != off.dxil);
+    // (what `super::emit` gives the host)
+    let shader = paired(&native);
+    assert!(shader.dxil == on.dxil, "emit's choice: the paired form with the set-up");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for s0 in [0u32, 1, 5, 40] {
+        let want: Vec<u32> = (0..64).flat_map(|t| if t < s0 { [0; 4] } else { [63, 7 + 64 - s0, t, t] }).collect();
+        let Some(got) = run_paired(&shader, [s0, 0, 0, 0], 256) else { return };
+        same_as_console(&got, &want);
+    }
+    eprintln!("ran on the hardware device: LDS set up by the first thread, its lane there or not");
+}
+
+/// A group of 8 rows of 8 whose test is x | y (`v_or_b32`) is the set-up; near misses are left
+/// as the lane's write: a compare with 1, an address from an SGPR, data moved in before the
+/// compare, and a group of rows tested by x alone.
+#[test]
+fn only_the_first_threads_set_up_is_written_by_the_first_thread_alone() {
+    let mut rows = vec![vop2(0x1C, 7, v(1), 0)]; // v_or_b32 v7, v1, v0
+    rows.push(vopc(0xD2, k(0), 7)); // v_cmpx_eq_u32 exec, 0, v7
+    rows.extend_from_slice(&SETUP[1..]);
+    assert_eq!(paired_setups(&setup_program(&rows, [8, 8, 1]), true).1, 1, "x | y in a group of rows");
+    let mut one = SETUP;
+    one[0] = vopc(0xD2, k(1), 0); // v_cmpx_eq_u32 exec, 1, v0
+    let mut scalar = SETUP;
+    scalar[1] = vop1(0x01, 1, 1); // v_mov_b32 v1, s1
+    let early = [SETUP[2], SETUP[0], SETUP[1], SETUP[3], SETUP[4]];
+    for (setup, threads, what) in [
+        (&one[..], [64, 1, 1], "a compare with 1"),
+        (&scalar[..], [64, 1, 1], "an address from an SGPR"),
+        (&early[..], [64, 1, 1], "data moved in before the compare"),
+        (&SETUP[..], [8, 8, 1], "a group of rows tested by x alone"),
+    ] {
+        assert_eq!(paired_setups(&setup_program(setup, threads), true).1, 0, "{what}");
+    }
+}
+
+/// The set-up in each arm of a per-lane if/else whose arms both use LDS (`if (x < s0) { set
+/// up; max } else { set up; max }`): the lanes missing at either set-up are in the other arm,
+/// not gone, and the console's second arm starts from what the first left when the first
+/// thread went the other way. Left as the lane's write.
+#[test]
+fn a_set_up_in_one_arm_of_a_per_lane_branch_is_the_lanes_write() {
+    let mut arm = vec![sop1(0x04, 14, EXEC)]; // s_mov_b64 s[14:15], exec
+    arm.extend_from_slice(&SETUP);
+    arm.push(sop1(0x04, EXEC, 14)); // s_mov_b64 exec, s[14:15]
+    arm.extend(ds(0x08, 0, 3, 0, 0)); // ds_max_u32 v3, v0
+    let mut w = vec![
+        vop1(0x01, 3, k(0)),  // v_mov_b32 v3, 0
+        vopc(0xC4, 0, 0),     // v_cmp_gt_u32 vcc, s0, v0: x below s0
+        sop1(0x24, 12, VCC),  // s_and_saveexec_b64 s[12:13], vcc
+        sopp(0x08, arm.len() as i16), // s_cbranch_execz to the other arm
+    ];
+    w.extend_from_slice(&arm);
+    w.extend([
+        sop2(0x15, EXEC, 12, EXEC),         // s_andn2_b64 exec, s[12:13], exec: the other arm
+        sopp(0x08, arm.len() as i16),       // s_cbranch_execz past it
+    ]);
+    w.extend_from_slice(&arm);
+    w.push(sop1(0x04, EXEC, 12)); // s_mov_b64 exec, s[12:13]
+    w.extend(stores([3, 3, 3, 3]));
+    assert_eq!(paired_setups(&native_with(&w, true, 64, 256), true).1, 0);
+}

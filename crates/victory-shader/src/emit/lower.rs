@@ -5098,6 +5098,33 @@ impl<'a> Lower<'a> {
             } else {
                 return Err("an LDS write of bytes or halves");
             };
+            let x = self.x;
+            if let Some(words) = super::lds_setup::find(x.p, x.st, x.native, (b, i), addr.as_ref(), data, &elements) {
+                // by the group's first thread, its lane running or not, once: in the paired form
+                // in the lower lane's pass (console lanes 0-31)
+                if self.twin.is_some() && self.upper {
+                    return Ok(());
+                }
+                #[cfg(test)]
+                super::lds_setup::TEST_SETUPS.set(super::lds_setup::TEST_SETUPS.get() + 1);
+                let t = if self.console_lanes {
+                    self.s.flags |= flags::WAVE_OPS;
+                    self.console_thread()
+                } else {
+                    let (e, i32t) = (self.s.entry, self.s.t.i32);
+                    self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[])
+                };
+                let zero = self.s.m.i32(0);
+                let first = self.s.m.cmp(self.cur, pred::EQ, t, zero);
+                let at = self.begin_guarded(Some(first));
+                for (index, x) in words {
+                    let (index, x, lds) = (self.s.m.i32(index), self.s.m.i32(x), self.s.lds());
+                    let p = self.s.m.element(self.cur, lds, index);
+                    self.s.m.store(self.cur, p, x);
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let mut stores = Vec::new();
             for (e, (off, w)) in elements.into_iter().enumerate() {
                 let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;

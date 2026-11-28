@@ -755,6 +755,28 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    let r: Vec<u64> = crate::resource::RETURNS.iter().map(|k| k.load(Relaxed)).collect();
+    let kinds_named = ["on the card whole", "on the card level by level", "in the PC's memory"];
+    let mut went = String::new();
+    let mut back = String::new();
+    for (kind, name) in kinds_named.iter().enumerate() {
+        let g = |fill: usize| (r[(kind * 3 + fill) * 2], mb(r[(kind * 3 + fill) * 2 + 1]));
+        let b = |class: usize| (r[18 + (kind * 4 + class) * 2], mb(r[18 + (kind * 4 + class) * 2 + 1]));
+        let [g0, g1, g2] = [g(0), g(1), g(2)];
+        let [b0, b1, b2, b3] = [b(0), b(1), b(2), b(3)];
+        went.push_str(&format!(
+            "; {name}: {} {:.0} MB under the line by a tenth of the budget or more, {} {:.0} MB under it by less, {} {:.0} MB at or over it",
+            g0.0, g0.1, g1.0, g1.1, g2.0, g2.1
+        ));
+        back.push_str(&format!(
+            "; {name}: {} {:.0} MB within 2 s, {} {:.0} MB in 2 to 10 s, {} {:.0} MB in 10 to 60 s, {} {:.0} MB later",
+            b0.0, b0.1, b1.0, b1.1, b2.0, b2.1, b3.0, b3.1
+        ));
+    }
+    tracing::info!(
+        "host copies of textures the title fills let go since the start, by the card's use then against the line new ones are \
+         made to{went}; made again, by the time since they went{back}"
+    );
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
@@ -862,7 +884,7 @@ fn log_memory() {
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
-         views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
+         views and {} views of placed memory; shapes of placed views kept: {} ({} entries of views without a resource let go for the cap); host lists: {} \
          made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
@@ -873,6 +895,7 @@ fn log_memory() {
         views[3],
         views[4],
         views[5],
+        views[8],
         lists[0],
         lists[1],
         lists[2] as i64 as f64 / (1 << 20) as f64,
