@@ -4701,6 +4701,14 @@ mod digest_tests {
         assert!(!crate::writes::told_after(at, at + 0x2_0000, stamp), "the pages before");
         assert!(!crate::writes::told_after(at + 0x3_0000, at + 0x4_0000, stamp), "the pages after");
         assert!(crate::writes::told_after(1 << 41, (1 << 41) + 1, stamp), "above the title's addresses: told");
+        // A tell to the end of the address space (the runtime frees a whole
+        // reservation) costs a number a chunk, and is found in every page.
+        let far: u64 = 0xac_0000_0000;
+        let long = crate::writes::next();
+        crate::writes::told(far + 0x1_0000, u64::MAX, long);
+        assert!(crate::writes::told_after(far + 0x1_0000, far + 0x2_0000, stamp), "its first page, in a chunk told in part");
+        assert!(crate::writes::told_after(far + (5 << 26) + 0x3_0000, far + (5 << 26) + 0x3_0001, stamp), "a chunk told whole");
+        assert!(!crate::writes::told_after(far, far + 0x1_0000, stamp), "the page before it");
     }
 
     #[test]

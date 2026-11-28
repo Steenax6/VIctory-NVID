@@ -124,6 +124,12 @@ const TOLD_CHUNKS: usize = ((1u64 << 40) / TOLD_PAGE / TOLD_CHUNK) as usize;
 /// look at its pages without a lock ([`told_after`]).
 static TOLD: [std::sync::OnceLock<Box<[AtomicU64]>>; TOLD_CHUNKS] = [const { std::sync::OnceLock::new() }; TOLD_CHUNKS];
 
+/// The highest number of a tell that covered a whole chunk of [`TOLD`]: a
+/// tell of a long range (the runtime frees and maps whole reservations, up
+/// to the end of the address space) costs a number for each chunk, not for
+/// each page, and makes no chunk of pages.
+static TOLD_WHOLE: [AtomicU64; TOLD_CHUNKS] = [const { AtomicU64::new(0) }; TOLD_CHUNKS];
+
 /// `[start, end)` was told under the number `number` ([`next`]). Called
 /// under the lock of the ranges the pass takes, after the number is given;
 /// calls nothing that locks.
@@ -131,11 +137,21 @@ pub(crate) fn told(start: u64, end: u64, number: u64) {
     if end <= start {
         return;
     }
-    let (first, last) = (start / TOLD_PAGE, end.div_ceil(TOLD_PAGE).min(TOLD_CHUNKS as u64 * TOLD_CHUNK));
-    for page in first..last {
-        let chunk = TOLD[(page / TOLD_CHUNK) as usize]
-            .get_or_init(|| (0..TOLD_CHUNK).map(|_| AtomicU64::new(0)).collect());
-        chunk[(page % TOLD_CHUNK) as usize].fetch_max(number, SeqCst);
+    let top = TOLD_CHUNKS as u64 * TOLD_CHUNK;
+    let (first, last) = (start / TOLD_PAGE, end.div_ceil(TOLD_PAGE).min(top));
+    let mut page = first;
+    while page < last {
+        let chunk = page / TOLD_CHUNK;
+        let chunk_end = ((chunk + 1) * TOLD_CHUNK).min(last);
+        if page % TOLD_CHUNK == 0 && chunk_end == (chunk + 1) * TOLD_CHUNK {
+            TOLD_WHOLE[chunk as usize].fetch_max(number, SeqCst);
+        } else {
+            let pages = TOLD[chunk as usize].get_or_init(|| (0..TOLD_CHUNK).map(|_| AtomicU64::new(0)).collect());
+            for p in page..chunk_end {
+                pages[(p % TOLD_CHUNK) as usize].fetch_max(number, SeqCst);
+            }
+        }
+        page = chunk_end;
     }
 }
 
@@ -151,7 +167,9 @@ pub(crate) fn told_after(start: u64, end: u64, stamp: u64) -> bool {
         return true;
     }
     (first..last).any(|page| {
-        TOLD[(page / TOLD_CHUNK) as usize].get().is_some_and(|chunk| chunk[(page % TOLD_CHUNK) as usize].load(SeqCst) > stamp)
+        let chunk = (page / TOLD_CHUNK) as usize;
+        TOLD_WHOLE[chunk].load(SeqCst) > stamp
+            || TOLD[chunk].get().is_some_and(|pages| pages[(page % TOLD_CHUNK) as usize].load(SeqCst) > stamp)
     })
 }
 
