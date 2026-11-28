@@ -3272,6 +3272,46 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     (noted, written, open)
 }
 
+/// Whether nothing the guards and the journal know of can have changed
+/// title memory `[start, end)` since the asking numbered `asked`: every 64
+/// KiB block of it is guarded, clean and not noted absent, no opening is
+/// under way in its regions, and the journal notes no page of it after
+/// that asking. For the texture pass's reads of parts its host copy holds
+/// (`crate::texture` `Staging::refresh_parts`).
+///
+/// Read without the guards' locks, the guards before the journal: a block
+/// is noted clean again only by a check that notes in the journal, under
+/// its lock, what it found written (or by a mapping, which clears the
+/// guards first), so a write that a look at the guards misses is one the
+/// journal holds by the time it is looked at, and a write that comes after
+/// the look is one that comes after a read would have. Whether the
+/// memory is there it does not say: the runtime tells of an unmapping
+/// before the pages go, and a check between the two notes them clean again.
+pub(crate) fn untouched_since(start: usize, end: usize, asked: u64) -> bool {
+    if start >= end || asked == 0 {
+        return false;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    if last - first > 1 << 16 {
+        return false;
+    }
+    for index in first / REGION..=(last - 1) / REGION {
+        let want = span(index, first, last);
+        let Some(r) = region(index) else {
+            return false;
+        };
+        if r.protected.get() & r.clean.get() & !r.absent.get() & want != want
+            || r.openings.load(std::sync::atomic::Ordering::Acquire) != 0
+        {
+            return false;
+        }
+    }
+    let j = journal();
+    let mut after = false;
+    let _ = j.written.each_after(first, last, After::All(asked), |_, _| after = true);
+    !after
+}
+
 /// Diagnostics: what the guards hold of title memory `[start, end)` now
 /// (`crate::census::unseen`), by a look without their locks.
 #[cfg(feature = "diagnostics")]

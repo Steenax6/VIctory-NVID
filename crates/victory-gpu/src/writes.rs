@@ -110,6 +110,51 @@ pub(crate) fn holds(stamp: u64, number: u64) -> bool {
     stamp == NOT_READ || stamp >= number
 }
 
+/// The pages of [`TOLD`]'s chunks (64 KiB each: 64 MiB a chunk), and the
+/// chunks: the title's addresses (40 bits).
+const TOLD_PAGE: u64 = 64 << 10;
+const TOLD_CHUNK: u64 = 1024;
+const TOLD_CHUNKS: usize = ((1u64 << 40) / TOLD_PAGE / TOLD_CHUNK) as usize;
+
+/// The highest number of a tell to the texture pass (memory mapped,
+/// written by DirectStorage, by the layer's copies or copied back, about
+/// to be written through the kernel; `crate::descriptor::host` `remapped`
+/// and `written`) by 64 KiB page, in chunks made where a page is first
+/// told: whether anything was told of a texture's part after a read is a
+/// look at its pages without a lock ([`told_after`]).
+static TOLD: [std::sync::OnceLock<Box<[AtomicU64]>>; TOLD_CHUNKS] = [const { std::sync::OnceLock::new() }; TOLD_CHUNKS];
+
+/// `[start, end)` was told under the number `number` ([`next`]). Called
+/// under the lock of the ranges the pass takes, after the number is given;
+/// calls nothing that locks.
+pub(crate) fn told(start: u64, end: u64, number: u64) {
+    if end <= start {
+        return;
+    }
+    let (first, last) = (start / TOLD_PAGE, end.div_ceil(TOLD_PAGE).min(TOLD_CHUNKS as u64 * TOLD_CHUNK));
+    for page in first..last {
+        let chunk = TOLD[(page / TOLD_CHUNK) as usize]
+            .get_or_init(|| (0..TOLD_CHUNK).map(|_| AtomicU64::new(0)).collect());
+        chunk[(page % TOLD_CHUNK) as usize].fetch_max(number, SeqCst);
+    }
+}
+
+/// Whether something was told of `[start, end)` under a number above
+/// `stamp`: a read that began at `stamp` may not hold what is there now.
+/// Memory above the title's addresses counts as told.
+pub(crate) fn told_after(start: u64, end: u64, stamp: u64) -> bool {
+    if end <= start {
+        return false;
+    }
+    let (first, last) = (start / TOLD_PAGE, end.div_ceil(TOLD_PAGE));
+    if last > TOLD_CHUNKS as u64 * TOLD_CHUNK {
+        return true;
+    }
+    (first..last).any(|page| {
+        TOLD[(page / TOLD_CHUNK) as usize].get().is_some_and(|chunk| chunk[(page % TOLD_CHUNK) as usize].load(SeqCst) > stamp)
+    })
+}
+
 /// Title memory about to be written by reads the title has submitted
 /// ([`title_memory_will_write`]): by start and a number of its own, the
 /// end; and the longest range so far, which bounds a look for the ranges

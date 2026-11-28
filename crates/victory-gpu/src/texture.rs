@@ -111,6 +111,11 @@ pub(crate) struct Staging {
     /// The number the refresh under way began at (`crate::writes::stamp`),
     /// for what a part found as the host copy holds it notes ([`Sent`]).
     reading: std::sync::atomic::AtomicU64,
+    /// The parts (a bit each) the last refresh read where they lie with all
+    /// their pages there, or left unread for that ([`Staging::unchanged`]):
+    /// of those alone the host copy keeps the number its read began at
+    /// ([`Sent`]).
+    whole: std::sync::atomic::AtomicU32,
     /// Diagnostics: a read the title submitted was still to write the
     /// texture's memory when the refresh under way began; what the last
     /// read knew of each part ([`unseen_flags`]).
@@ -320,6 +325,13 @@ fn memory_parts(size: u64, slices: u32, offsets: &[u64]) -> Vec<(usize, usize)> 
         return vec![(0, size)];
     }
     cuts.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// The digest of a part of a texture's memory as a refresh by level takes
+/// it ([`Staging::refresh_parts`]): [`digest`] folded to 64 bits, never 0.
+fn part_digest(bytes: &[u8]) -> u64 {
+    let d = digest(bytes).0;
+    (d as u64 ^ (d >> 64) as u64).max(1)
 }
 
 /// Whether `bytes` are all zero, a word at a time.
@@ -789,6 +801,59 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         crate::list::ensure_state(list, source, before);
     }
     true
+}
+
+/// Whether an upload of the texture pass made because the title wrote the
+/// slot's view again leaves unread the parts its host copy holds that
+/// nothing can have changed since ([`Staging::unchanged`]);
+/// `VICTORY_TEXTURE_SKIP=0`: every part is read and hashed, as before.
+///
+/// The title writes its descriptors again all the time, and every such
+/// write made the slot due and its texture read and hashed whole: in a run
+/// in motion in the open world 79 GB of title memory in 150 s, nearly all of
+/// it found as the host copy held it (57.8 GB of levels not detiled for
+/// that), 8.6 ms a frame of the submitting thread in the hashing and the
+/// asking which pages are there. Of the parts of such uploads that had
+/// changed, 3 % had changed with nothing seen by the journal, the guards or
+/// the write watch, and 945 of those 947 were of textures made level by
+/// level (in guarded view memory whose pages have other views, with no
+/// tell, no page missing and no read of the title's under way): those are
+/// never left unread.
+fn skip_unread() -> Option<()> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SKIP").is_none_or(|v| v != "0")).then_some(())
+}
+
+/// Diagnostics: whether every part [`skip_unread`] leaves unread is read
+/// and hashed all the same and compared with what the host copy holds
+/// (`VICTORY_TEXTURE_SKIP_CHECK=1`): the parts that differ are counted and
+/// the first ones named ([`skip_checked`]); what the read found is what
+/// goes up, as without the skip.
+#[cfg(feature = "diagnostics")]
+fn skip_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SKIP_CHECK").is_some_and(|v| v == "1"))
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn skip_check() -> bool {
+    false
+}
+
+/// The check of [`skip_check`]: a part `[at, at + len)` the skip would have
+/// left unread was read, and `differs` says whether its bytes were other
+/// than what the host copy holds. Counted (`crate::census::skip_checked`),
+/// and the first that differ named.
+fn skip_checked(differs: bool, at: usize, len: usize, bytes: u64) {
+    let n = crate::census::skip_checked(differs, bytes);
+    if differs && (n < 32 || n.is_multiple_of(100)) {
+        tracing::warn!(
+            at = format_args!("{at:#x}"),
+            len,
+            so_far = n + 1,
+            "a part of a texture the skip would have left unread holds other bytes than its host copy (VICTORY_TEXTURE_SKIP_CHECK)"
+        );
+    }
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
@@ -2293,6 +2358,33 @@ impl Staging {
         [first, limit]
     }
 
+    /// Whether part `k` of the texture's memory cannot have changed since a
+    /// read found it as the host copy holds it, so that an upload may leave
+    /// it unread ([`skip_unread`]): the host copy holds bytes of it, that
+    /// read found all its pages there and read it where it lies, every
+    /// block of it is guarded and clean with nothing noted in the journal
+    /// after that read's asking (`crate::watch::untouched_since`), and nothing was told of its pages to the
+    /// texture pass after the number that read began at (memory mapped,
+    /// written by DirectStorage, by the layer's copies, copied back:
+    /// `crate::writes::told_after`). Never of a texture made level by
+    /// level: those changed with nothing seen (see [`skip_unread`]).
+    fn unchanged(&self, k: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.on_demand || skip_unread().is_none() {
+            return false;
+        }
+        let Some(&(from, to)) = self.place.parts.get(k) else {
+            return false;
+        };
+        let (was, since, stamp) = (self.sent.key(k), self.sent.1[k].load(Relaxed), self.sent.2[k].load(Relaxed));
+        if was <= 1 || since == 0 || stamp == 0 || stamp == crate::writes::NOT_READ {
+            return false;
+        }
+        let at = self.memory as usize;
+        let (start, end) = (at.saturating_add(from), at.saturating_add(to));
+        crate::watch::untouched_since(start, end, since) && !crate::writes::told_after(start as u64, end as u64, stamp)
+    }
+
     /// What [`Staging::judgement`] said at the last detiling.
     fn judged(&self) -> [u64; 2] {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2357,6 +2449,8 @@ impl Staging {
         let under = crate::writes::pending_over(start, start + size);
         let asked = crate::watch::asked_now();
         self.reading.store(stamp, SeqCst);
+        // (Set by a read of it part by part where it lies.)
+        self.whole.store(0, Relaxed);
         #[cfg(feature = "diagnostics")]
         self.pending_read.store(under, Relaxed);
         let read = self.refresh_now();
@@ -2851,6 +2945,13 @@ impl Staging {
         // good. The read of the whole texture through the kernel, which
         // this replaces, took what was there.)
         let mut through = [false; c::PARTS];
+        // The parts left unread because nothing can have changed them since
+        // a read found them as the host copy holds them ([`Staging::unchanged`]).
+        let mut unread = [false; c::PARTS];
+        let pending_now = in_place && why == u32::from(c::VIEW) + 1 && skip_unread().is_some() && {
+            let start = self.memory as u64;
+            crate::writes::pending_over(start, start.saturating_add(self.layout.size))
+        };
         let (mut held, mut left, mut away, mut out, mut partly) = (0u32, 0u64, 0u64, 0u64, 0u64);
         for k in 0..n {
             let ((from, to), of_part) = (parts[k], self.place.levels_of_part[k]);
@@ -2860,10 +2961,19 @@ impl Staging {
                 None => {
                     let at = self.memory.wrapping_add(from);
                     let mut whole = true;
+                    let skip = in_place && why == u32::from(c::VIEW) + 1 && !pending_now && self.unchanged(k);
                     let state = part_is(cut, of_part, to as u64, judged, || {
+                        // Left unread: whether its pages are there is not
+                        // asked (if they went, what the host copy holds is
+                        // what the texture shows until a mapping is told).
+                        // The check reads it, and asks.
+                        if skip && !skip_check() {
+                            return true;
+                        }
                         whole = !in_place || committed(at, to - from);
                         whole || some_there(at, to - from)
                     });
+                    unread[k] = skip && state == PartIs::Read;
                     through[k] = state == PartIs::Read && !whole;
                     state
                 }
@@ -2890,8 +3000,20 @@ impl Staging {
                 (is[k], through[k]) = (PartIs::Left, false);
                 out += (to - from) as u64;
             }
+            unread[k] &= is[k] == PartIs::Read;
         }
         self.detiled.store(held, Relaxed);
+        // The parts read where they lie with all their pages there, or left
+        // unread for that: what the host copy holds of them may be left
+        // unread later ([`Sent`]).
+        if in_place {
+            let whole = (0..n).filter(|&k| is[k] == PartIs::Read && !through[k]).fold(0u32, |all, k| all | 1 << k);
+            self.whole.store(whole, Relaxed);
+        }
+        // With the check, the parts are read all the same and compared.
+        let check = skip_check();
+        let unread_now = |k: usize| unread[k] && !check;
+        let mut skipped = 0u64;
         if in_place {
             // Its views are clamped to the first level from which every
             // level has all its texels' pages (`Staging::note_levels_there`),
@@ -2927,14 +3049,18 @@ impl Staging {
         // Pages of what is the title's are missing.
         let partial = in_place && (0..n).any(|k| through[k] || is[k] == PartIs::Zeros);
         let taken = |bytes: &[u8]| {
-            let d = digest(bytes).0;
-            let d = (d as u64 ^ (d >> 64) as u64).max(1);
+            let d = part_digest(bytes);
             (d, c::Part { bytes: bytes.len() as u64, digest: d, zero: (count || partial) && all_zero(bytes) })
         };
         let reading = |k: usize| is[k] == PartIs::Read;
         if in_place && (0..n).all(|k| reading(k) && !through[k]) {
             // All of the texture is there: read where it lies.
             for (k, &(from, to)) in parts.iter().enumerate().take(n) {
+                if unread_now(k) {
+                    digests[k] = self.sent.key(k);
+                    skipped += (to - from) as u64;
+                    continue;
+                }
                 // SAFETY: the part's pages are all there (asked above), and
                 // stay while the caller holds title memory still.
                 let bytes = unsafe { std::slice::from_raw_parts(self.memory.add(from), to - from) };
@@ -2955,6 +3081,11 @@ impl Staging {
             with_read(size, |buffer| {
                 for k in (0..n).filter(|&k| reading(k)) {
                     let (from, to) = parts[k];
+                    if unread_now(k) {
+                        digests[k] = self.sent.key(k);
+                        skipped += (to - from) as u64;
+                        continue;
+                    }
                     let bytes: &[u8] = if through[k] {
                         crate::host::copy_mapped(buffer[from..to].as_mut_ptr(), self.memory.wrapping_add(from), to - from, false);
                         &buffer[from..to]
@@ -2972,7 +3103,7 @@ impl Staging {
                 // ("nothing at all mapped changes nothing"), and a
                 // texture whose memory goes before other memory comes in
                 // its place kept its texels meanwhile.
-                if partial && (0..n).filter(|&k| reading(k)).all(|k| census[k].zero) {
+                if partial && (0..n).filter(|&k| reading(k) && !unread_now(k)).all(|k| census[k].zero) {
                     return;
                 }
                 if partial {
@@ -3016,12 +3147,22 @@ impl Staging {
         let sampled = count && TURN.fetch_add(1, Relaxed).is_multiple_of(16);
         #[cfg(feature = "diagnostics")]
         let pending_read = self.pending_read.load(Relaxed);
+        if skipped > 0 {
+            c::unread(skipped, (0..n).filter(|&k| unread_now(k)).count() as u64);
+        }
+        let whole = self.whole.load(Relaxed);
         for k in (0..n).filter(|&k| reading(k)) {
             #[cfg(feature = "diagnostics")]
             self.read_flags[k].store(unseen_flags(through[k], pending_read), Relaxed);
             let (was, since) = (self.sent.key(k), self.sent.1[k].load(Relaxed));
             let changed = part_key(digests[k], self.place.levels_of_part[k], held) != was;
-            if count && was > 1 && since != 0 && (changed || sampled) {
+            // A part left unread with the check on: read all the same, and
+            // what it holds compared with what the host copy holds.
+            if unread[k] && check {
+                let (from, to) = parts[k];
+                skip_checked(changed, self.memory as usize + from, to - from, (to - from) as u64);
+            }
+            if count && was > 1 && since != 0 && (changed || sampled) && !unread_now(k) {
                 let ((from, to), at) = (parts[k], self.memory as usize);
                 let (noted, written, open) = crate::watch::seen_since(at.saturating_add(from), at.saturating_add(to), since);
                 let seen = noted || written > 0 || open > 0;
@@ -3041,9 +3182,15 @@ impl Staging {
                 }
             }
             // Found as the host copy holds it, by a read after this asking.
+            // (Left unread: nothing can have changed it since that read, and
+            // up to this asking.)
             if !changed && last.asked != 0 {
                 self.sent.1[k].fetch_max(last.asked, Relaxed);
-                self.sent.2[k].fetch_max(self.reading.load(Relaxed), Relaxed);
+                if whole & 1 << k != 0 {
+                    self.sent.2[k].fetch_max(self.reading.load(Relaxed), Relaxed);
+                } else {
+                    self.sent.2[k].store(0, Relaxed);
+                }
                 #[cfg(feature = "diagnostics")]
                 self.sent.3[k].store(self.read_flags[k].load(Relaxed), Relaxed);
             }
@@ -3130,7 +3277,8 @@ impl Staging {
                     by_level[crate::census::L_ZERO_FILLED].fetch_add(1, Relaxed);
                 }
                 sent.1[k].store(self.asked.load(std::sync::atomic::Ordering::SeqCst), Relaxed);
-                sent.2[k].store(self.stamp.load(std::sync::atomic::Ordering::SeqCst), Relaxed);
+                let whole = self.whole.load(Relaxed) & 1 << k != 0;
+                sent.2[k].store(if whole { self.stamp.load(std::sync::atomic::Ordering::SeqCst) } else { 0 }, Relaxed);
                 #[cfg(feature = "diagnostics")]
                 sent.3[k].store(self.read_flags[k].load(Relaxed), Relaxed);
             }
@@ -3922,6 +4070,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         filled: std::sync::atomic::AtomicBool::new(false),
         stamp: Arc::new(std::sync::atomic::AtomicU64::new(crate::writes::NOT_READ)),
         reading: std::sync::atomic::AtomicU64::new(0),
+        whole: std::sync::atomic::AtomicU32::new(0),
         #[cfg(feature = "diagnostics")]
         pending_read: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "diagnostics")]
@@ -4504,6 +4653,41 @@ mod digest_tests {
         assert_eq!(super::memory_parts(0, 0, &[0, u64::MAX]), [(0, 0)]);
         assert_eq!(super::memory_parts(0x1000, 1, &[u64::MAX, 0x800]), [(0, 0x800), (0x800, 0x1000)]);
         assert!(super::all_zero(&[0u8; 37]) && !super::all_zero(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]));
+    }
+
+    /// The check of the parts the skip leaves unread finds a part whose
+    /// bytes are other than what the host copy holds, and counts the ones
+    /// that are the same as compared and nothing more.
+    #[test]
+    fn the_skip_check_finds_a_seeded_difference() {
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+        let was = super::part_key(super::part_digest(&bytes), 1, u32::MAX);
+        let [compared, differing] = [2, 4].map(|k| crate::census::UNREAD[k].load(std::sync::atomic::Ordering::Relaxed));
+        super::skip_checked(super::part_key(super::part_digest(&bytes), 1, u32::MAX) != was, 0x1000, bytes.len(), bytes.len() as u64);
+        let mut seeded = bytes.clone();
+        seeded[2049] ^= 0x10;
+        super::skip_checked(super::part_key(super::part_digest(&seeded), 1, u32::MAX) != was, 0x1000, seeded.len(), seeded.len() as u64);
+        let [compared_now, differing_now] = [2, 4].map(|k| crate::census::UNREAD[k].load(std::sync::atomic::Ordering::Relaxed));
+        // (Other tests may count beside this one: at least these.)
+        assert!(compared_now >= compared + 2, "both parts compared");
+        assert!(differing_now > differing, "the seeded difference is found");
+    }
+
+    /// A tell after a read's number is found over the pages it lies in and
+    /// no others; one before it is not.
+    #[test]
+    fn a_tell_after_a_read_is_found_where_it_lies() {
+        let at: u64 = 0xab_0000_0000;
+        let before = crate::writes::next();
+        crate::writes::told(at + 0x1_8000, at + 0x2_0000, before);
+        let stamp = crate::writes::stamp();
+        assert!(!crate::writes::told_after(at, at + 0x4_0000, stamp), "a tell before the read");
+        let after = crate::writes::next();
+        crate::writes::told(at + 0x2_0000, at + 0x2_1000, after);
+        assert!(crate::writes::told_after(at + 0x2_ffff, at + 0x3_0000, stamp), "the same 64 KiB page");
+        assert!(!crate::writes::told_after(at, at + 0x2_0000, stamp), "the pages before");
+        assert!(!crate::writes::told_after(at + 0x3_0000, at + 0x4_0000, stamp), "the pages after");
+        assert!(crate::writes::told_after(1 << 41, (1 << 41) + 1, stamp), "above the title's addresses: told");
     }
 
     #[test]

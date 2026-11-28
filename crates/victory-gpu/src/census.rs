@@ -213,6 +213,28 @@ pub(crate) fn screened(why: u8, changed: bool, seen: bool, bytes: u64) {
     };
 }
 
+/// Since the start: parts of textures that uploads of the pass left unread
+/// because nothing can have changed them (`crate::texture` `skip_unread`)
+/// and their bytes; with the check (`VICTORY_TEXTURE_SKIP_CHECK=1`) the
+/// parts it read all the same, their bytes, and those of them that held
+/// other bytes than the host copy.
+pub(crate) static UNREAD: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// An upload left `parts` parts of `bytes` bytes unread.
+pub(crate) fn unread(bytes: u64, parts: u64) {
+    UNREAD[0].fetch_add(parts, Relaxed);
+    UNREAD[1].fetch_add(bytes, Relaxed);
+}
+
+/// The check read a part of `bytes` bytes the skip would have left unread;
+/// `differs`: it held other bytes than the host copy. Returns how many
+/// differed before.
+pub(crate) fn skip_checked(differs: bool, bytes: u64) -> u64 {
+    UNREAD[2].fetch_add(1, Relaxed);
+    UNREAD[3].fetch_add(bytes, Relaxed);
+    if differs { UNREAD[4].fetch_add(1, Relaxed) } else { UNREAD[4].load(Relaxed) }
+}
+
 /// Diagnostics: the last number (`crate::writes::next`) of a tell of each
 /// [`Cause`] by 64 KiB page of title memory, for [`unseen`]: the tells the
 /// texture pass takes are gone once it took them, and the question is
@@ -772,6 +794,22 @@ pub(crate) fn lines(frames: f64) {
                  again (parts the host copy held; every changed part, and the unchanged ones of one upload in 16), since \
                  the start, by the upload's reason{text}. A part changed with nothing seen is one a screen by them, in \
                  place of the read, would have left with the bytes from before"
+            );
+        }
+    }
+    {
+        let u: [u64; 5] = std::array::from_fn(|k| UNREAD[k].load(Relaxed));
+        if u.iter().any(|&n| n != 0) {
+            tracing::info!(
+                "parts of textures uploads of the pass left unread because nothing can have changed them since a read \
+                 found them as the host copy holds them (VICTORY_TEXTURE_SKIP), since the start: {} parts, {} MB; the check \
+                 (VICTORY_TEXTURE_SKIP_CHECK=1) read {} such parts all the same, {} MB, and found {} of them with other \
+                 bytes than the host copy (0: none may be)",
+                u[0],
+                mb(u[1]),
+                u[2],
+                mb(u[3]),
+                u[4]
             );
         }
     }
