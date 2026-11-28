@@ -450,6 +450,30 @@ pass read again" has, by the upload's reason, the parts changed with
 nothing seen (must be 0 before anything is left unread on their word), the
 parts changed and seen, and for one upload in sixteen the megabytes of
 unchanged parts with nothing seen (what leaving them unread would save).
+In diagnostics builds "parts of textures an upload of the pass found changed
+with nothing seen" splits those parts by what is known of them: the kind of
+memory now (write-watched, guarded view memory, blocks noted absent, blocks
+whose pages have other views), pages missing at the read that last found the
+part as the host copy holds it and at this one, a read of the game's still to
+write the texture then and now, a texture made level by level, and each
+cause of the texture pass's tells (memory mapped, DirectStorage, the layer's
+copies) told there since that read; the first 32 parts, and one in 200
+after, are named in a line of their own.
+
+`VICTORY_TEXTURE_SKIP` (on; `=0`: every part read and hashed, as before):
+an upload made because the game wrote the slot's view again leaves unread
+the parts its host copy holds that nothing can have changed since a read
+found them as it holds them: every block guarded and clean, nothing in the
+journal after that read, nothing told to the texture pass there since (a
+mapping, DirectStorage, the layer's copies), no read of the game's under way
+into the texture, and that read found all the part's pages there. Never for
+a texture made level by level: of 947 parts found changed with nothing seen
+in a run in motion, 945 were of those. "parts of textures uploads of the pass
+left unread" counts the parts and megabytes. `VICTORY_TEXTURE_SKIP_CHECK=1`
+(diagnostics builds) reads and hashes those parts all the same, uploads what
+it found, and counts in the same line the parts it compared and those with
+other bytes than the host copy (0: none may be); the first are named in a
+warning.
 
 For a texture both the game and the card write (the game's bake compresses
 its result on the card and copies it, level by level, into textures it also

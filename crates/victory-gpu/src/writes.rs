@@ -110,6 +110,69 @@ pub(crate) fn holds(stamp: u64, number: u64) -> bool {
     stamp == NOT_READ || stamp >= number
 }
 
+/// The pages of [`TOLD`]'s chunks (64 KiB each: 64 MiB a chunk), and the
+/// chunks: the title's addresses (40 bits).
+const TOLD_PAGE: u64 = 64 << 10;
+const TOLD_CHUNK: u64 = 1024;
+const TOLD_CHUNKS: usize = ((1u64 << 40) / TOLD_PAGE / TOLD_CHUNK) as usize;
+
+/// The highest number of a tell to the texture pass (memory mapped,
+/// written by DirectStorage, by the layer's copies or copied back, about
+/// to be written through the kernel; `crate::descriptor::host` `remapped`
+/// and `written`) by 64 KiB page, in chunks made where a page is first
+/// told: whether anything was told of a texture's part after a read is a
+/// look at its pages without a lock ([`told_after`]).
+static TOLD: [std::sync::OnceLock<Box<[AtomicU64]>>; TOLD_CHUNKS] = [const { std::sync::OnceLock::new() }; TOLD_CHUNKS];
+
+/// The highest number of a tell that covered a whole chunk of [`TOLD`]: a
+/// tell of a long range (the runtime frees and maps whole reservations, up
+/// to the end of the address space) costs a number for each chunk, not for
+/// each page, and makes no chunk of pages.
+static TOLD_WHOLE: [AtomicU64; TOLD_CHUNKS] = [const { AtomicU64::new(0) }; TOLD_CHUNKS];
+
+/// `[start, end)` was told under the number `number` ([`next`]). Called
+/// under the lock of the ranges the pass takes, after the number is given;
+/// calls nothing that locks.
+pub(crate) fn told(start: u64, end: u64, number: u64) {
+    if end <= start {
+        return;
+    }
+    let top = TOLD_CHUNKS as u64 * TOLD_CHUNK;
+    let (first, last) = (start / TOLD_PAGE, end.div_ceil(TOLD_PAGE).min(top));
+    let mut page = first;
+    while page < last {
+        let chunk = page / TOLD_CHUNK;
+        let chunk_end = ((chunk + 1) * TOLD_CHUNK).min(last);
+        if page % TOLD_CHUNK == 0 && chunk_end == (chunk + 1) * TOLD_CHUNK {
+            TOLD_WHOLE[chunk as usize].fetch_max(number, SeqCst);
+        } else {
+            let pages = TOLD[chunk as usize].get_or_init(|| (0..TOLD_CHUNK).map(|_| AtomicU64::new(0)).collect());
+            for p in page..chunk_end {
+                pages[(p % TOLD_CHUNK) as usize].fetch_max(number, SeqCst);
+            }
+        }
+        page = chunk_end;
+    }
+}
+
+/// Whether something was told of `[start, end)` under a number above
+/// `stamp`: a read that began at `stamp` may not hold what is there now.
+/// Memory above the title's addresses counts as told.
+pub(crate) fn told_after(start: u64, end: u64, stamp: u64) -> bool {
+    if end <= start {
+        return false;
+    }
+    let (first, last) = (start / TOLD_PAGE, end.div_ceil(TOLD_PAGE));
+    if last > TOLD_CHUNKS as u64 * TOLD_CHUNK {
+        return true;
+    }
+    (first..last).any(|page| {
+        let chunk = (page / TOLD_CHUNK) as usize;
+        TOLD_WHOLE[chunk].load(SeqCst) > stamp
+            || TOLD[chunk].get().is_some_and(|pages| pages[(page % TOLD_CHUNK) as usize].load(SeqCst) > stamp)
+    })
+}
+
 /// Title memory about to be written by reads the title has submitted
 /// ([`title_memory_will_write`]): by start and a number of its own, the
 /// end; and the longest range so far, which bounds a look for the ranges
