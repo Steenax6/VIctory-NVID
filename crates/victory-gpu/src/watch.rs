@@ -3272,6 +3272,42 @@ pub(crate) fn seen_since(start: usize, end: usize, asked: u64) -> (bool, usize, 
     (noted, written, open)
 }
 
+/// Diagnostics: what the guards hold of title memory `[start, end)` now
+/// (`crate::census::unseen`), by a look without their locks.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct PartState {
+    /// Its 64 KiB blocks; of them guarded and clean, noted absent, and
+    /// guarded together with the other views of their pages.
+    pub(crate) blocks: usize,
+    pub(crate) guarded: usize,
+    pub(crate) absent: usize,
+    pub(crate) aliased: usize,
+    /// The kernel's write watch answers for it.
+    pub(crate) watched: bool,
+}
+
+/// Diagnostics: [`PartState`] of `[start, end)`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn part_state(start: usize, end: usize) -> PartState {
+    let mut s = PartState { blocks: 0, guarded: 0, absent: 0, aliased: 0, watched: false };
+    if start >= end {
+        return s;
+    }
+    let first = start / BLOCK;
+    let last = end.div_ceil(BLOCK).min(first.saturating_add(1 << 16));
+    s.blocks = last - first;
+    for index in first / REGION..=(last - 1) / REGION {
+        let want = span(index, first, last);
+        if let Some(r) = region(index) {
+            s.guarded += (want & r.protected.get() & r.clean.get()).count_ones() as usize;
+            s.absent += (want & r.absent.get()).count_ones() as usize;
+            s.aliased += (want & r.aliased.get()).count_ones() as usize;
+        }
+    }
+    s.watched = kernel_dirty(first * BLOCK, (last - first) * BLOCK).is_some();
+    s
+}
+
 /// How many pages of `[at, at + len)` count as written since whatever
 /// watches them was last asked, without taking anything: for write-watched
 /// memory the pages whose bit the kernel holds (up to a few,

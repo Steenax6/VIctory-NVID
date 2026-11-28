@@ -108,6 +108,16 @@ pub(crate) struct Staging {
     /// refresh, 0 if that read nothing. The texture pass keeps it per slot
     /// (`crate::descriptor::host::HostHeap::texture_slot_stamp`).
     stamp: Arc<std::sync::atomic::AtomicU64>,
+    /// The number the refresh under way began at (`crate::writes::stamp`),
+    /// for what a part found as the host copy holds it notes ([`Sent`]).
+    reading: std::sync::atomic::AtomicU64,
+    /// Diagnostics: a read the title submitted was still to write the
+    /// texture's memory when the refresh under way began; what the last
+    /// read knew of each part ([`unseen_flags`]).
+    #[cfg(feature = "diagnostics")]
+    pending_read: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "diagnostics")]
+    read_flags: [std::sync::atomic::AtomicU64; crate::census::PARTS],
     /// The first level its views show while its most detailed levels' pages
     /// are not there; 0: all ([`Staging::note_levels_there`]).
     shown_from: std::sync::atomic::AtomicU32,
@@ -162,12 +172,29 @@ pub(crate) struct Staging {
 /// last read which found the part's memory as the host copy holds it came
 /// after (`crate::watch::asked_now`; 0: none): what was known of the
 /// memory since is counted when an upload reads the part again
-/// (`crate::census::SCREEN`).
+/// (`crate::census::SCREEN`). Beside that, the number the same read began
+/// at by the writes' count (`crate::writes::stamp`): a tell of the texture
+/// pass's after it (memory mapped, written by DirectStorage or by the layer)
+/// is numbered higher.
+///
+/// Diagnostics: what that read knew of the part ([`unseen_flags`]), for the
+/// count of parts found changed with nothing seen (`crate::census::unseen`).
 #[derive(Default)]
 pub(crate) struct Sent(
     [std::sync::atomic::AtomicU64; crate::census::PARTS],
     [std::sync::atomic::AtomicU64; crate::census::PARTS],
+    [std::sync::atomic::AtomicU64; crate::census::PARTS],
+    #[cfg(feature = "diagnostics")] [std::sync::atomic::AtomicU64; crate::census::PARTS],
 );
+
+/// Diagnostics: what a read knew of one part of a texture's memory, for
+/// [`Sent`]'s last field: some of its pages were not there (read through the
+/// kernel, as zeros there), a read the title submitted was still to write
+/// the texture's memory, and the frame of the read (from bit 8 on).
+#[cfg(feature = "diagnostics")]
+fn unseen_flags(through: bool, pending: bool) -> u64 {
+    u64::from(through) | u64::from(pending) << 1 | crate::frame::current() << 8
+}
 
 impl Sent {
     /// The key of what the host copy holds of part `part` (0: nothing).
@@ -2329,6 +2356,9 @@ impl Staging {
         let (start, size) = (self.memory as u64, self.layout.size);
         let under = crate::writes::pending_over(start, start + size);
         let asked = crate::watch::asked_now();
+        self.reading.store(stamp, SeqCst);
+        #[cfg(feature = "diagnostics")]
+        self.pending_read.store(under, Relaxed);
         let read = self.refresh_now();
         if read > 0 {
             self.stamp.store(stamp, SeqCst);
@@ -2984,17 +3014,38 @@ impl Staging {
         // left with the bytes from before.
         static TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sampled = count && TURN.fetch_add(1, Relaxed).is_multiple_of(16);
+        #[cfg(feature = "diagnostics")]
+        let pending_read = self.pending_read.load(Relaxed);
         for k in (0..n).filter(|&k| reading(k)) {
+            #[cfg(feature = "diagnostics")]
+            self.read_flags[k].store(unseen_flags(through[k], pending_read), Relaxed);
             let (was, since) = (self.sent.key(k), self.sent.1[k].load(Relaxed));
             let changed = part_key(digests[k], self.place.levels_of_part[k], held) != was;
             if count && was > 1 && since != 0 && (changed || sampled) {
                 let ((from, to), at) = (parts[k], self.memory as usize);
                 let (noted, written, open) = crate::watch::seen_since(at.saturating_add(from), at.saturating_add(to), since);
-                c::screened((why - 1) as u8, changed, noted || written > 0 || open > 0, (to - from) as u64);
+                let seen = noted || written > 0 || open > 0;
+                c::screened((why - 1) as u8, changed, seen, (to - from) as u64);
+                #[cfg(feature = "diagnostics")]
+                if changed && !seen {
+                    c::unseen(c::Unseen {
+                        why: (why - 1) as u8,
+                        at: at.saturating_add(from),
+                        len: to - from,
+                        level_by_level: self.on_demand,
+                        then: self.sent.3[k].load(Relaxed),
+                        stamp: self.sent.2[k].load(Relaxed),
+                        through: through[k],
+                        pending: pending_read,
+                    });
+                }
             }
             // Found as the host copy holds it, by a read after this asking.
             if !changed && last.asked != 0 {
                 self.sent.1[k].fetch_max(last.asked, Relaxed);
+                self.sent.2[k].fetch_max(self.reading.load(Relaxed), Relaxed);
+                #[cfg(feature = "diagnostics")]
+                self.sent.3[k].store(self.read_flags[k].load(Relaxed), Relaxed);
             }
         }
         by_level[c::L_READ].fetch_add(read as u64, Relaxed);
@@ -3079,6 +3130,9 @@ impl Staging {
                     by_level[crate::census::L_ZERO_FILLED].fetch_add(1, Relaxed);
                 }
                 sent.1[k].store(self.asked.load(std::sync::atomic::Ordering::SeqCst), Relaxed);
+                sent.2[k].store(self.stamp.load(std::sync::atomic::Ordering::SeqCst), Relaxed);
+                #[cfg(feature = "diagnostics")]
+                sent.3[k].store(self.read_flags[k].load(Relaxed), Relaxed);
             }
         }
     }
@@ -3867,6 +3921,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         remapped,
         filled: std::sync::atomic::AtomicBool::new(false),
         stamp: Arc::new(std::sync::atomic::AtomicU64::new(crate::writes::NOT_READ)),
+        reading: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(feature = "diagnostics")]
+        pending_read: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "diagnostics")]
+        read_flags: Default::default(),
         shown_from: std::sync::atomic::AtomicU32::new(0),
         buffer,
         #[cfg(feature = "diagnostics")]

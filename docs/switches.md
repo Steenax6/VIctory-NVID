@@ -450,6 +450,15 @@ pass read again" has, by the upload's reason, the parts changed with
 nothing seen (must be 0 before anything is left unread on their word), the
 parts changed and seen, and for one upload in sixteen the megabytes of
 unchanged parts with nothing seen (what leaving them unread would save).
+In diagnostics builds "parts of textures an upload of the pass found changed
+with nothing seen" splits those parts by what is known of them: the kind of
+memory now (write-watched, guarded view memory, blocks noted absent, blocks
+whose pages have other views), pages missing at the read that last found the
+part as the host copy holds it and at this one, a read of the game's still to
+write the texture then and now, a texture made level by level, and each
+cause of the texture pass's tells (memory mapped, DirectStorage, the layer's
+copies) told there since that read; the first 32 parts, and one in 200
+after, are named in a line of their own.
 
 For a texture both the game and the card write (the game's bake compresses
 its result on the card and copies it, level by level, into textures it also

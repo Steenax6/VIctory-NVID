@@ -213,6 +213,166 @@ pub(crate) fn screened(why: u8, changed: bool, seen: bool, bytes: u64) {
     };
 }
 
+/// Diagnostics: the last number (`crate::writes::next`) of a tell of each
+/// [`Cause`] by 64 KiB page of title memory, for [`unseen`]: the tells the
+/// texture pass takes are gone once it took them, and the question is
+/// whether one came after a read that is long past.
+#[cfg(feature = "diagnostics")]
+static TOLD_AT: Mutex<Option<HashMap<u64, [u64; CAUSES]>>> = Mutex::new(None);
+
+/// Diagnostics: title memory `[start, end)` was told by the cause coded
+/// `cause` under the number `number` (`crate::descriptor::host` `remapped`
+/// and `written`, under their lock; this locks one mutex of its own and calls
+/// nothing).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn told_at(start: u64, end: u64, cause: u8, number: u64) {
+    const PAGE: u64 = 64 << 10;
+    if end <= start {
+        return;
+    }
+    let cause = usize::from(cause).min(CAUSES - 1);
+    let mut all = TOLD_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(HashMap::new);
+    // (No more than 4 GiB of it at once.)
+    for page in (start / PAGE..end.div_ceil(PAGE)).take(1 << 16) {
+        let last = &mut all.entry(page).or_default()[cause];
+        *last = (*last).max(number);
+    }
+}
+
+/// Diagnostics: the causes (a bit each) told of `[start, end)` under a
+/// number above `stamp`.
+#[cfg(feature = "diagnostics")]
+fn told_since(start: u64, end: u64, stamp: u64) -> u32 {
+    const PAGE: u64 = 64 << 10;
+    let all = TOLD_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(all) = all.as_ref() else {
+        return 0;
+    };
+    let mut causes = 0;
+    for page in (start / PAGE..end.div_ceil(PAGE)).take(1 << 16) {
+        if let Some(last) = all.get(&page) {
+            for (cause, &n) in last.iter().enumerate() {
+                if n > stamp {
+                    causes |= 1 << cause;
+                }
+            }
+        }
+    }
+    causes
+}
+
+/// Diagnostics: a part of a texture's memory that an upload of the pass
+/// found changed while the journal, the guards and the write watch had seen
+/// nothing there since the read that last found it as the host copy holds
+/// it ([`screened`]): the upload's reason, where the part is, whether the
+/// texture is made level by level, what that read knew of it
+/// (`crate::texture` `unseen_flags`) and the number it began at
+/// (`crate::writes::stamp`), and whether this read found pages of it
+/// missing and a read of the title's still to write the texture.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct Unseen {
+    pub(crate) why: u8,
+    pub(crate) at: usize,
+    pub(crate) len: usize,
+    pub(crate) level_by_level: bool,
+    pub(crate) then: u64,
+    pub(crate) stamp: u64,
+    pub(crate) through: bool,
+    pub(crate) pending: bool,
+}
+
+/// Diagnostics: [`UNSEEN`]'s places. Parts in all; of them, by the kind of
+/// memory now (write-watched: the kernel answers; guarded view memory; some
+/// blocks noted absent; some whose pages have other views the guards hold
+/// with them); some pages missing at the earlier read, and at this one; a
+/// read of the title's to write the texture under way then, and now; made
+/// level by level; then one place for each [`Cause`] told there since the
+/// earlier read; and parts none of these name.
+#[cfg(feature = "diagnostics")]
+const U_ALL: usize = 0;
+#[cfg(feature = "diagnostics")]
+const U_WATCHED: usize = 1;
+#[cfg(feature = "diagnostics")]
+const U_VIEW: usize = 2;
+#[cfg(feature = "diagnostics")]
+const U_ABSENT: usize = 3;
+#[cfg(feature = "diagnostics")]
+const U_ALIASED: usize = 4;
+#[cfg(feature = "diagnostics")]
+const U_MISSING_THEN: usize = 5;
+#[cfg(feature = "diagnostics")]
+const U_MISSING_NOW: usize = 6;
+#[cfg(feature = "diagnostics")]
+const U_PENDING_THEN: usize = 7;
+#[cfg(feature = "diagnostics")]
+const U_PENDING_NOW: usize = 8;
+#[cfg(feature = "diagnostics")]
+const U_LEVELS: usize = 9;
+#[cfg(feature = "diagnostics")]
+const U_TOLD: usize = 10;
+#[cfg(feature = "diagnostics")]
+const U_NONE: usize = U_TOLD + CAUSES;
+/// Diagnostics: since the start ([`unseen`]).
+#[cfg(feature = "diagnostics")]
+static UNSEEN: [AtomicU64; U_NONE + 1] = [const { AtomicU64::new(0) }; U_NONE + 1];
+
+/// Diagnostics: counts and names a part found changed with nothing seen.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn unseen(u: Unseen) {
+    let count = |k: usize| UNSEEN[k].fetch_add(1, Relaxed);
+    let n = count(U_ALL);
+    let state = crate::watch::part_state(u.at, u.at.saturating_add(u.len));
+    let told = told_since(u.at as u64, u.at.saturating_add(u.len) as u64, u.stamp);
+    let (missing_then, pending_then) = (u.then & 1 != 0, u.then & 2 != 0);
+    let flags = [
+        (U_WATCHED, state.watched),
+        (U_VIEW, state.blocks > 0 && state.guarded + state.absent == state.blocks),
+        (U_ABSENT, state.absent > 0),
+        (U_ALIASED, state.aliased > 0),
+        (U_MISSING_THEN, missing_then),
+        (U_MISSING_NOW, u.through),
+        (U_PENDING_THEN, pending_then),
+        (U_PENDING_NOW, u.pending),
+        (U_LEVELS, u.level_by_level),
+    ];
+    for &(k, on) in &flags {
+        if on {
+            count(k);
+        }
+    }
+    for cause in 0..CAUSES {
+        if told & 1 << cause != 0 {
+            count(U_TOLD + cause);
+        }
+    }
+    let named = told != 0 || state.absent > 0 || missing_then || u.through || pending_then || u.pending || u.level_by_level;
+    if !named {
+        count(U_NONE);
+    }
+    if n < 32 || n.is_multiple_of(200) {
+        tracing::info!(
+            why = row_name(usize::from(u.why)),
+            at = format_args!("{:#x}", u.at),
+            bytes = u.len,
+            blocks = state.blocks,
+            guarded_clean = state.guarded,
+            absent = state.absent,
+            aliased = state.aliased,
+            write_watched = state.watched,
+            told = format_args!("{told:#x}"),
+            missing_then,
+            missing_now = u.through,
+            pending_then,
+            pending_now = u.pending,
+            level_by_level = u.level_by_level,
+            frames_since = crate::frame::current().saturating_sub(u.then >> 8),
+            so_far = n + 1,
+            "a part of a texture changed with nothing seen since the read that found it as the host copy holds it"
+        );
+    }
+}
+
 /// What the pass knows of an upload when it records it, beside its reason
 /// ([`FLAGS`]' places): its host copy was made anew after it had been let
 /// go; made for the first time; another texture's view starts inside the
@@ -612,6 +772,35 @@ pub(crate) fn lines(frames: f64) {
                  again (parts the host copy held; every changed part, and the unchanged ones of one upload in 16), since \
                  the start, by the upload's reason{text}. A part changed with nothing seen is one a screen by them, in \
                  place of the read, would have left with the bytes from before"
+            );
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::fmt::Write;
+        let u: [u64; U_NONE + 1] = std::array::from_fn(|k| UNSEEN[k].load(Relaxed));
+        if u[U_ALL] > 0 {
+            let mut told = String::new();
+            for cause in Cause::ALL {
+                let _ = write!(told, ", {} {}", cause.name(), u[U_TOLD + cause as usize]);
+            }
+            tracing::info!(
+                "parts of textures an upload of the pass found changed with nothing seen (the line above), since the start, \
+                 by what is known of them: {} in all; now in write-watched memory {}, in guarded view memory {}, with blocks \
+                 noted absent {}, with blocks whose pages have other views {}; pages missing at the read that found them as \
+                 the host copy holds them {}, at this read {}; a read of the title's to write the texture under way then {}, \
+                 now {}; made level by level {}; told since that read{told}; none of these {}",
+                u[U_ALL],
+                u[U_WATCHED],
+                u[U_VIEW],
+                u[U_ABSENT],
+                u[U_ALIASED],
+                u[U_MISSING_THEN],
+                u[U_MISSING_NOW],
+                u[U_PENDING_THEN],
+                u[U_PENDING_NOW],
+                u[U_LEVELS],
+                u[U_NONE]
             );
         }
     }
