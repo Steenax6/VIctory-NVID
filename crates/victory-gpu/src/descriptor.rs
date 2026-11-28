@@ -894,6 +894,60 @@ fn view_at_cached(i: u32, generation: u32, shapes: &mut Vec<Shape>) -> Option<Vi
     placed_from(shapes, i, generation)
 }
 
+/// A placed view as the title makes it carries words that nothing reads: the
+/// padding of the resource description (words 1 and 13), of a shader
+/// resource view's description (word 3), and the words of the view's union
+/// past the member its dimension uses. The title leaves there what its
+/// stack held, so the same view was a new shape each time it was made: of
+/// the 181,818 shapes after 150 s of movement, 152,339 had a twin that
+/// differed in those words alone (resource words 1 and 13, view words 3
+/// and 9), and the table grew by some 1,200 a second without a plateau
+/// (the shapes are full after an hour of play, and every view after that is
+/// a table entry nothing lets go). These words are cleared before the view
+/// is recorded. `VICTORY_PLACED_NORMAL=0`: kept as the title gave them.
+fn clear_filler(unordered: bool, resource: &mut [u32; 14], desc: &mut [u32; 16]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_NORMAL").is_none_or(|v| v != "0")) {
+        return;
+    }
+    resource[1] = 0;
+    resource[13] = 0;
+    // Where the union starts and how many words the member of the view's
+    // dimension takes (an unknown dimension keeps all of them).
+    let (start, used) = if unordered {
+        (2, match desc[1] {
+            1 => 7,
+            2 => 1,
+            3 => 3,
+            4 => 2,
+            5 => 4,
+            6 => 1,
+            7 => 2,
+            8 => 3,
+            _ => 8,
+        })
+    } else {
+        desc[3] = 0;
+        (4, match desc[1] {
+            1 => 5,
+            2 => 3,
+            3 => 5,
+            4 => 4,
+            5 => 6,
+            6 => 1,
+            7 => 2,
+            8 => 3,
+            9 => 3,
+            10 => 5,
+            11 => 2,
+            _ => 6,
+        })
+    };
+    for w in &mut desc[(start + used).min(10)..10] {
+        *w = 0;
+    }
+}
+
 /// The copy of the shapes [`view_at_cached`] reads.
 #[cfg(windows)]
 static SHAPES_SEEN: std::sync::Mutex<Vec<Shape>> = std::sync::Mutex::new(Vec::new());
@@ -1318,7 +1372,8 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
+        clear_filler(false, &mut resource, &mut desc);
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1329,7 +1384,8 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
+        clear_filler(true, &mut resource, &mut desc);
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1848,6 +1904,42 @@ mod tests {
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
     }
 
+    /// Views of placed memory that differ in the words nothing reads are one
+    /// view once those are cleared, and views that differ in a word the
+    /// view's dimension uses stay two.
+    #[test]
+    fn filler_words_of_placed_views_are_cleared() {
+        let make = |unordered: bool, filler: u32| {
+            let mut resource = [3, filler, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, filler];
+            // Texture 2D view: format, dimension, mapping, pad (shader
+            // views), then mip, levels, plane, clamp; the rest filler.
+            let mut desc = if unordered {
+                [98, 4, 0, filler, filler, filler, filler, filler, filler, filler, 0x1000, 0, 7, 0, 0, 0]
+            } else {
+                [98, 4, 0x1688, filler, 2, 1, 0, 0, filler, filler, 0x1000, 0, 7, 0, 0, 0]
+            };
+            if unordered {
+                // Union from word 2: mip and plane.
+                desc[2] = 5;
+                desc[3] = 0;
+            }
+            clear_filler(unordered, &mut resource, &mut desc);
+            (resource, desc)
+        };
+        for unordered in [false, true] {
+            assert_eq!(make(unordered, 0x1234_5678), make(unordered, 0x9abc_def0), "unordered {unordered}");
+        }
+        let (resource, mut desc) = make(false, 0x55);
+        assert_eq!((resource[1], resource[13], desc[3], desc[8], desc[9]), (0, 0, 0, 0, 0));
+        desc[4] += 1;
+        assert_ne!(make(false, 0x55).1, desc, "the level a view starts at is kept");
+        // A dimension it does not know keeps every word.
+        let mut odd = [98, 99, 0, 0, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0];
+        let before = odd;
+        clear_filler(false, &mut [0; 14], &mut odd);
+        assert_eq!(odd, before);
+    }
+
     /// The leak of run 65: a title that writes constant buffer views and
     /// views of placed memory at ever new addresses adds nothing to the
     /// table; one shape stands for all the placed views alike.
@@ -1860,8 +1952,12 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // (Words the title leaves as they are and nothing reads are cleared
+        // when a view is recorded; these have none set.)
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        (resource[1], resource[13]) = (0, 0);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        desc[3] = 0;
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
