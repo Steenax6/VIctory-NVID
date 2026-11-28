@@ -746,6 +746,14 @@ room's single wrong frames were still there with this (3 pictures in
   flights wrote stood behind as a whole). Whether the bytes the sample
   finds apart ever show, in the picture or in what the title does, is not
   known either: nothing has been traced to them. Not pursued.
+- `VICTORY_REMAP_SYNC=1` (off since 2026-11-28; the way for a day before): the
+  queues' waiting work is run from the caller's thread before each of the
+  title's page-mapping copies. A stop-gap for the host device lost at the
+  open world's entry: 34 of 115 entries lost without it on 2026-11-27, 1 of
+  about 65 with it; why it helped is not known. Off because it cost 41 ms a
+  frame of the title's streaming threads while the player moves (the line
+  "page-mapping copies per frame"), single calls up to 345 ms. The first
+  thing to turn on if the device is lost at the world's entry again.
 - `VICTORY_ASYNC_PRESENT=1` (opt-in; the title records the next frame
   while the last is sent): its first form passed every wait the queues
   held at the present call, and the title faulted within two minutes. A
