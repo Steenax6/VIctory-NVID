@@ -100,6 +100,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
+mod lds_setup;
 mod link;
 mod lower;
 mod own_bits;
