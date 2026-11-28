@@ -1204,6 +1204,58 @@ struct Hosted {
     /// or slot) since it was last found held (`crate::host::moment`; 0:
     /// held, or not looked at yet): [`let_go_idle`].
     unheld: std::sync::atomic::AtomicU64,
+    /// When its host copy was last let go and of what kind it was, for
+    /// [`RETURNS`] ([`went_mark`]; 0: never, or made again since).
+    went: std::sync::atomic::AtomicU64,
+}
+
+/// For the memory line: host copies of textures the title fills let go, by
+/// kind (on the card whole, on the card level by level, in the PC's memory)
+/// and by the card's use then as [`card_room`] weighs it (under its line by
+/// a tenth of the budget or more, under it by less, at or over it), a
+/// count and bytes each; then those made again, by kind and by how long
+/// after they went (under 2 s, 2 to 10 s, 10 to 60 s, later), a count and
+/// bytes each. Whether letting go by idle time alone costs uploads the
+/// card had room to spare.
+#[cfg(windows)]
+pub(crate) static RETURNS: [std::sync::atomic::AtomicU64; 42] = [const { std::sync::atomic::AtomicU64::new(0) }; 42];
+
+/// [`Hosted::went`]'s word for a copy of kind `kind` (0 to 2, as in
+/// [`RETURNS`]) let go now with the card's use in class `fill` (0 to 2).
+#[cfg(windows)]
+fn went_mark(kind: u64, fill: u64) -> u64 {
+    (((crate::host::moment() & 0xffff_ffff) + 1) << 4) | (kind << 2) | fill
+}
+
+/// Counts the host copy of `bytes` made again for a texture whose last
+/// copy went as `went` says ([`went_mark`]).
+#[cfg(windows)]
+fn count_return(went: u64, bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if went == 0 {
+        return;
+    }
+    let tenths = (crate::host::moment() & 0xffff_ffff).saturating_sub((went >> 4) - 1);
+    let class = match tenths {
+        0..20 => 0,
+        20..100 => 1,
+        100..600 => 2,
+        _ => 3,
+    };
+    let at = 18 + (((went >> 2) & 3) as usize * 4 + class) * 2;
+    RETURNS[at].fetch_add(1, Relaxed);
+    RETURNS[at + 1].fetch_add(bytes, Relaxed);
+}
+
+/// The card's use as [`card_room`] weighs it and its line, in bytes, from
+/// the system's `budget` and `used`: what is in use, less what the heaps of
+/// placed textures have free, plus what is kept for card copies of title
+/// buffers and for render targets not made yet; the line [`room_percent`]
+/// of the budget.
+#[cfg(windows)]
+fn card_use(budget: u64, used: u64) -> (u64, u64) {
+    let used = used.saturating_sub(crate::placed::free_bytes()) + crate::shadow::card_room_kept() + targets_room_kept();
+    (used, budget / 100 * room_percent())
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1543,6 +1595,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
+            count_return(r.host.went.swap(0, Relaxed), host.bytes);
         }
         KINDS[6].fetch_add(1, Relaxed);
         if host.filled {
@@ -1779,7 +1832,8 @@ pub(crate) fn card_room() -> bool {
         // used.
         // What the heaps of placed textures have free is room.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::placed::free_bytes()) + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            let (used, line) = card_use(budget, used);
+            used < line
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2230,7 +2284,19 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    let idle_ms = crate::host::vram_idle_ms(memory);
+    // The card's use now, for [`RETURNS`].
+    let fill = memory.map_or(2, |[budget, used, ..]| {
+        let (used, line) = card_use(budget, used);
+        if used + budget / 10 <= line {
+            0
+        } else if used < line {
+            1
+        } else {
+            2
+        }
+    });
     // Host copies made without memory of their own (`crate::tiles`: levels
     // left out, or on demand) wait longer while the card is not pressed
     // (`vram_idle_ms` above its least): they hold little of it, and the
@@ -2305,6 +2371,11 @@ pub(crate) fn let_go_idle() {
             crate::released::mark(&host.texture, crate::released::Path::Sweep);
             r.host.gone.store(true, Relaxed);
             r.host.unheld.store(0, Relaxed);
+            let kind = if host.spilled { 2 } else { u64::from(host.tiled.is_some()) };
+            r.host.went.store(went_mark(kind, fill), Relaxed);
+            let at = ((kind * 3 + fill) * 2) as usize;
+            RETURNS[at].fetch_add(1, Relaxed);
+            RETURNS[at + 1].fetch_add(host.bytes, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
             went += 1;
@@ -3082,6 +3153,7 @@ fn hand_out_resource(
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             unheld: std::sync::atomic::AtomicU64::new(0),
+            went: std::sync::atomic::AtomicU64::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
