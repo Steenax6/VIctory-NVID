@@ -49,6 +49,7 @@ mod indirect;
 mod inplace;
 pub mod list;
 pub mod object;
+mod pagemap;
 #[cfg(windows)]
 mod own_time;
 pub mod pipeline;

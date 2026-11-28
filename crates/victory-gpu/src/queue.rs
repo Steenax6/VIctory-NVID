@@ -1234,6 +1234,7 @@ extern "system" fn present(
     crate::copystat::present_begins();
     #[cfg(windows)]
     crate::timeline::present(FRAMES.load(Ordering::Relaxed) + 1);
+    crate::pagemap::presenting();
     #[cfg(windows)]
     let _span = crate::timeline::span("present.", "present<", 0, 0);
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1444,31 +1445,47 @@ const PAGE: u64 = 64 << 10;
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages).
 ///
+/// Whether the queues' lines are run from the caller's thread before a
+/// page-mapping copy (`VICTORY_REMAP_SYNC=1`; off): see
+/// [`copy_page_mappings`].
+#[cfg(windows)]
+fn remap_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_SYNC").is_some_and(|v| v == "1"))
+}
+
 /// A command of a queue's: the console makes the mapping behind the work
 /// the title sent before it, to whichever queue. Here the mapping is one
 /// of the title's address space and is made at once, because the title's
-/// own code goes on to use the addresses. Before it, what the queues'
-/// lines hold and is free to run is run from the caller's thread
-/// ([`before_sync`]), so that it takes its bytes where the console's lists
-/// take theirs, and the flights sent ahead whose shaders may write the
-/// pages land ([`crate::host::land_before_remap`]).
+/// own code goes on to use the addresses. Before it, the flights sent
+/// ahead whose shaders may write the pages land
+/// ([`crate::host::land_before_remap`]).
 ///
-/// Running the lines is what keeps the host device at the open world's
-/// entry, where the title maps pages by the thousand: without it the
-/// device was lost (removal reason: hung) in 34 of 115 entries on
-/// 2026-11-27, with it in none of 28. Why it does is not known. It is not
-/// the order of the reads and the remap: with the lines run behind the
-/// remap none of 13 entries was lost, and with the submissions that stood
-/// reading the pages mapped before by their physical place (no read through
-/// a remapped address was left) 4 of 18 were. Nor is it the remap falling
-/// into a preparation: kept out of one, 1 of 14 was lost. Nor the host
-/// copies of textures let go in that second: with none let go, 1 of 4.
-/// What the forms that hold have in common is that the caller does not go
-/// on until the lines are empty.
+/// `VICTORY_REMAP_SYNC=1` ([`remap_sync`]) also runs what the queues' lines
+/// hold and is free to run from the caller's thread first
+/// ([`before_sync`]). That was the way from 2026-11-27 until the next day,
+/// as a stop-gap for the host device lost at the open world's entry, where
+/// the title maps pages by the thousand (removal reason: hung): 34 of 115
+/// entries lost without it that day, 1 of about 65 with it. Why it helped
+/// is not known. It is not the order of the reads and the remap: with the
+/// lines run behind the remap none of 13 entries was lost, and with the
+/// submissions that stood reading the pages mapped before by their
+/// physical place 4 of 18 were. Nor is it the remap falling into a
+/// preparation (kept out of one: 1 of 14 lost), nor the host copies of
+/// textures let go in that second (none let go: 1 of 4). What the forms
+/// that held had in common is that the caller does not go on until the
+/// lines are empty.
 ///
-/// Its cost, two runs a side (an indication): none in the median of a
-/// whole run; about 10 ms a frame in the first 15 s of the world, 2 to
-/// 8 ms where the opening cutscene loads, none where nothing is loaded.
+/// It is off now because of what it costs where the player moves and the
+/// title maps pages nearly every frame: 41 ms a frame of the title's two
+/// streaming threads stood in it (of 53 in the call; the remap itself is
+/// 3), single calls up to 345 ms, and twice that with list calls only
+/// written down (`crate::list::thin`: the lines wait for the translation
+/// too). Since texture slots show a new texture only once its upload has
+/// run on the card (`crate::descriptor::after`), 16 entries without it
+/// lost none (8 with that mechanism, 8 with its switches off, by turns, on
+/// a night when the rate was low: no proof). If the device is lost at the
+/// world's entry again, this switch is the first thing to turn on.
 ///
 /// Tried and not kept: the copy standing in a line and made in its place
 /// while the title's thread goes on. In its own queue's line it changed
@@ -1496,9 +1513,15 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    // What the title sent before runs first (see above).
     #[cfg(windows)]
-    before_sync();
+    let _span = crate::timeline::span("pmap>", "pmap<", u64::from(count), 0);
+    let mut stat = crate::pagemap::Call::begin();
+    // With the switch: what the title sent before runs first (see above).
+    #[cfg(windows)]
+    if remap_sync() {
+        before_sync();
+    }
+    stat.took(crate::pagemap::Part::Sync);
     // And what that work's shaders write must land in the pages mapped
     // now, not in those mapped next (flights sent ahead land after their
     // submission returned).
@@ -1512,16 +1535,19 @@ extern "system" fn copy_page_mappings(
         let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
         crate::host::land_before_remap(b.destination, len);
     }
+    stat.took(crate::pagemap::Part::Land);
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
         }
+        stat.batch();
         // SAFETY: each batch holds `count` ranges.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
+            stat.range(r.kind, r.count);
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
             ok &= match r.kind {
@@ -1534,6 +1560,7 @@ extern "system" fn copy_page_mappings(
             at += len;
         }
     }
+    stat.took(crate::pagemap::Part::Remap);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));

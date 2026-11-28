@@ -38,7 +38,6 @@ impl SlotSet {
         was
     }
 
-    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn contains(&self, slot: u32) -> bool {
         self.words
             .get(slot as usize / 64)
@@ -64,6 +63,29 @@ impl SlotSet {
                 w &= w - 1;
             }
         }
+        out
+    }
+
+    /// What one pass of a round looks at: the slots whose number leaves
+    /// `part` when divided by `parts` (a divisor of 64: a word then holds
+    /// the same bits of every part), and the `written` slots besides, each
+    /// once. A written slot that is in the set is in the part's slots
+    /// already if it belongs to the part; one that went from the set is not,
+    /// and must be looked at (to be forgotten) wherever it belongs. Over the
+    /// passes of a round (`part` 0 to `parts - 1`) every slot of the set is
+    /// in one of them.
+    pub(crate) fn pass_of(&self, part: u32, parts: u32, written: Vec<u32>) -> Vec<u32> {
+        debug_assert!(parts.is_power_of_two() && parts <= 64 && part < parts);
+        let mask = (0..64u32).filter(|b| b % parts == part).fold(0u64, |m, b| m | 1 << b);
+        let mut out = Vec::with_capacity(self.len / parts as usize + written.len());
+        for (i, &word) in self.words.iter().enumerate() {
+            let mut w = word & mask;
+            while w != 0 {
+                out.push(i as u32 * 64 + w.trailing_zeros());
+                w &= w - 1;
+            }
+        }
+        out.extend(written.into_iter().filter(|&slot| slot % parts != part || !self.contains(slot)));
         out
     }
 }
@@ -345,6 +367,50 @@ pub(crate) fn present_into<V>(queue: &std::collections::BTreeMap<u32, V>, slots:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Over the sixteen passes of a round every slot of the set is looked at
+    /// exactly once (those written in between besides, once in the pass
+    /// they are written in), and a slot that was written is in its pass
+    /// whether it is in the set or went from it.
+    #[test]
+    fn a_round_of_passes_looks_at_every_slot_once_and_every_written_slot() {
+        let mut set = SlotSet::default();
+        for slot in (0..5000).filter(|s| s % 7 != 3) {
+            set.insert(slot);
+        }
+        let mut seen = vec![0u32; 5000];
+        for part in 0..16 {
+            // Written: a slot of the set in the part, one of another part,
+            // and two that went from the set (slot % 7 == 3), one of the
+            // part and one of another.
+            let went = |of_part: bool| (0..5000u32).find(|s| s % 7 == 3 && (s % 16 == part) == of_part).unwrap();
+            let mut written = vec![part, part + 1, went(true), went(false)];
+            written.sort_unstable();
+            written.dedup();
+            let pass = set.pass_of(part, 16, written.clone());
+            for w in &written {
+                assert!(pass.contains(w), "written slot {w} left out of part {part}");
+            }
+            let mut distinct = pass.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct.len(), pass.len(), "a slot twice in one pass");
+            let own: Vec<u32> = set.to_vec().into_iter().filter(|s| s % 16 == part).collect();
+            assert!(own.iter().all(|s| pass.contains(s)), "part {part} incomplete");
+            for &slot in pass.iter().filter(|s| set.contains(**s) && **s % 16 == part) {
+                seen[slot as usize] += 1;
+            }
+        }
+        for slot in 0..5000u32 {
+            assert_eq!(seen[slot as usize], u32::from(set.contains(slot)), "slot {slot}");
+        }
+        // The other way round: the slots of the passes of a round, taken
+        // with nothing written, are the set.
+        let mut all: Vec<u32> = (0..16).flat_map(|part| set.pass_of(part, 16, Vec::new())).collect();
+        all.sort_unstable();
+        assert_eq!(all, set.to_vec());
+        assert!(SlotSet::default().pass_of(0, 16, Vec::new()).is_empty());
+    }
 
     #[test]
     fn slot_sets_are_sets_in_ascending_order() {

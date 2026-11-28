@@ -83,7 +83,6 @@ pub(crate) fn submissions_in_flight() -> u64 {
 }
 
 /// The number of the last submission begun, and of the last finished.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn submissions_numbered() -> [u64; 2] {
     [STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire)]
 }
@@ -6690,6 +6689,7 @@ impl Host {
         }
         steps.mark("p.card", card.as_ref().map_or(0, |c| c.ranges.len() as u64));
         let prepared = std::time::Instant::now();
+        crate::descriptor::after::sending(this_submission);
         crate::timeline::ev("sub.", 8, runs.len() as u64);
         if late {
             *submitted += 1;
@@ -9436,8 +9436,10 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         {
             crate::draw::picked_counts::line();
+            crate::pagemap::line(frames);
             standing_line();
             crate::descriptor::host::shown_line();
+            crate::descriptor::after::line();
             crate::texture::staging_line();
         }
         crate::shadow::exact_line(frames);

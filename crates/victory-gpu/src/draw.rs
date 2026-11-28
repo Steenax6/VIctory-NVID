@@ -1023,6 +1023,20 @@ pub(crate) mod picked_counts {
     }
 }
 
+/// Frames after which every buffer slot of a heap was looked at again
+/// without a write ([`picked_pass`]).
+const HEAP_ROUND: u64 = 16;
+
+/// Whether the slots looked at again for no write are a sixteenth of them at
+/// every frame's first pass (`VICTORY_HEAP_SPREAD=0`: all of them at every
+/// sixteenth frame, as before). All at once was one submission waiting 48 ms
+/// for a pass over 232,914 slots, and 130 ms at most in a play session
+/// against a median of 5 ms.
+fn heap_spread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SPREAD").is_none_or(|v| v != "0"))
+}
+
 /// One pass over the buffer views of `heap` ([`Passes`]): the host slots
 /// of the views written since the pass before are made, and the
 /// ranges of host copies to bring up to date are returned: in the first
@@ -1036,9 +1050,10 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
     // Per host heap: the host copy and range each slot's buffer view
     // reads, kept from pass to pass. Only the slots written since the
     // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-    // at best); all of them every 16 frames, because a view of a
-    // released resource goes stale without a write, and a slot written
-    // before its memory had a host copy is only made then.
+    // at best); every slot again every 16 frames (a sixteenth of them a
+    // frame, [`heap_spread`]), because a view of a released resource goes
+    // stale without a write, and a slot written before its memory had a
+    // host copy is only made then.
     // (By slot with a multiply for a hash, not SipHash: the pass looks
     // at tens of thousands of slots a frame.)
     // (Declared before the table's guard, so let go after it: what was
@@ -1053,9 +1068,17 @@ fn picked_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::H
     // The frame's first pass over this heap.
     let first = std::mem::replace(last, frame) != frame;
     let changed = host.buffer_changes();
-    let slots = if first && *frames % 16 == 0 {
+    // The slots looked at again for no write: all of them at the heap's
+    // first pass and (`VICTORY_HEAP_SPREAD=0`) at every sixteenth frame, or
+    // a sixteenth of them at every frame's first pass, each at every
+    // sixteenth frame as well. A slot looked at is forgotten first (below),
+    // so a view gone stale without a write is dropped in its frame of the
+    // round; a slot that left the set was written, and is in `changed`.
+    let slots = if first && *frames == 0 || first && *frames % HEAP_ROUND == 0 && !heap_spread() {
         ranges.clear();
         host.buffer_slots()
+    } else if first && heap_spread() {
+        host.buffer_slots_of((*frames % HEAP_ROUND) as u32, HEAP_ROUND as u32, changed)
     } else {
         changed
     };
@@ -2713,6 +2736,13 @@ impl State {
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
+        // The slots held until their texture's first upload had run on the
+        // card (`crate::descriptor::after`) that are settled now.
+        crate::descriptor::after::flip(std::ptr::from_ref(host) as usize, |index| {
+            if let Some(handle) = heap.handle(index) {
+                let _ = host.mirror(index, handle, true);
+            }
+        });
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
         if room {
@@ -2971,7 +3001,13 @@ impl State {
                     );
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            // (Before a bake draw, which reads the slot once in this list
+            // after the upload, the slot is made at once.)
+            let view = heap.handle(index).and_then(|handle| {
+                use crate::descriptor::after::{AT_ONCE, PASS, by};
+                let _by = by(if bake { AT_ONCE } else { PASS });
+                host.mirror(index, handle, true)
+            });
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -3873,23 +3909,31 @@ impl State {
         known.then_some(key)
     }
 
-    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+    /// Brings the view of a table entry bound in the heap up to date for
+    /// the draw. True if its slot is held until its texture is settled
+    /// (`crate::descriptor::after`): the draw then reads the table made
+    /// afresh, where the view is made for it.
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) -> bool {
         let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
+            return false;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
         let Some(heap) = self.heap_of(handle) else {
-            return;
+            return false;
         };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
+            return false;
         };
         if let Some(key) = self.slot_known(host, index, handle) {
             self.ready(list, u.kind, key, None);
-            return;
+            return false;
         }
-        let (Some(view), key) = host.mirror_key(index, handle, true) else {
-            return;
+        let made = {
+            let _by = crate::descriptor::after::by(crate::descriptor::after::TABLE);
+            host.mirror_key(index, handle, true)
+        };
+        let (Some(view), key) = made else {
+            return false;
         };
         // (The record the slot is made from, unless another thread made it
         // from another meanwhile: then nothing is noted.)
@@ -3906,6 +3950,7 @@ impl State {
         if made {
             self.seen.slots.insert((std::ptr::from_ref(host) as usize, index), key);
         }
+        !made && crate::descriptor::after::held(std::ptr::from_ref(host) as usize, index)
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -4006,10 +4051,19 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        // A table with a slot held until its texture is settled is made
+        // afresh too: the draw reads the new view there, in the list that
+        // uploads its texture, while lists in the air read the held slot.
+        let mut held = false;
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+            if !fresh.contains(&u.slot) && self.table_entry(list, u, compute) {
+                fresh.push(u.slot);
+                held = true;
             }
+        }
+        if held {
+            fresh.sort_unstable();
+            fresh.dedup();
         }
         let mut made = std::mem::take(&mut self.scratch.made);
         made.clear();
@@ -4177,6 +4231,7 @@ impl State {
                                 host.texture_slot_tabled(title + k, false);
                             } else if self.slot_known(host, title + k, handle).is_none() {
                                 host.texture_slot_tabled(title + k, true);
+                                let _by = crate::descriptor::after::by(crate::descriptor::after::IN_PLACE);
                                 let (made, key) = host.mirror_key(title + k, handle, true);
                                 if made.is_some() && host.made_from(title + k, key) {
                                     self.seen.slots.insert((std::ptr::from_ref(host) as usize, title + k), key);

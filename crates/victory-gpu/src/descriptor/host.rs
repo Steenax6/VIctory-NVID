@@ -2453,6 +2453,13 @@ impl HostHeap {
         self.buffers.lock().unwrap_or_else(|e| e.into_inner()).to_vec()
     }
 
+    /// One pass of a round over the slots that hold buffer views
+    /// ([`SlotSet::pass_of`]): those of part `part` of `parts`, and the
+    /// `written` slots besides.
+    pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32, written: Vec<u32>) -> Vec<u32> {
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).pass_of(part, parts, written)
+    }
+
     /// The title slots whose buffer view was written, or went, since the
     /// last call (in the order first written; the set this was gave them
     /// in no order).
@@ -3380,6 +3387,26 @@ impl HostHeap {
                     return Ok(Some(view));
                 }
             }
+            // A texture whose first upload has not run on the card, or made
+            // while submissions begun before it may still run: lists in the
+            // air read this slot by index ([`super::after`]). It shows what
+            // it showed, where that can stand for the new texture, or
+            // nothing, and the new view once the texture is settled.
+            if !later
+                && !self.sampler
+                && is_texture_view(&view)
+                && let Some(now) = super::after::hold(std::ptr::from_ref(self) as usize, index, key, &view)
+            {
+                let shown = made(index);
+                let stands = view_at(shown as u32, (shown >> 32) as u32)
+                    .is_some_and(|old| is_texture_view(&old) && kin(&old, &view) <= keep_shown());
+                if now && !stands {
+                    super::after::held_null();
+                    self.shown_null(index, shown, NULL_WRITTEN);
+                    self.unmake(index);
+                }
+                return Ok(Some(view));
+            }
             if later {
                 self.shown_null(index, made(index), NULL_WRITTEN);
             } else {
@@ -3400,6 +3427,12 @@ impl HostHeap {
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+            }
+            if let Some(Some(texture)) = &kept
+                && !self.sampler
+                && is_texture_view(&view)
+            {
+                super::after::named(std::ptr::from_ref(self) as usize, index, texture);
             }
             // The slot holds the view or a null view of its kind: now its
             // entry may say so, behind the slot's own bytes.
