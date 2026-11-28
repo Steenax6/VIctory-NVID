@@ -884,7 +884,7 @@ fn log_memory() {
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
-         views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
+         views and {} views of placed memory; shapes of placed views kept: {} ({} entries of views without a resource let go for the cap); host lists: {} \
          made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
@@ -895,6 +895,7 @@ fn log_memory() {
         views[3],
         views[4],
         views[5],
+        views[8],
         lists[0],
         lists[1],
         lists[2] as i64 as f64 / (1 << 20) as f64,
