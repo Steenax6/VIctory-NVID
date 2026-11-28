@@ -19,14 +19,20 @@
 //! the console what the group before left, on the host anything. Here the first thread always
 //! writes the set-up (`Lower::ds`), and the tile works from its own depths.
 //!
-//! The title's shader archive has the pattern in 19 compute programs. In 15 of them EXEC is
-//! whole at the compare (at the program's start, or past uniform branches and regions that
-//! have closed), so the first thread runs the write on the console too and nothing changes. In
-//! the four water programs lanes may have left: the two above, and
-//! `CS_TransmissionVolumetrics` and `_VolumePortalsOnly`, which set up in each arm of a
-//! per-lane if/else; in the second arm, where the first thread went the other way, the console
-//! starts from the first arm's finished values and the host from the set-up.
-//! (`VICTORY_LDS_FIRST_INIT=0`: the lane's write, as the console has it.)
+//! Only where no one would write at all: the lanes missing at the set-up must have left for
+//! good, so that none of them uses LDS before it or after it ([`lanes_missing_never_use_lds`]).
+//! A set-up in one arm of a per-lane if/else whose other arm uses LDS too stays the lane's
+//! write: there the console's second arm starts from the first arm's finished values when the
+//! first thread went the other way, and that is the console's result.
+//!
+//! The title's shader archive has the pattern in 19 compute programs; 15 are taken. In 13 of
+//! them EXEC is whole at the compare (at the program's start, or past uniform branches and
+//! regions that have closed), so the first thread runs the write on the console too and what
+//! they compute does not change. Only the two above change. Left as they were:
+//! `CS_TransmissionVolumetrics` and `_VolumePortalsOnly` (a set-up in each arm of a per-lane
+//! if/else), and two tessellation programs whose EXEC is whole at the compare but whose earlier
+//! LDS writes run under masks the rule does not follow back.
+//! (`VICTORY_LDS_FIRST_INIT=0`: the lane's write everywhere, as the console has it.)
 
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{EXEC, Program, Reg, Value};
@@ -145,6 +151,9 @@ pub(super) fn find(
             _ => None,
         }
     };
+    if !lanes_missing_never_use_lds(p, &insts[j]) {
+        return None;
+    }
     let at = constant(addr?)?;
     let mut words = Vec::new();
     for (e, &(offset, dwords)) in elements.iter().enumerate() {
@@ -158,4 +167,116 @@ pub(super) fn find(
         words.push((byte / 4, constant(data.get(e)?)?));
     }
     Some(words)
+}
+
+/// Whether every LDS access of `p` runs under an EXEC that holds only lanes of the EXEC the
+/// set-up's compare `cmp` starts from: the lanes missing at the set-up have left for good and
+/// touch LDS neither before it nor after it. Not so where the set-up sits in one arm of a
+/// per-lane if/else whose other arm uses LDS too: there the console's second arm starts from
+/// what the first left when the first thread went the other way, and that is kept.
+///
+/// An EXEC value holds only such lanes when it is the compare's, or narrows one that does:
+/// a copy (`s_mov`), an AND with one (`s_and`, `s_andn2` of one, `s_and_saveexec` and a
+/// lane compare into EXEC), the EXEC a saveexec saved from one, or a phi of such values
+/// (taken as so around loops until a way in says otherwise). Anything else (a restore of a
+/// mask saved before the compare, an OR) holds lanes the compare did not have.
+fn lanes_missing_never_use_lds(p: &Program, cmp: &crate::ir::Inst) -> bool {
+    use std::collections::{HashMap, HashSet};
+    let halves: u8 = if p.wave64 { 2 } else { 1 };
+    let start: Vec<Value> = (0..halves).filter_map(|h| cmp.read(Reg::S(EXEC + h))).collect();
+    if start.len() != usize::from(halves) {
+        return false;
+    }
+    // how each value of a scalar half comes about
+    enum Def<'p> {
+        Phi(&'p [Value]),
+        Inst(&'p crate::ir::Inst, Reg),
+    }
+    let mut defs: HashMap<Value, Def> = HashMap::new();
+    for block in &p.blocks {
+        for phi in &block.phis {
+            defs.insert(phi.value, Def::Phi(&phi.args));
+        }
+        for inst in &block.insts {
+            for &(reg, v) in &inst.writes {
+                defs.insert(v, Def::Inst(inst, reg));
+            }
+        }
+    }
+    // the values an operand reads in half `h`
+    let half = |inst: &crate::ir::Inst, op: Option<&Operand>, h: u8| match op {
+        Some(Operand::Scalar { code, .. }) => inst.read(Reg::S(code + h)),
+        _ => None,
+    };
+    // Greatest fixpoint: every value is taken to hold only the compare's lanes until its way
+    // of coming about says otherwise.
+    let mut out: HashSet<Value> = HashSet::new();
+    let inside = |v: Option<Value>, out: &HashSet<Value>| v.is_some_and(|v| start.contains(&v) || defs.contains_key(&v) && !out.contains(&v));
+    loop {
+        let mut changed = false;
+        for (&v, def) in &defs {
+            if out.contains(&v) || start.contains(&v) {
+                continue;
+            }
+            let holds = match *def {
+                Def::Phi(args) => args.iter().all(|&a| inside(Some(a), &out)),
+                Def::Inst(inst, Reg::S(code)) => holds_inside(inst, code, &half, &|x| inside(x, &out)),
+                Def::Inst(..) => false,
+            };
+            if !holds {
+                out.insert(v);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    p.blocks.iter().flat_map(|b| &b.insts).filter(|i| uses_lds(i)).all(|i| {
+        (0..halves).all(|h| inside(i.read(Reg::S(EXEC + h)), &out))
+    })
+}
+
+/// An LDS access (not a lane swizzle or permute, which touch no LDS).
+fn uses_lds(i: &crate::ir::Inst) -> bool {
+    matches!(i.fields, Fields::Ds { .. }) && !i.name().starts_with("ds_swizzle") && !i.name().contains("permute")
+}
+
+/// Whether what `inst` writes to `s<code>` holds only the compare's lanes, given `inside` for
+/// the values it reads (`half`: an operand's value in the low or high dword).
+fn holds_inside(
+    inst: &crate::ir::Inst,
+    code: u8,
+    half: &dyn Fn(&crate::ir::Inst, Option<&Operand>, u8) -> Option<Value>,
+    inside: &dyn Fn(Option<Value>) -> bool,
+) -> bool {
+    let name = inst.name();
+    let exec = code.checked_sub(EXEC).filter(|&h| h < 2);
+    let old_exec = |h: u8| inside(inst.read(Reg::S(EXEC + h)));
+    match &inst.fields {
+        // a lane compare into EXEC: the lanes it had, where the compare holds
+        Fields::Valu(_) => exec.is_some_and(|h| name.starts_with("v_cmpx_") && old_exec(h)),
+        Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src, .. } => {
+            let base = name.trim_end_matches("_b64").trim_end_matches("_b32");
+            match (base, exec) {
+                ("s_and_saveexec", Some(h)) => old_exec(h) || inside(half(inst, src.first(), h)),
+                ("s_andn2_saveexec", Some(h)) => inside(half(inst, src.first(), h)),
+                // the EXEC a saveexec saved
+                (b, None) if b.ends_with("_saveexec") => code.checked_sub(*d).is_some_and(|h| h < 2 && old_exec(h)),
+                (b, _) => {
+                    let Some(h) = code.checked_sub(*d).filter(|&h| h < 2) else {
+                        return false;
+                    };
+                    let (a, c) = (half(inst, src.first(), h), half(inst, src.get(1), h));
+                    match b {
+                        "s_mov" => inside(a),
+                        "s_and" => inside(a) || inside(c),
+                        "s_andn2" => inside(a),
+                        _ => false,
+                    }
+                }
+            }
+        }
+        _ => false,
+    }
 }

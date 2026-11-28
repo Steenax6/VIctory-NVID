@@ -1781,3 +1781,30 @@ fn only_the_first_threads_set_up_is_written_by_the_first_thread_alone() {
         assert_eq!(paired_setups(&setup_program(setup, threads), true).1, 0, "{what}");
     }
 }
+
+/// The set-up in each arm of a per-lane if/else whose arms both use LDS (`if (x < s0) { set
+/// up; max } else { set up; max }`): the lanes missing at either set-up are in the other arm,
+/// not gone, and the console's second arm starts from what the first left when the first
+/// thread went the other way. Left as the lane's write.
+#[test]
+fn a_set_up_in_one_arm_of_a_per_lane_branch_is_the_lanes_write() {
+    let mut arm = vec![sop1(0x04, 14, EXEC)]; // s_mov_b64 s[14:15], exec
+    arm.extend_from_slice(&SETUP);
+    arm.push(sop1(0x04, EXEC, 14)); // s_mov_b64 exec, s[14:15]
+    arm.extend(ds(0x08, 0, 3, 0, 0)); // ds_max_u32 v3, v0
+    let mut w = vec![
+        vop1(0x01, 3, k(0)),  // v_mov_b32 v3, 0
+        vopc(0xC4, 0, 0),     // v_cmp_gt_u32 vcc, s0, v0: x below s0
+        sop1(0x24, 12, VCC),  // s_and_saveexec_b64 s[12:13], vcc
+        sopp(0x08, arm.len() as i16), // s_cbranch_execz to the other arm
+    ];
+    w.extend_from_slice(&arm);
+    w.extend([
+        sop2(0x15, EXEC, 12, EXEC),         // s_andn2_b64 exec, s[12:13], exec: the other arm
+        sopp(0x08, arm.len() as i16),       // s_cbranch_execz past it
+    ]);
+    w.extend_from_slice(&arm);
+    w.push(sop1(0x04, EXEC, 12)); // s_mov_b64 exec, s[12:13]
+    w.extend(stores([3, 3, 3, 3]));
+    assert_eq!(paired_setups(&native_with(&w, true, 64, 256), true).1, 0);
+}
