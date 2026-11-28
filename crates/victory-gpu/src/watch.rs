@@ -1435,6 +1435,12 @@ fn known_view(start: usize) -> bool {
     !view_ask() && held(start / BLOCK)
 }
 
+/// [`known_view`] for those outside: whether the kernel's write watch can
+/// only fail for the memory at `start` (a hint, read without a lock).
+pub(crate) fn known_view_at(start: usize) -> bool {
+    known_view(start)
+}
+
 /// `VICTORY_VIEW_ASK=1` or `VICTORY_GUARD_ASK=1` (see [`known_view`]).
 fn view_ask() -> bool {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

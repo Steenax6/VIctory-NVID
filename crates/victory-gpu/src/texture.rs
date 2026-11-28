@@ -2497,7 +2497,20 @@ impl Staging {
         // Remapped since the last check ([`remapped`]): read whatever the
         // write watch, the guards or the partly mapped wait say.
         let remapped = self.remapped.swap(false, std::sync::atomic::Ordering::Relaxed);
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        // Memory the guards hold as view memory cannot be write-watched, and
+        // the kernel's answer for it is a failure: asked all the same, it was
+        // 1.2 ms a frame of the submitting thread in motion in the open world
+        // (`GetWriteWatch` under this refresh, profile of 2026-11-28), once
+        // for every upload of the texture pass. Such memory goes to the
+        // guards below, as it did after the failed asking. (If the memory is
+        // no view by now, mapped anew in between, the guards' asking finds
+        // that and asks the kernel: `crate::watch::writes_fine_look`.)
+        let watched = if crate::watch::known_view_at(start) {
+            None
+        } else {
+            waited(1, || crate::watch::writes(start, start + size, false))
+        };
+        if let Some((now, written)) = watched {
             if !remapped && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
